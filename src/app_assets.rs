@@ -6,7 +6,14 @@ use gpui_kit::{AssetSource, SharedString};
 
 gpui_kit::assets::icon_assets!(
     WorkspaceIcons,
-    [GitBranch, GitCommitHorizontal, Keyboard, Braces, Diff]
+    [
+        GitBranch,
+        GitCommitHorizontal,
+        Keyboard,
+        Braces,
+        Diff,
+        Trash
+    ]
 );
 
 pub(crate) struct AppAssets;
@@ -41,6 +48,7 @@ mod tests {
             IconName::Keyboard,
             IconName::Braces,
             IconName::Diff,
+            IconName::Trash,
             IconName::Search,
             IconName::ChevronLeft,
             IconName::TriangleAlert,

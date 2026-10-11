@@ -9,8 +9,8 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
-    WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState, Textarea, TextareaState},
@@ -21,7 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Window, div, px,
-    rgb,
+    relative, rgb,
 };
 
 use crate::{diff::viewer::DiffViewer, git_status::GitStatus};
@@ -149,8 +149,8 @@ impl GitDialog {
     ) -> Self {
         let commit_message = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(3, 7)
-                .placeholder("Commit message")
+                .auto_grow(3, 5)
+                .placeholder("Describe your changes…")
         });
         cx.subscribe(
             &commit_message,
@@ -704,27 +704,123 @@ impl GitDialog {
         }
     }
 
+    fn render_repository_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let repository = self
+            .checkout
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        h_flex()
+            .h(px(68.))
+            .flex_none()
+            .px_5()
+            .pr_12()
+            .gap_3()
+            .child(
+                h_flex()
+                    .size(px(36.))
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(cx.theme().muted)
+                    .child(Icon::new(gpui_kit::assets::IconName::GitBranch).size(px(18.))),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .min_w_0()
+                    .flex_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().text_base().font_semibold().child("Git"))
+                            .child(div().text_color(cx.theme().muted_foreground).child("/"))
+                            .child(div().min_w_0().truncate().text_base().child(repository)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .truncate()
+                            .child(self.checkout.to_string_lossy().into_owned()),
+                    ),
+            )
+            .when(matches!(self.state, LoadState::Loaded(_)), |view| {
+                let upstream = match &self.state {
+                    LoadState::Loaded(snapshot) => snapshot
+                        .upstream
+                        .as_ref()
+                        .map(|name| format!("Tracking {name}"))
+                        .unwrap_or_else(|| "No upstream configured".into()),
+                    _ => String::new(),
+                };
+                view.child(
+                    v_flex()
+                        .gap_1()
+                        .max_w(relative(0.45))
+                        .items_end()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .px_3()
+                                .py_1()
+                                .max_w_full()
+                                .rounded_md()
+                                .bg(cx.theme().muted)
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::GitBranch).size(px(14.)),
+                                )
+                                .child(div().min_w_0().truncate().text_xs().child(self.summary())),
+                        )
+                        .child(
+                            div()
+                                .max_w_full()
+                                .truncate()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(upstream),
+                        ),
+                )
+            })
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .h(px(44.))
+            .min_h(px(48.))
             .flex_none()
-            .px_3()
+            .px_4()
+            .py_2()
             .gap_3()
-            .items_center()
+            .flex_wrap()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
                 h_flex().gap_1().children(
                     [
-                        (GitMode::Changes, "Changes"),
-                        (GitMode::Branches, "Branches"),
-                        (GitMode::History, "History"),
+                        (
+                            GitMode::Changes,
+                            "Changes",
+                            gpui_kit::assets::IconName::Diff,
+                        ),
+                        (
+                            GitMode::Branches,
+                            "Branches",
+                            gpui_kit::assets::IconName::GitBranch,
+                        ),
+                        (
+                            GitMode::History,
+                            "History",
+                            gpui_kit::assets::IconName::GitCommitHorizontal,
+                        ),
                     ]
                     .into_iter()
-                    .map(|(mode, label)| {
+                    .map(|(mode, label, icon)| {
                         Button::new(("git-dialog-mode", mode as usize))
                             .small()
                             .ghost()
+                            .h(px(30.))
+                            .px_3()
+                            .icon(icon)
                             .label(label)
                             .selected(self.mode == mode)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -737,15 +833,8 @@ impl GitDialog {
                     }),
                 ),
             )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.summary()),
-            )
+            .child(div().flex_1())
+            .child(self.render_remote_toolbar(cx))
             .child(
                 Button::new("git-dialog-refresh")
                     .small()
@@ -774,140 +863,64 @@ impl GitDialog {
     fn render_changes(&self, snapshot: &RepositorySnapshot, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.active_mutation.is_some();
         let has_conflicts = !snapshot.conflicts.is_empty();
-        h_flex()
-            .size_full()
-            .min_h_0()
-            .min_w_0()
+        h_flex().size_full().min_h_0().min_w_0()
             .child(
-                v_flex()
-                    .w(px(390.))
-                    .h_full()
-                    .min_h_0()
-                    .flex_none()
-                    .border_r_1()
-                    .border_color(cx.theme().border)
+                v_flex().w(px(340.)).max_w(relative(0.4)).h_full().min_h_0().flex_none()
+                    .bg(cx.theme().sidebar).border_r_1().border_color(cx.theme().border)
                     .child(
-                        h_flex()
-                            .h(px(40.))
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(format!("Changes · {}", snapshot.change_count())),
-                            )
-                            .child(
-                                Button::new("git-stage-all")
-                                    .small()
-                                    .ghost()
-                                    .label("Stage All")
-                                    .disabled(
-                                        busy
-                                            || has_conflicts
-                                            || (snapshot.unstaged.is_empty()
-                                                && snapshot.untracked.is_empty()),
-                                    )
-                                    .tooltip(if has_conflicts {
-                                        "Resolve merge changes before staging all files"
-                                    } else {
-                                        "Stage every changed file"
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.enqueue_mutation(Mutation::StageAll, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("git-unstage-all")
-                                    .small()
-                                    .ghost()
-                                    .label("Unstage All")
-                                    .disabled(
-                                        busy || has_conflicts || snapshot.staged.is_empty(),
-                                    )
-                                    .tooltip(if has_conflicts {
-                                        "Resolve merge changes before unstaging all files"
-                                    } else {
-                                        "Unstage every staged file"
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        let unborn = matches!(&this.state, LoadState::Loaded(snapshot) if snapshot.unborn);
-                                        this.enqueue_mutation(
-                                            Mutation::UnstageAll { unborn },
-                                            window,
-                                            cx,
-                                        )
-                                    })),
-                            ),
+                        h_flex().h(px(56.)).flex_none().gap_2().px_4()
+                            .child(div().flex_1().text_sm().font_semibold().child("Working changes"))
+                            .child(self.render_count(snapshot.change_count(), cx))
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scrollbar()
-                            .child(
-                                v_flex()
-                                    .w_full()
-                                    .p_2()
-                                    .gap_3()
-                                    .child(self.render_change_section(
-                                        "Merge Changes",
-                                        ChangeArea::Conflict,
-                                        &snapshot.conflicts,
-                                        0xf87171,
-                                        busy,
-                                        cx,
-                                    ))
-                                    .child(self.render_orphaned_results(snapshot, cx))
-                                    .child(self.render_change_section(
-                                        "Staged Changes",
-                                        ChangeArea::Staged,
-                                        &snapshot.staged,
-                                        0x4ade80,
-                                        busy,
-                                        cx,
-                                    ))
-                                    .child(self.render_change_section(
-                                        "Changes",
-                                        ChangeArea::Unstaged,
-                                        &snapshot.unstaged,
-                                        0xfbbf24,
-                                        busy,
-                                        cx,
-                                    ))
-                                    .child(self.render_change_section(
-                                        "Untracked Files",
-                                        ChangeArea::Untracked,
-                                        &snapshot.untracked,
-                                        0x60a5fa,
-                                        busy,
-                                        cx,
-                                    )),
-                            ),
+                        h_flex().px_4().pb_3().gap_2().flex_none()
+                            .child(Button::new("git-stage-all").small().ghost().icon(IconName::Plus).label("Stage all")
+                                .disabled(busy || has_conflicts || (snapshot.unstaged.is_empty() && snapshot.untracked.is_empty()))
+                                .tooltip(if has_conflicts { "Resolve merge changes before staging all files" } else { "Stage every changed file" })
+                                .on_click(cx.listener(|this, _, window, cx| this.enqueue_mutation(Mutation::StageAll, window, cx))))
+                            .child(Button::new("git-unstage-all").small().ghost().icon(IconName::Minus).label("Unstage all")
+                                .disabled(busy || has_conflicts || snapshot.staged.is_empty())
+                                .tooltip(if has_conflicts { "Resolve merge changes before unstaging all files" } else { "Unstage every staged file" })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let unborn = matches!(&this.state, LoadState::Loaded(snapshot) if snapshot.unborn);
+                                    this.enqueue_mutation(Mutation::UnstageAll { unborn }, window, cx)
+                                })))
                     )
-                    .child(self.render_commit_panel(snapshot, cx)),
+                    .child(
+                        div().flex_1().min_h_0().overflow_y_scrollbar().child(
+                            v_flex().w_full().px_2().pb_3().gap_3()
+                                .when(!snapshot.conflicts.is_empty(), |view| view.child(self.render_change_section("Merge changes", ChangeArea::Conflict, &snapshot.conflicts, busy, cx)))
+                                .child(self.render_orphaned_results(snapshot, cx))
+                                .child(self.render_change_section("Staged", ChangeArea::Staged, &snapshot.staged, busy, cx))
+                                .child(self.render_change_section("Unstaged", ChangeArea::Unstaged, &snapshot.unstaged, busy, cx))
+                                .when(!snapshot.untracked.is_empty(), |view| view.child(self.render_change_section("Untracked", ChangeArea::Untracked, &snapshot.untracked, busy, cx)))
+                        )
+                    )
+                    .child(self.render_commit_panel(snapshot, cx))
             )
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .min_h_0()
+                v_flex().flex_1().min_w_0().h_full().min_h_0()
                     .child(self.render_diff_header(cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .child(self.selected_change_view()),
-                    ),
-            )
-            .into_any_element()
+                    .child(div().flex_1().min_h_0().min_w_0()
+                        .child(if self.selection.is_some() {
+                            self.selected_change_view()
+                        } else {
+                            self.render_empty("Working tree clean", "New changes will appear here automatically. Explore your commits in History.", cx).into_any_element()
+                        }))
+            ).into_any_element()
+    }
+
+    fn render_count(&self, count: usize, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .min_w(px(22.))
+            .px_1p5()
+            .py(px(2.))
+            .rounded_md()
+            .bg(cx.theme().muted)
+            .text_color(cx.theme().muted_foreground)
+            .text_xs()
+            .text_center()
+            .child(count.to_string())
     }
 
     fn render_change_section(
@@ -915,11 +928,16 @@ impl GitDialog {
         title: &str,
         area: ChangeArea,
         changes: &[Change],
-        color: u32,
         busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let visible = changes.len().min(self.visible_changes[area as usize]);
+        let color = match area {
+            ChangeArea::Conflict => cx.theme().danger,
+            ChangeArea::Staged => cx.theme().success,
+            ChangeArea::Unstaged => cx.theme().warning,
+            ChangeArea::Untracked => cx.theme().ring,
+        };
         v_flex()
             .w_full()
             .gap_1()
@@ -927,12 +945,14 @@ impl GitDialog {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .px_1()
+                    .px_2()
+                    .h(px(28.))
                     .text_xs()
                     .font_semibold()
                     .text_color(cx.theme().muted_foreground)
-                    .child(title.to_owned())
-                    .child(changes.len().to_string()),
+                    .child(div().size(px(6.)).rounded_full().bg(color))
+                    .child(div().flex_1().child(title.to_owned()))
+                    .child(self.render_count(changes.len(), cx)),
             )
             .children(
                 changes
@@ -948,40 +968,91 @@ impl GitDialog {
                         let selected = self.selection.as_ref() == Some(&target);
                         let select_target = target.clone();
                         let path = change.path.to_string_lossy().into_owned();
+                        let name = change
+                            .path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+                        let parent = change
+                            .original_path
+                            .as_ref()
+                            .map(|original| format!("← {}", original.display()))
+                            .unwrap_or_else(|| {
+                                change
+                                    .path
+                                    .parent()
+                                    .unwrap_or_else(|| Path::new(""))
+                                    .to_string_lossy()
+                                    .into_owned()
+                            });
+                        let accessible = if parent.is_empty() {
+                            path.clone()
+                        } else {
+                            format!("{path} · {parent}")
+                        };
                         let mut row = h_flex()
                             .id(("git-change-row", index * 4 + area as usize))
                             .w_full()
-                            .min_h(px(40.))
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .items_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .when(selected, |row| row.bg(rgb(0x203442)))
-                            .hover(|style| style.bg(rgb(0x202222)))
-                            .child(
-                                div()
-                                    .w(px(16.))
-                                    .flex_none()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(rgb(color))
-                                    .child(change.kind.label()),
-                            )
+                            .min_w_0()
+                            .h(px(48.))
+                            .pr_1()
+                            .gap_1()
+                            .rounded_md()
+                            .when(selected, |row| row.bg(cx.theme().accent))
                             .child(
                                 Button::new(("git-select-file", index * 4 + area as usize))
                                     .ghost()
                                     .flex_1()
                                     .min_w_0()
-                                    .label(if let Some(original) = &change.original_path {
-                                        format!("{path} (from {})", original.to_string_lossy())
-                                    } else {
-                                        path
-                                    })
+                                    .h_full()
+                                    .px_2()
+                                    .accessibility_label(accessible.clone())
                                     .selected(selected)
+                                    .tooltip(accessible)
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .min_w_0()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .w(px(20.))
+                                                    .flex_none()
+                                                    .text_xs()
+                                                    .font_semibold()
+                                                    .text_center()
+                                                    .text_color(color)
+                                                    .child(change.kind.label()),
+                                            )
+                                            .child(
+                                                v_flex()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .gap(px(2.))
+                                                    .child(
+                                                        div()
+                                                            .w_full()
+                                                            .truncate()
+                                                            .text_sm()
+                                                            .child(name),
+                                                    )
+                                                    .when(!parent.is_empty(), |view| {
+                                                        view.child(
+                                                            div()
+                                                                .w_full()
+                                                                .truncate()
+                                                                .text_xs()
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(parent),
+                                                        )
+                                                    }),
+                                            ),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_change(select_target.clone(), cx);
+                                        this.select_change(select_target.clone(), cx)
                                     })),
                             );
                         row = match area {
@@ -991,7 +1062,9 @@ impl GitDialog {
                                     Button::new(("git-unstage-file", index))
                                         .xsmall()
                                         .ghost()
-                                        .label("Unstage")
+                                        .icon(IconName::Minus)
+                                        .tooltip("Unstage file")
+                                        .accessibility_label(format!("Unstage {path}"))
                                         .disabled(busy)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.unstage_change(&action, window, cx)
@@ -1005,7 +1078,9 @@ impl GitDialog {
                                     Button::new(("git-stage-file", index))
                                         .xsmall()
                                         .ghost()
-                                        .label("Stage")
+                                        .icon(IconName::Plus)
+                                        .tooltip("Stage file")
+                                        .accessibility_label(format!("Stage {path}"))
                                         .disabled(busy)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.stage_change(&stage, window, cx)
@@ -1018,7 +1093,11 @@ impl GitDialog {
                                             Button::new(("git-discard-file", index))
                                                 .xsmall()
                                                 .ghost()
-                                                .label("Discard")
+                                                .icon(IconName::Undo2)
+                                                .tooltip("Discard changes…")
+                                                .accessibility_label(format!(
+                                                    "Discard changes in {path}"
+                                                ))
                                                 .disabled(busy)
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     this.request_restore(discard.clone(), cx)
@@ -1034,7 +1113,9 @@ impl GitDialog {
                                     Button::new(("git-stage-untracked", index))
                                         .xsmall()
                                         .ghost()
-                                        .label("Stage")
+                                        .icon(IconName::Plus)
+                                        .tooltip("Stage file")
+                                        .accessibility_label(format!("Stage {path}"))
                                         .disabled(busy)
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.stage_change(&stage, window, cx)
@@ -1045,7 +1126,9 @@ impl GitDialog {
                                         Button::new(("git-trash-file", index))
                                             .xsmall()
                                             .ghost()
-                                            .label("Trash")
+                                            .icon(gpui_kit::assets::IconName::Trash)
+                                            .tooltip("Move to Trash…")
+                                            .accessibility_label(format!("Move {path} to Trash"))
                                             .disabled(busy)
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.request_trash(trash.clone(), cx)
@@ -1064,8 +1147,12 @@ impl GitDialog {
                         .px_2()
                         .py_1()
                         .text_xs()
-                        .text_color(rgb(0x555a5a))
-                        .child("No files"),
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if area == ChangeArea::Staged {
+                            "Stage files to include them in a commit."
+                        } else {
+                            "No unstaged changes."
+                        }),
                 )
             })
             .when(changes.len() > visible, |view| {
@@ -1105,25 +1192,37 @@ impl GitDialog {
         v_flex()
             .flex_none()
             .gap_2()
-            .p_3()
+            .p_4()
             .border_t_1()
             .border_color(cx.theme().border)
             .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Commit"),
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(gpui_kit::assets::IconName::GitCommitHorizontal).size(px(16.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_semibold()
+                            .child("Create a commit"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{} staged", snapshot.staged.len())),
+                    ),
             )
             .child(Textarea::new(&self.commit_message))
             .child(
                 Button::new("git-commit")
                     .w_full()
                     .primary()
+                    .icon(IconName::Check)
                     .label(if self.active_mutation.is_some() {
                         "Working…"
                     } else {
-                        "Commit"
+                        "Commit changes"
                     })
                     .tooltip(reason)
                     .disabled(disabled)
@@ -1207,32 +1306,48 @@ impl GitDialog {
 
     fn render_diff_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(target) = &self.selection else {
-            return div().h(px(0.)).into_any_element();
+            return div().into_any_element();
         };
         let path = target.change.path.clone();
         let label = path.to_string_lossy().into_owned();
         let can_open = self.checkout.join(&path).is_file();
+        let comparison = match target.area {
+            ChangeArea::Staged => "Staged · HEAD → index",
+            ChangeArea::Unstaged => "Unstaged · index → working tree",
+            ChangeArea::Untracked => "Untracked · new file",
+            ChangeArea::Conflict => "Merge conflict",
+        };
         h_flex()
-            .h(px(40.))
+            .min_h(px(62.))
             .flex_none()
-            .items_center()
-            .gap_2()
-            .px_3()
+            .gap_3()
+            .px_5()
+            .py_2()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                div()
+                Icon::new(IconName::FileText)
+                    .size(px(16.))
+                    .text_color(cx.theme().muted_foreground),
+            )
+            .child(
+                v_flex()
                     .flex_1()
                     .min_w_0()
-                    .text_sm()
-                    .font_semibold()
-                    .child(label),
+                    .gap_1()
+                    .child(div().truncate().text_sm().font_semibold().child(label))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(comparison),
+                    ),
             )
             .child(
                 Button::new("git-open-selected-file")
                     .small()
                     .ghost()
-                    .label("Open in Editor")
+                    .label("Open in editor")
                     .disabled(!can_open)
                     .tooltip(if can_open {
                         "Open this working-tree file in the built-in editor"
@@ -1265,9 +1380,21 @@ impl GitDialog {
             .flex_1()
             .items_center()
             .justify_center()
-            .gap_2()
+            .gap_3()
             .p_6()
-            .child(div().text_sm().font_semibold().child(title.to_owned()))
+            .child(
+                h_flex()
+                    .size(px(52.))
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(cx.theme().muted)
+                    .child(
+                        Icon::new(gpui_kit::assets::IconName::GitBranch)
+                            .size(px(24.))
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+            )
+            .child(div().text_base().font_semibold().child(title.to_owned()))
             .child(
                 div()
                     .max_w(px(520.))
@@ -1320,10 +1447,9 @@ impl Render for GitDialog {
             .min_h_0()
             .track_focus(&self.focus_handle)
             .tab_group()
+            .bg(cx.theme().background)
+            .child(self.render_repository_header(cx))
             .child(self.render_toolbar(cx))
-            .when(matches!(self.state, LoadState::Loaded(_)), |view| {
-                view.child(self.render_remote_toolbar(cx))
-            })
             .when(matches!(&self.state, LoadState::Loaded(snapshot) if snapshot.operation_details.is_some()), |view| view.child(self.render_operation_banner(cx)))
             .when_some(self.confirmation.as_ref(), |view, confirmation| {
                 view.child(self.render_confirmation(confirmation, cx))

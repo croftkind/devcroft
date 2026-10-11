@@ -40,6 +40,7 @@ pub(super) struct HistoryState {
     viewer: Entity<DiffViewer>,
     choose_scope: bool,
     create_branch: bool,
+    show_metadata: bool,
 }
 impl HistoryState {
     pub(super) fn new(window: &mut Window, cx: &mut Context<GitDialog>) -> Self {
@@ -71,6 +72,7 @@ impl HistoryState {
             viewer: cx.new(DiffViewer::new),
             choose_scope: false,
             create_branch: false,
+            show_metadata: false,
         }
     }
     fn cancel_page(&mut self) {
@@ -374,25 +376,41 @@ impl GitDialog {
             .map(|b| b.name.clone())
             .unwrap_or_else(|| "HEAD".into());
         let mut sidebar = v_flex()
-            .w(px(430.))
+            .w(px(340.))
+            .max_w(relative(0.4))
+            .bg(cx.theme().sidebar)
             .h_full()
             .min_h_0()
             .flex_none()
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                h_flex().p_2().gap_2().child(
-                    Button::new("history-scope")
-                        .small()
-                        .ghost()
-                        .label(format!("History · {scope}"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.history.choose_scope = !this.history.choose_scope;
-                            cx.notify();
-                        })),
-                ),
+                h_flex()
+                    .h(px(56.))
+                    .px_4()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .font_semibold()
+                            .child("Commit history"),
+                    )
+                    .child(
+                        Button::new("history-scope")
+                            .small()
+                            .ghost()
+                            .max_w(px(160.))
+                            .icon(gpui_kit::assets::IconName::GitBranch)
+                            .label(scope)
+                            .tooltip("Choose history branch")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.history.choose_scope = !this.history.choose_scope;
+                                cx.notify();
+                            })),
+                    ),
             )
-            .child(div().px_2().pb_2().child(Input::new(&self.history.query)));
+            .child(div().px_3().pb_3().child(Input::new(&self.history.query)));
         if self.history.choose_scope {
             sidebar = sidebar
                 .child(div().px_2().pb_2().child(Input::new(&self.branch_query)))
@@ -474,10 +492,18 @@ impl GitDialog {
                                         .py_2()
                                         .cursor_pointer()
                                         .border_b_1()
-                                        .border_color(cx.theme().border)
+                                        .border_color(cx.theme().border.opacity(0.45))
+                                        .hover(|view| view.bg(cx.theme().muted))
                                         .when(this.history.selected == Some(index), |view| {
                                             view.bg(cx.theme().accent)
                                         })
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .font_semibold()
+                                                .truncate()
+                                                .child(commit.subject.clone()),
+                                        )
                                         .child(
                                             h_flex()
                                                 .gap_2()
@@ -503,12 +529,6 @@ impl GitDialog {
                                                         .text_color(cx.theme().muted_foreground)
                                                         .child(commit.decorations.clone()),
                                                 ),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_sm()
-                                                .truncate()
-                                                .child(commit.subject.clone()),
                                         )
                                         .child(
                                             div()
@@ -612,37 +632,69 @@ impl GitDialog {
             Some(parent) => format!("Compared with parent {}", &parent[..12]),
         };
         let mut metadata = v_flex()
-            .gap_2()
-            .p_3()
+            .gap_3()
+            .px_5()
+            .py_4()
             .child(
                 div()
-                    .text_sm()
+                    .text_lg()
                     .font_semibold()
                     .child(commit.subject.clone()),
             )
-            .child(div().text_xs().child(oid.clone()))
-            .child(div().text_xs().child(format!(
-                "Author: {} <{}> · {}",
-                commit.author, commit.email, commit.authored
-            )))
-            .child(div().text_xs().child(format!(
-                "Committer: {} <{}> · {}",
-                commit.committer, commit.committer_email, commit.committed
-            )))
-            .child(div().text_xs().child(format!(
-                "Parents: {}",
-                if commit.parents.is_empty() {
-                    "none".into()
-                } else {
-                    commit.parents.join(" · ")
-                }
-            )))
             .child(
-                div()
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(commit.decorations.clone()),
+                    .child(
+                        div()
+                            .font_family(crate::fonts::TERMINAL_FONT_FAMILY)
+                            .child(commit.oid[..12].to_owned()),
+                    )
+                    .child("·")
+                    .child(commit.author.clone())
+                    .child("·")
+                    .child(commit.time_label())
+                    .when(!commit.decorations.is_empty(), |view| {
+                        view.child(
+                            div()
+                                .px_2()
+                                .rounded_sm()
+                                .bg(cx.theme().muted)
+                                .child(commit.decorations.clone()),
+                        )
+                    }),
             )
+            .when(self.history.show_metadata, |view| {
+                view.child(
+                    v_flex()
+                        .gap_2()
+                        .child(self.render_detail("Commit", oid.clone(), cx))
+                        .child(self.render_detail(
+                            "Author",
+                            format!("{} <{}> · {}", commit.author, commit.email, commit.authored),
+                            cx,
+                        ))
+                        .child(self.render_detail(
+                            "Committer",
+                            format!(
+                                "{} <{}> · {}",
+                                commit.committer, commit.committer_email, commit.committed
+                            ),
+                            cx,
+                        ))
+                        .child(self.render_detail(
+                            "Parents",
+                            if commit.parents.is_empty() {
+                                "none".into()
+                            } else {
+                                commit.parents.join(" · ")
+                            },
+                            cx,
+                        )),
+                )
+            })
             .when(!commit.body.is_empty(), |view| {
                 view.child(div().text_sm().child(commit.body.clone()))
             })
@@ -655,6 +707,21 @@ impl GitDialog {
             .child(
                 h_flex()
                     .gap_2()
+                    .flex_wrap()
+                    .child(
+                        Button::new("history-metadata-toggle")
+                            .small()
+                            .ghost()
+                            .label(if self.history.show_metadata {
+                                "Hide details"
+                            } else {
+                                "Details"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.history.show_metadata = !this.history.show_metadata;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("history-copy")
                             .small()
@@ -718,29 +785,21 @@ impl GitDialog {
             );
         }
         let file_count = self.history.files.len();
-        v_flex()
-            .flex_1()
-            .min_w_0()
+        let files = v_flex()
+            .w(px(220.))
+            .max_w(relative(0.35))
             .h_full()
             .min_h_0()
-            .child(
-                div()
-                    .id("history-metadata")
-                    .max_h(px(260.))
-                    .overflow_y_scroll()
-                    .child(metadata),
-            )
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .child(if self.history.files_loading {
-                        "Loading changed files…".into()
-                    } else {
-                        format!("Changed files · {file_count}")
-                    }),
-            )
+            .flex_none()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(div().px_3().py_3().font_semibold().text_xs().child(
+                if self.history.files_loading {
+                    "Loading changed files…".into()
+                } else {
+                    format!("Changed files · {file_count}")
+                },
+            ))
             .when_some(self.history.files_error.clone(), |view, error| {
                 view.child(div().px_3().text_xs().child(error)).child(
                     Button::new("history-files-retry")
@@ -776,9 +835,11 @@ impl GitDialog {
                                     .tab_stop(false)
                                     .small()
                                     .ghost()
-                                    .h(px(28.))
+                                    .h(px(34.))
                                     .w_full()
-                                    .label(label)
+                                    .accessibility_label(label.clone())
+                                    .tooltip(label.clone())
+                                    .child(div().w_full().truncate().text_left().child(label))
                                     .when(this.history.selected_file == Some(index), |view| {
                                         view.bg(cx.theme().accent)
                                     })
@@ -796,9 +857,14 @@ impl GitDialog {
                 .border_1()
                 .border_color(cx.theme().border)
                 .focus(|style| style.border_color(cx.theme().ring))
-                .h(px(112.))
-                .flex_none(),
-            )
+                .flex_1()
+                .min_h_0(),
+            );
+        let diff = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
             .when_some(
                 self.history
                     .selected_file
@@ -813,7 +879,44 @@ impl GitDialog {
                     )
                 },
             )
-            .child(div().flex_1().min_h_0().child(self.history.viewer.clone()))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(if self.history.selected_file.is_some() {
+                        self.history.viewer.clone().into_any_element()
+                    } else {
+                        self.render_empty(
+                            "Select a changed file",
+                            "Choose a file to view the changes in this commit.",
+                            cx,
+                        )
+                        .into_any_element()
+                    }),
+            );
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .child(
+                div()
+                    .id("history-metadata")
+                    .max_h(px(260.))
+                    .flex_none()
+                    .overflow_y_scroll()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(metadata),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(files)
+                    .child(diff),
+            )
             .into_any_element()
     }
 }

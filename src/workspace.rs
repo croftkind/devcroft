@@ -1256,11 +1256,10 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, window, _| {
             dialog
-                .title("Git")
                 .w(window.viewport_size().width)
                 .h(window.viewport_size().height)
                 .margin_top(px(0.))
-                .p(px(8.))
+                .p(px(0.))
                 .on_cancel({
                     let git = dialog_git.clone();
                     move |_, _, cx| git.update(cx, |git, cx| git.request_close(cx))

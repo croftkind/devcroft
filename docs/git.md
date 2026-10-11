@@ -27,8 +27,10 @@ in the dialog. A refresh can reset history selection when refs change.
 
 ## Changes and commits
 
-**Changes** groups **Merge Changes**, **Staged Changes**, **Changes**
-(unstaged), and **Untracked Files**. Select a file to see HEAD-to-index,
+**Changes** groups **Merge changes**, **Staged**, **Unstaged**, and **Untracked**
+files in a sidebar. Conflict and untracked sections appear when they contain files.
+Rows show the filename above its directory (or original path for renames), with
+compact, labeled-on-hover stage, unstage, discard, and trash controls. Select a file to see HEAD-to-index,
 index-to-worktree, or empty-to-worktree content as appropriate. Renames show
 both paths. **Show more** exposes further files in large sections.
 
@@ -76,7 +78,8 @@ Failures show bounded command output and preserve the repository operation.
 **History** loads at most 100 commits per page; **Load more** adds another
 page. Filtering searches only loaded metadata. Choose HEAD or a branch scope.
 Rows show graph lanes, commit id, subject, author, time, and ref decorations.
-Select a commit for parents, body, and changed files, then a file for its
+Select a commit for its summary and body; **Details** expands the full commit id,
+author, committer, and parents. Changed files sit beside the diff. Select a file for its
 immutable parent-to-commit diff. Root commits compare to an empty tree;
 merge commits explicitly compare to the first parent. Oversized metadata is
 truncated with a notice.
