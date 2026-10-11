@@ -10,7 +10,12 @@ pub(super) enum RemoteForm {
 }
 
 impl GitDialog {
-    fn request_remote(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn request_remote(
+        &mut self,
+        action: Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_mutation.is_some() {
             return;
         }

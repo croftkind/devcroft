@@ -1,3 +1,4 @@
+mod history_ui;
 mod remote_ui;
 
 use std::{
@@ -115,6 +116,7 @@ pub(crate) struct GitDialog {
     remote_form: Option<remote_ui::RemoteForm>,
     active_started: Option<Instant>,
     check_conflicts: bool,
+    history: history_ui::HistoryState,
 }
 
 impl EventEmitter<SnapshotChanged> for GitDialog {}
@@ -141,6 +143,18 @@ impl GitDialog {
         for input in [&branch_query, &branch_name, &push_branch] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
         }
+        let history = history_ui::HistoryState::new(window, cx);
+        cx.subscribe(
+            &history.query,
+            |this, _, event: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    this.history_filter_changed(cx);
+                }
+            },
+        )
+        .detach();
+        cx.observe(&history.branch_name, |_, _, cx| cx.notify())
+            .detach();
         let mut dialog = Self {
             focus_handle: cx.focus_handle(),
             file_changes: FileChanges::new(&checkout),
@@ -167,6 +181,7 @@ impl GitDialog {
             remote_form: None,
             active_started: None,
             check_conflicts: false,
+            history,
         };
         dialog.reload(false, cx);
         dialog.start_refresh_loop(cx);
@@ -231,9 +246,11 @@ impl GitDialog {
                         if this.selected_ref.as_ref().is_some_and(|reference| !snapshot.branches.iter().any(|branch| &branch.reference == reference)) {
                             this.selected_ref = None;
                         }
+                        let history_changed = !matches!(&this.state, LoadState::Loaded(current) if current.oid == snapshot.oid && current.branches == snapshot.branches && current.tag_state == snapshot.tag_state);
                         this.selection = reconcile_selection(this.selection.take(), &snapshot);
                         this.state = LoadState::Loaded(Box::new(snapshot));
                         this.load_selected_diff(cx);
+                        if history_changed { this.reset_history(cx); }
                         if changed {
                             cx.emit(SnapshotChanged {
                                 checkout: this.checkout.clone(),
@@ -257,6 +274,7 @@ impl GitDialog {
 
     fn fail_load(&mut self, state: LoadState, cx: &mut Context<Self>) {
         self.state = state;
+        self.reset_history(cx);
         self.selection = None;
         self.diff_generation += 1;
         self.diff_viewer.update(cx, |viewer, cx| viewer.clear(cx));
@@ -545,6 +563,9 @@ impl GitDialog {
                             2 => GitMode::History,
                             _ => GitMode::Changes,
                         };
+                        if this.mode == GitMode::History && this.history.commits.is_empty() {
+                            this.load_history_page(cx);
+                        }
                         cx.notify();
                     }))
                     .children([
@@ -574,6 +595,7 @@ impl GitDialog {
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.file_changes.mark_changed();
                         this.reload(true, cx);
+                        this.reset_history(cx);
                     })),
             )
     }
@@ -1068,20 +1090,6 @@ impl GitDialog {
                         this.open_file(path.clone(), window, cx)
                     })),
             )
-            .into_any_element()
-    }
-
-    fn render_history(&self, snapshot: &RepositorySnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let head = snapshot
-            .oid
-            .as_deref()
-            .map(|oid| oid[..oid.len().min(12)].to_owned())
-            .unwrap_or_else(|| "No commits yet".to_owned());
-        v_flex()
-            .w_full()
-            .gap_4()
-            .p_4()
-            .child(self.render_detail("HEAD", head, cx))
             .into_any_element()
     }
 

@@ -65,6 +65,30 @@ pub(crate) fn load_snapshot(root: &Path) -> Result<RepositorySnapshot, LoadError
     let mut snapshot = parse_status(&output.stdout)?;
     snapshot.remotes = load_remotes(root)?;
     snapshot.branches = super::branches::load_branches(root)?;
+    let tags = run_git_args(
+        root,
+        [
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)",
+            "refs/tags/",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect(),
+        None,
+        COMMAND_TIMEOUT,
+        8 * 1024 * 1024,
+        MAX_ERROR_BYTES,
+    )?;
+    if !tags.status.success() {
+        return Err(LoadError::Failed(stderr_message(&tags)));
+    }
+    if tags.stdout_truncated {
+        return Err(LoadError::Failed(
+            "Tag list is too large to display safely".into(),
+        ));
+    }
+    snapshot.tag_state = tags.stdout;
     snapshot.operation = detect_operation(root);
     Ok(snapshot)
 }
@@ -99,6 +123,7 @@ pub(super) fn run_git_args(
         stdout_limit,
         stderr_limit,
         false,
+        None,
     )
 }
 
@@ -108,7 +133,26 @@ pub(super) fn run_git_noninteractive(
     timeout: Duration,
     limit: usize,
 ) -> Result<CommandOutput, LoadError> {
-    run_git_process(root, args, None, timeout, limit, limit, true)
+    run_git_process(root, args, None, timeout, limit, limit, true, None)
+}
+
+/// History reads can be stopped when their UI request becomes obsolete.
+pub(super) fn run_git_cancellable(
+    root: &Path,
+    args: Vec<OsString>,
+    limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<CommandOutput, LoadError> {
+    run_git_process(
+        root,
+        args,
+        None,
+        COMMAND_TIMEOUT,
+        limit,
+        MAX_ERROR_BYTES,
+        false,
+        Some(cancelled),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -120,7 +164,11 @@ fn run_git_process(
     stdout_limit: usize,
     stderr_limit: usize,
     noninteractive: bool,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<CommandOutput, LoadError> {
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(LoadError::Failed("History request cancelled".into()));
+    }
     let mut command = git_command(root);
     #[cfg(unix)]
     {
@@ -173,6 +221,10 @@ fn run_git_process(
     let deadline = Instant::now() + timeout;
     let mut exit_status = None;
     let status = loop {
+        if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            terminate_git(&mut child);
+            return Err(LoadError::Failed("History request cancelled".into()));
+        }
         if exit_status.is_none() {
             match child.try_wait() {
                 Ok(status) => exit_status = status,

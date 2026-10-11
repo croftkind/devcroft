@@ -72,6 +72,49 @@ pub(super) fn load_change_diff(
     Ok(PreparedFileDiff::new(classify(target, old, new)))
 }
 
+/// Raw tree entries pin both sides to immutable objects, independent of HEAD/index.
+pub(super) fn load_history_diff(
+    root: &Path,
+    file: &super::history::HistoryFile,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PreparedFileDiff, String> {
+    Ok(PreparedFileDiff::new(load_history_file(
+        root, file, cancel,
+    )?))
+}
+
+fn load_history_file(
+    root: &Path,
+    file: &super::history::HistoryFile,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ChangedFile, String> {
+    let old = if file.old_mode == "000000" {
+        Content::empty()
+    } else {
+        read_object_with_cancel(
+            root,
+            file.old_mode.as_bytes(),
+            file.old_oid.as_bytes(),
+            Some(cancel),
+        )?
+    };
+    let new = if file.new_mode == "000000" {
+        Content::empty()
+    } else {
+        read_object_with_cancel(
+            root,
+            file.new_mode.as_bytes(),
+            file.new_oid.as_bytes(),
+            Some(cancel),
+        )?
+    };
+    let target = DiffTarget {
+        area: ChangeArea::Staged,
+        change: file.change.clone(),
+    };
+    Ok(classify(&target, old, new))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContentKind {
     Empty,
@@ -223,6 +266,27 @@ fn read_index(root: &Path, path: &Path) -> Result<Content, String> {
 }
 
 fn read_object(root: &Path, mode: &[u8], oid: &[u8]) -> Result<Content, String> {
+    read_object_with_cancel(root, mode, oid, None)
+}
+
+fn read_object_with_cancel(
+    root: &Path,
+    mode: &[u8],
+    oid: &[u8],
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Content, String> {
+    let run = |root: &Path, args, limit| {
+        if let Some(cancel) = cancel {
+            super::repository::run_git_cancellable(root, args, limit, cancel).map_err(|error| {
+                match error {
+                    LoadError::Failed(message) => message,
+                    _ => "Could not read Git object".into(),
+                }
+            })
+        } else {
+            run(root, args, limit)
+        }
+    };
     if mode == b"160000" {
         return Ok(Content::Submodule);
     }
@@ -616,5 +680,98 @@ mod tests {
             .content,
             FileContent::Text { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn immutable_history_pairs_ignore_current_head_index_and_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let git = |args: &[&str], input: Option<&[u8]>| {
+            let out = run_git_args(
+                root,
+                args.iter().map(Into::into).collect(),
+                input.map(Vec::from),
+                READ_TIMEOUT,
+                1024,
+                1024,
+            )
+            .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-b", "main"], None);
+        let old = git(&["hash-object", "-w", "--stdin"], Some(b"historical old\n"));
+        let new = git(&["hash-object", "-w", "--stdin"], Some(b"historical new\n"));
+        fs::write(root.join("file.txt"), "unrelated worktree\n").unwrap();
+        git(&["add", "file.txt"], None);
+        let mut file = super::super::history::HistoryFile {
+            change: Change {
+                path: "file.txt".into(),
+                original_path: None,
+                kind: ChangeKind::Modified,
+                index_mode: None,
+                index_oid: None,
+            },
+            old_mode: "100644".into(),
+            new_mode: "100644".into(),
+            old_oid: old,
+            new_oid: new,
+        };
+        let cancel = AtomicBool::new(false);
+        let diff = load_history_file(root, &file, &cancel).unwrap();
+        assert_eq!((diff.additions, diff.deletions), (1, 1));
+        let FileContent::Text { hunks, .. } = diff.content else {
+            panic!("text diff expected")
+        };
+        let text = format!("{hunks:?}");
+        assert!(text.contains("historical old"));
+        assert!(text.contains("historical new"));
+        assert!(!text.contains("unrelated"));
+        file.old_mode = "000000".into();
+        file.change.kind = ChangeKind::Added;
+        assert_eq!(
+            load_history_file(root, &file, &cancel).unwrap().deletions,
+            0
+        );
+        file.old_mode = "100644".into();
+        file.new_mode = "000000".into();
+        file.change.kind = ChangeKind::Deleted;
+        assert_eq!(
+            load_history_file(root, &file, &cancel).unwrap().additions,
+            0
+        );
+        file.new_mode = "120000".into();
+        assert_eq!(
+            load_history_file(root, &file, &cancel).unwrap().content,
+            FileContent::Unavailable(UnavailableReason::Unsupported)
+        );
+        file.new_mode = "160000".into();
+        assert_eq!(
+            load_history_file(root, &file, &cancel).unwrap().content,
+            FileContent::Unavailable(UnavailableReason::Submodule)
+        );
+        file.new_mode = "100644".into();
+        file.new_oid = git(&["hash-object", "-w", "--stdin"], Some(&[0, 1]));
+        assert_eq!(
+            load_history_file(root, &file, &cancel).unwrap().content,
+            FileContent::Unavailable(UnavailableReason::Binary)
+        );
+        file.new_oid = git(&["hash-object", "-w", "--stdin"], Some(&[0xff]));
+        assert_eq!(
+            load_history_file(root, &file, &cancel).unwrap().content,
+            FileContent::Unavailable(UnavailableReason::InvalidUtf8)
+        );
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            load_history_file(root, &file, &cancel)
+                .unwrap_err()
+                .contains("cancelled")
+        );
     }
 }

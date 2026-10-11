@@ -1,6 +1,7 @@
 mod branches;
 mod dialog;
 mod diff;
+mod history;
 mod model;
 mod operations;
 mod remote;

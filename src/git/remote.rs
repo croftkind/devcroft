@@ -23,6 +23,13 @@ impl Source {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Action {
     Fetch,
+    CreateAt {
+        name: String,
+        oid: String,
+    },
+    Detach {
+        oid: String,
+    },
     Switch {
         reference: String,
     },
@@ -49,6 +56,8 @@ impl Action {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Fetch => "Fetch",
+            Self::CreateAt { .. } => "Create branch here",
+            Self::Detach { .. } => "Check out commit (detached HEAD)",
             Self::Switch { .. } => "Switch branch",
             Self::Create { track: true, .. } => "Track remote branch",
             Self::Create { .. } => "Create branch",
@@ -59,7 +68,10 @@ impl Action {
         }
     }
     pub fn changes_worktree(&self) -> bool {
-        !matches!(self, Self::Fetch | Self::Push { .. })
+        !matches!(
+            self,
+            Self::Fetch | Self::Push { .. } | Self::CreateAt { .. }
+        )
     }
 }
 
@@ -90,6 +102,20 @@ pub(super) fn execute(root: &Path, source: &Source, action: &Action) -> Result<S
     }
     let mut args: Vec<OsString> = Vec::new();
     match action {
+        Action::CreateAt { name, oid } => {
+            validate_branch(root, name)?;
+            if !super::history::valid_oid(oid) {
+                return Err("Invalid commit id".into());
+            }
+            args.extend(["branch", "--no-track", "--", name, oid].map(Into::into));
+        }
+        Action::Detach { oid } => {
+            if !super::history::valid_oid(oid) {
+                return Err("Invalid commit id".into());
+            }
+            protect_ignored(root, oid, false)?;
+            args.extend(["switch", "--detach", "--no-overwrite-ignore", "--", oid].map(Into::into));
+        }
         Action::Fetch => {
             if snapshot.remotes.is_empty() {
                 return Err("Add a remote in Git before fetching.".into());
@@ -543,6 +569,58 @@ mod tests {
             set_upstream: true,
         }
     }
+    #[test]
+    fn history_actions_create_without_switching_and_detach_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        init(root);
+        commit(root, "file", "old\n");
+        let old = git(root, &["rev-parse", "HEAD"]);
+        commit(root, "file", "new\n");
+        run(
+            root,
+            Action::CreateAt {
+                name: "from-history".into(),
+                oid: old.clone(),
+            },
+        )
+        .unwrap();
+        let snapshot = load_snapshot(root).unwrap();
+        assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert_eq!(git(root, &["rev-parse", "from-history"]), old);
+        fs::write(root.join("file"), "unsaved local work\n").unwrap();
+        assert!(run(root, Action::Detach { oid: old.clone() }).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join("file")).unwrap(),
+            "unsaved local work\n"
+        );
+        fs::write(root.join("file"), "new\n").unwrap();
+        run(root, Action::Detach { oid: old.clone() }).unwrap();
+        let snapshot = load_snapshot(root).unwrap();
+        assert!(snapshot.detached);
+        assert_eq!(snapshot.oid.as_deref(), Some(old.as_str()));
+        assert_eq!(fs::read_to_string(root.join("file")).unwrap(), "old\n");
+        assert!(
+            run(
+                root,
+                Action::CreateAt {
+                    name: "--bad".into(),
+                    oid: old.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                root,
+                Action::Detach {
+                    oid: "--all".into()
+                }
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn create_rejects_a_moved_start_point() {
         let temp = tempfile::tempdir().unwrap();
