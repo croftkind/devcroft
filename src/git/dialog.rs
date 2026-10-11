@@ -1,8 +1,9 @@
+mod conflict_ui;
 mod history_ui;
 mod remote_ui;
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -116,7 +117,13 @@ pub(crate) struct GitDialog {
     remote_form: Option<remote_ui::RemoteForm>,
     active_started: Option<Instant>,
     check_conflicts: bool,
+    continuation_loading: bool,
+    recovery_paths: HashSet<PathBuf>,
+    recovery_warning: Option<String>,
     history: history_ui::HistoryState,
+    merge_editors: HashMap<PathBuf, Entity<super::merge_editor::MergeEditor>>,
+    data_root: Option<PathBuf>,
+    external_editors: Vec<crate::editor::ExternalEditorKind>,
 }
 
 impl EventEmitter<SnapshotChanged> for GitDialog {}
@@ -126,6 +133,8 @@ impl GitDialog {
     pub(crate) fn new(
         checkout: PathBuf,
         dirty_editor_paths: HashSet<PathBuf>,
+        data_root: Option<PathBuf>,
+        external_editors: Vec<crate::editor::ExternalEditorKind>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -181,8 +190,15 @@ impl GitDialog {
             remote_form: None,
             active_started: None,
             check_conflicts: false,
+            continuation_loading: false,
+            recovery_paths: HashSet::new(),
+            recovery_warning: None,
             history,
+            merge_editors: HashMap::new(),
+            data_root,
+            external_editors,
         };
+        dialog.discover_conflict_drafts(cx);
         dialog.reload(false, cx);
         dialog.start_refresh_loop(cx);
         dialog
@@ -247,7 +263,9 @@ impl GitDialog {
                             this.selected_ref = None;
                         }
                         let history_changed = !matches!(&this.state, LoadState::Loaded(current) if current.oid == snapshot.oid && current.branches == snapshot.branches && current.tag_state == snapshot.tag_state);
-                        this.selection = reconcile_selection(this.selection.take(), &snapshot);
+                        let selection = this.selection.take();
+                        let preserve = selection.as_ref().is_some_and(|target| target.area==ChangeArea::Conflict && this.merge_editors.get(&target.change.path).is_some_and(|editor| editor.read(cx).has_draft(cx)));
+                        this.selection = if preserve {selection} else {reconcile_selection(selection, &snapshot)};
                         this.state = LoadState::Loaded(Box::new(snapshot));
                         this.load_selected_diff(cx);
                         if history_changed { this.reset_history(cx); }
@@ -297,6 +315,9 @@ impl GitDialog {
             self.diff_viewer.update(cx, |viewer, cx| viewer.clear(cx));
             return;
         };
+        if target.area == ChangeArea::Conflict {
+            return;
+        }
         let label = target.label();
         self.diff_viewer
             .update(cx, |viewer, cx| viewer.set_loading(label.clone(), cx));
@@ -328,6 +349,37 @@ impl GitDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(mutation, Mutation::Continue { .. })
+            && self
+                .merge_editors
+                .values()
+                .any(|editor| editor.read(cx).dirty(cx))
+        {
+            self.notice = Some(OperationNotice {
+                message: "Save or discard unsaved merge Results before changing the Git operation."
+                    .into(),
+                error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if matches!(mutation, Mutation::Continue { .. }) && !self.dirty_editor_paths.is_empty() {
+            self.notice = Some(OperationNotice { message: "Save or discard unsaved editor drafts before continuing, aborting, or skipping a Git operation.".into(), error: true });
+            cx.notify();
+            return;
+        }
+        if let Mutation::Resolve { source, .. } = &mutation
+            && self.is_dirty_in_editor(&source.index.path)
+        {
+            self.notice = Some(OperationNotice {
+                message:
+                    "Save or discard this file's built-in editor draft before resolving it in Git."
+                        .into(),
+                error: true,
+            });
+            cx.notify();
+            return;
+        }
         if let Mutation::Remote { action, .. } = &mutation
             && action.changes_worktree()
             && !self.dirty_editor_paths.is_empty()
@@ -373,7 +425,17 @@ impl GitDialog {
                     }
                     this.active_mutation = None;
                     this.active_started = None;
-                    this.check_conflicts = matches!(mutation, Mutation::Remote { .. });
+                    this.check_conflicts = matches!(
+                        mutation,
+                        Mutation::Remote { .. } | Mutation::Continue { .. }
+                    );
+                    if let Mutation::Resolve { source, choice } = &mutation
+                        && let Some(editor) = this.merge_editors.get(&source.index.path)
+                    {
+                        editor.update(cx, |editor, cx| {
+                            editor.completed(choice.clone(), result.is_ok(), window, cx)
+                        });
+                    }
                     match result {
                         Ok(message) => {
                             if matches!(mutation, Mutation::Commit { .. }) {
@@ -498,6 +560,19 @@ impl GitDialog {
             },
             Confirmation::Trash { path, fingerprint } => Mutation::Trash { path, fingerprint },
         };
+        if let Mutation::Resolve {
+            source,
+            choice: super::conflicts::Resolution::Text { result, .. },
+        } = &mutation
+            && self
+                .merge_editors
+                .get(&source.index.path)
+                .is_some_and(|editor| !editor.read(cx).matches_result(result, cx))
+        {
+            self.notice = Some(OperationNotice { message: "Result changed after the confirmation opened. Review it and mark it resolved again.".into(), error: true });
+            cx.notify();
+            return;
+        }
         self.enqueue_mutation(mutation, window, cx);
     }
 
@@ -700,6 +775,7 @@ impl GitDialog {
                                         busy,
                                         cx,
                                     ))
+                                    .child(self.render_orphaned_results(snapshot, cx))
                                     .child(self.render_change_section(
                                         "Staged Changes",
                                         ChangeArea::Staged,
@@ -740,7 +816,7 @@ impl GitDialog {
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
-                            .child(self.diff_viewer.clone()),
+                            .child(self.selected_change_view()),
                     ),
             )
             .into_any_element()
@@ -1133,7 +1209,8 @@ impl Focusable for GitDialog {
 }
 
 impl Render for GitDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_merge_editor(window, cx);
         let body = match &self.state {
             LoadState::Loading => self
                 .render_empty(
@@ -1170,6 +1247,7 @@ impl Render for GitDialog {
             .when(matches!(self.state, LoadState::Loaded(_)), |view| {
                 view.child(self.render_remote_toolbar(cx))
             })
+            .when(matches!(&self.state, LoadState::Loaded(snapshot) if snapshot.operation_details.is_some()), |view| view.child(self.render_operation_banner(cx)))
             .when_some(self.confirmation.as_ref(), |view, confirmation| {
                 view.child(self.render_confirmation(confirmation, cx))
             })

@@ -308,7 +308,7 @@ pub(super) fn execute(root: &Path, source: &Source, action: &Action) -> Result<S
     Ok(format!("{} completed", action.label()))
 }
 
-fn run_command(root: &Path, mut args: Vec<OsString>) -> Result<(), String> {
+pub(super) fn run_command(root: &Path, mut args: Vec<OsString>) -> Result<(), String> {
     // Respect custom SSH commands while making OpenSSH fail instead of waiting
     // for an invisible terminal prompt. Other SSH variants retain their setup.
     let ssh = std::env::var("GIT_SSH_COMMAND")

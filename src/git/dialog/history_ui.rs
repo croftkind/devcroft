@@ -763,7 +763,8 @@ mod tests {
         let slot = holder.clone();
         let checkout = root.to_owned();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let dialog = cx.new(|cx| GitDialog::new(checkout, HashSet::new(), window, cx));
+            let dialog =
+                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
             dialog.update(cx, |this, cx| {
                 this.generation += 1; // reject the initial status request
                 this.load_in_flight = false;

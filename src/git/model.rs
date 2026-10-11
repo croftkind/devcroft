@@ -58,7 +58,7 @@ pub(crate) struct Change {
     pub(crate) index_oid: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum OperationState {
     Merge,
     Rebase,
@@ -87,6 +87,8 @@ pub(crate) struct RepositorySnapshot {
     pub(crate) ahead: usize,
     pub(crate) behind: usize,
     pub(crate) operation: Option<OperationState>,
+    pub(super) operation_details: Option<super::conflicts::OperationDetails>,
+    pub(super) conflict_entries: Vec<super::conflicts::IndexConflict>,
     pub(crate) remotes: Vec<String>,
     pub(super) tag_state: Vec<u8>,
     pub(super) branches: Vec<super::branches::Branch>,

@@ -90,6 +90,11 @@ pub(crate) fn load_snapshot(root: &Path) -> Result<RepositorySnapshot, LoadError
     }
     snapshot.tag_state = tags.stdout;
     snapshot.operation = detect_operation(root);
+    snapshot.operation_details =
+        super::conflicts::operation_details(root).map_err(LoadError::Failed)?;
+    if !snapshot.conflicts.is_empty() {
+        snapshot.conflict_entries = super::conflicts::unmerged(root).map_err(LoadError::Failed)?;
+    }
     Ok(snapshot)
 }
 
@@ -340,7 +345,7 @@ fn load_remotes(root: &Path) -> Result<Vec<String>, LoadError> {
         .collect())
 }
 
-fn detect_operation(root: &Path) -> Option<OperationState> {
+pub(super) fn detect_operation(root: &Path) -> Option<OperationState> {
     let repo = gix::discover(root).ok()?;
     let git_dir = repo.git_dir();
     if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
@@ -351,6 +356,16 @@ fn detect_operation(root: &Path) -> Option<OperationState> {
         Some(OperationState::CherryPick)
     } else if git_dir.join("REVERT_HEAD").exists() {
         Some(OperationState::Revert)
+    } else if let Ok(todo) = std::fs::File::open(git_dir.join("sequencer/todo")) {
+        let mut prefix = [0; 7];
+        let read = todo.take(prefix.len() as u64).read(&mut prefix).ok()?;
+        if prefix[..read].starts_with(b"pick ") {
+            Some(OperationState::CherryPick)
+        } else if prefix[..read].starts_with(b"revert ") {
+            Some(OperationState::Revert)
+        } else {
+            None
+        }
     } else {
         None
     }

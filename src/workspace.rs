@@ -1216,6 +1216,16 @@ impl Workspace {
             GitDialog::new(
                 self.working_directory.clone(),
                 dirty_editor_paths,
+                self.data_root.as_ref().map(|root| root.root().to_owned()),
+                ExternalEditorKind::ALL
+                    .into_iter()
+                    .filter(|kind| {
+                        self.external_editors
+                            .get(kind.id())
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                    .collect(),
                 window,
                 cx,
             )

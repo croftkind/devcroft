@@ -2447,7 +2447,7 @@ fn text_from_bytes(bytes: &[u8]) -> Result<String> {
 /// Keep a file's consistent newline convention when the editor inserts a
 /// newline or text is pasted. Mixed-newline files are left byte-for-byte as
 /// edited because there is no unambiguous style to apply.
-fn file_bytes_for_buffer<'a>(saved: &str, draft: &'a str) -> Cow<'a, str> {
+pub(crate) fn file_bytes_for_buffer<'a>(saved: &str, draft: &'a str) -> Cow<'a, str> {
     let has_crlf = saved.contains("\r\n");
     let has_lone_lf = saved.as_bytes().iter().enumerate().any(|(index, byte)| {
         *byte == b'\n' && (index == 0 || saved.as_bytes()[index - 1] != b'\r')
@@ -2471,7 +2471,7 @@ fn content_hash(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn save_if_unchanged(path: &Path, original: &[u8], replacement: &[u8]) -> Result<()> {
+pub(crate) fn save_if_unchanged(path: &Path, original: &[u8], replacement: &[u8]) -> Result<()> {
     if replacement.len() as u64 > MAX_FILE_BYTES {
         bail!("The draft is larger than 2 MiB. Open it in Zed or VS Code.");
     }

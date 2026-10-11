@@ -43,6 +43,14 @@ pub(super) struct TargetFingerprint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Mutation {
+    Resolve {
+        source: Box<super::conflicts::Source>,
+        choice: super::conflicts::Resolution,
+    },
+    Continue {
+        source: Box<super::conflicts::ContinuationSource>,
+        action: super::conflicts::Continuation,
+    },
     Remote {
         source: super::remote::Source,
         action: super::remote::Action,
@@ -74,6 +82,8 @@ pub(super) enum Mutation {
 impl Mutation {
     pub(super) fn progress(&self) -> String {
         match self {
+            Self::Resolve { choice, .. } => format!("{}…", choice.label()),
+            Self::Continue { action, .. } => format!("{}…", action.label()),
             Self::Remote { action, .. } => format!("{}…", action.label()),
             Self::Stage { paths } => path_progress("Staging", paths),
             Self::Unstage { paths, .. } => path_progress("Unstaging", paths),
@@ -89,6 +99,8 @@ impl Mutation {
 
     fn success(&self) -> String {
         match self {
+            Self::Resolve { choice, .. } => format!("{} completed", choice.label()),
+            Self::Continue { action, .. } => format!("{} completed", action.label()),
             Self::Remote { action, .. } => format!("{} completed", action.label()),
             Self::Stage { paths } => path_progress("Staged", paths),
             Self::Unstage { paths, .. } => path_progress("Unstaged", paths),
@@ -111,6 +123,10 @@ pub(super) fn execute(root: &Path, mutation: &Mutation) -> Result<String, String
 
 fn execute_locked(root: &Path, mutation: &Mutation) -> Result<String, String> {
     match mutation {
+        Mutation::Resolve { source, choice } => super::conflicts::resolve(root, source, choice),
+        Mutation::Continue { source, action } => {
+            super::conflicts::continue_operation(root, source, *action)
+        }
         Mutation::Remote { source, action } => super::remote::execute(root, source, action),
         Mutation::Trash { path, fingerprint } => {
             ensure_target_unchanged(root, path, fingerprint)?;
