@@ -51,7 +51,7 @@ use crate::data::{
     sync_portable_with_tracker,
 };
 use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
-use crate::git::{GitDialog, OpenGitFile, SnapshotChanged};
+use crate::git::{CommitDraftChanged, GitDialog, OpenGitFile, SnapshotChanged};
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
@@ -92,10 +92,6 @@ const AUTO_SYNC_POLL: Duration = Duration::from_secs(10);
 /// `move_navigation_component_focus`).
 pub(crate) const WORKSPACE_KEY_CONTEXT: &str = "Workspace";
 
-/// Restore terminal Tab input inside the Git dialog without changing focus
-/// traversal in other dialogs (see `bind_app_keys`).
-pub(crate) const TERMINAL_DIALOG_KEY_CONTEXT: &str = "terminal-dialog";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTab {
     Agent,
@@ -103,8 +99,6 @@ pub(crate) enum WorkspaceTab {
     Terminal,
     Review,
     Resources,
-    /// Dialog-only terminal; intentionally excluded from `ALL` and the tab bar.
-    Git,
 }
 
 impl WorkspaceTab {
@@ -123,7 +117,6 @@ impl WorkspaceTab {
             Self::Terminal => "Terminal",
             Self::Review => "Review",
             Self::Resources => "Resources",
-            Self::Git => "Git",
         }
     }
 
@@ -133,7 +126,6 @@ impl WorkspaceTab {
             // label in Settings and the spawned command cannot drift.
             Self::Agent => Some(AgentKind::DEFAULT.command()),
             Self::Editor => Some("nvim ."),
-            Self::Git => Some("lazygit"),
             Self::Terminal | Self::Review | Self::Resources => None,
         }
     }
@@ -259,6 +251,7 @@ pub(crate) struct Workspace {
     /// header projection so the independent lightweight poll cannot replace
     /// it with facts computed under different Git configuration.
     git_dialog_status: Option<GitStatus>,
+    git_commit_drafts: HashMap<PathBuf, String>,
     command_open: bool,
     /// Which filtered view the open bar shows. Set on every opening (and on
     /// mode switches while open); the render model follows it, so confirmations
@@ -817,6 +810,7 @@ impl Workspace {
             project_name: project_name.into(),
             git_poll: GitPoll::default(),
             git_dialog_status: None,
+            git_commit_drafts: HashMap::new(),
             command_open: false,
             palette_mode: PaletteMode::Actions,
             palette_has_query: false,
@@ -1243,6 +1237,21 @@ impl Workspace {
             this.open_git_file(event, window, cx)
         })
         .detach();
+        if let Some(message) = self.git_commit_drafts.get(&self.working_directory) {
+            git.update(cx, |git, cx| {
+                git.restore_commit_message(message, window, cx)
+            });
+        }
+        cx.subscribe(&git, |this, _, event: &CommitDraftChanged, cx| {
+            if event.message.is_empty() {
+                this.git_commit_drafts.remove(&event.checkout);
+            } else {
+                this.git_commit_drafts
+                    .insert(event.checkout.clone(), event.message.clone());
+            }
+            cx.notify();
+        })
+        .detach();
         let dialog_git = git.clone();
         let workspace = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, window, _| {
@@ -1252,6 +1261,10 @@ impl Workspace {
                 .h(window.viewport_size().height)
                 .margin_top(px(0.))
                 .p(px(8.))
+                .on_cancel({
+                    let git = dialog_git.clone();
+                    move |_, _, cx| git.update(cx, |git, cx| git.request_close(cx))
+                })
                 .on_close({
                     let workspace = workspace.clone();
                     move |_, _, cx| {
@@ -2744,7 +2757,6 @@ impl Workspace {
                 WorkspaceTab::Terminal => Some(navigation::Tab::Terminal),
                 WorkspaceTab::Review => Some(navigation::Tab::Review),
                 WorkspaceTab::Resources => Some(navigation::Tab::Resources),
-                WorkspaceTab::Git => None,
             },
             built_in_editor: self.editor_instance == Some(EditorChoice::BuiltIn),
             markdown_file: self
@@ -2790,8 +2802,6 @@ impl Workspace {
                 .and_then(|pane| pane.as_ref())
                 .map(|pane| vec![(self.active_tab.label(), pane.read(cx).focus_handle.clone())])
                 .unwrap_or_default(),
-            // Dialog-only surface, never selected as the active workspace tab.
-            WorkspaceTab::Git => Vec::new(),
         }
     }
 
@@ -2966,7 +2976,7 @@ impl Workspace {
                         });
                     }
                 }
-                WorkspaceTab::Editor | WorkspaceTab::Terminal | WorkspaceTab::Git => {}
+                WorkspaceTab::Editor | WorkspaceTab::Terminal => {}
             }
         }
         cx.notify();
@@ -3129,7 +3139,7 @@ impl Workspace {
                             .is_some_and(|(label, _)| *label == "Editor")
                 })
             }
-            WorkspaceTab::Editor | WorkspaceTab::Terminal | WorkspaceTab::Git => false,
+            WorkspaceTab::Editor | WorkspaceTab::Terminal => false,
         }
     }
 
@@ -5033,10 +5043,7 @@ mod tests {
         assert_eq!(WorkspaceTab::Resources.label(), "Resources");
         assert_eq!(WorkspaceTab::Resources.command(), None);
         assert!(!WorkspaceTab::Resources.has_terminal());
-        assert!(!WorkspaceTab::ALL.contains(&WorkspaceTab::Git));
-        assert_eq!(WorkspaceTab::Git.label(), "Git");
-        assert_eq!(WorkspaceTab::Git.command(), Some("lazygit"));
-        assert!(WorkspaceTab::Git.has_terminal());
+        assert_eq!(WorkspaceTab::ALL.len(), 5);
     }
 
     fn dirty_status() -> GitStatus {

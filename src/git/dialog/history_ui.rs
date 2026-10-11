@@ -3,7 +3,10 @@ use crate::git::{
     history::{self, Commit, HistoryFile},
     remote::{Action, Source},
 };
-use gpui_kit::{ClipboardItem, StatefulInteractiveElement as _, uniform_list};
+use gpui_kit::{
+    ClipboardItem, KeyDownEvent, MouseButton, StatefulInteractiveElement as _,
+    UniformListScrollHandle, uniform_list,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -13,6 +16,10 @@ pub(super) struct HistoryState {
     pub query: Entity<InputState>,
     pub branch_name: Entity<InputState>,
     pub commits: Vec<Commit>,
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    files_focus: FocusHandle,
+    files_scroll: UniformListScrollHandle,
     scope: Option<String>,
     tip: Option<String>,
     lanes: Vec<String>,
@@ -40,6 +47,10 @@ impl HistoryState {
             query: cx.new(|cx| InputState::new(window, cx).placeholder("Filter loaded commits…")),
             branch_name: cx.new(|cx| InputState::new(window, cx).placeholder("New branch name")),
             commits: vec![],
+            focus: cx.focus_handle().tab_stop(true),
+            scroll: UniformListScrollHandle::new(),
+            files_focus: cx.focus_handle().tab_stop(true),
+            files_scroll: UniformListScrollHandle::new(),
             scope: None,
             tip: None,
             lanes: vec![],
@@ -57,7 +68,7 @@ impl HistoryState {
             selected_file: None,
             diff_generation: 0,
             diff_cancel: Arc::new(AtomicBool::new(false)),
-            viewer: cx.new(|_| DiffViewer::new()),
+            viewer: cx.new(DiffViewer::new),
             choose_scope: false,
             create_branch: false,
         }
@@ -261,6 +272,79 @@ impl GitDialog {
         cx.notify();
     }
 
+    fn history_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = &event.keystroke;
+        if key.modifiers.modified() {
+            return;
+        }
+        let query = self.history.query.read(cx).value().to_lowercase();
+        let indices: Vec<_> = self
+            .history
+            .commits
+            .iter()
+            .enumerate()
+            .filter(|(_, commit)| commit.matches(&query))
+            .map(|(index, _)| index)
+            .collect();
+        let current = self
+            .history
+            .selected
+            .and_then(|index| indices.iter().position(|item| *item == index));
+        let next = match key.key.as_str() {
+            "down" => current.map_or(0, |row| (row + 1).min(indices.len().saturating_sub(1))),
+            "up" => current.map_or(0, |row| row.saturating_sub(1)),
+            "home" => 0,
+            "end" => indices.len().saturating_sub(1),
+            "enter" | "space" => current.unwrap_or(0),
+            _ => return,
+        };
+        if let Some(index) = indices.get(next) {
+            self.select_commit(*index, cx);
+            self.history
+                .scroll
+                .scroll_to_item(next, gpui_kit::ScrollStrategy::Nearest);
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
+    fn history_file_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let next = match event.keystroke.key.as_str() {
+            "down" => self.history.selected_file.map_or(0, |index| {
+                (index + 1).min(self.history.files.len().saturating_sub(1))
+            }),
+            "up" => self
+                .history
+                .selected_file
+                .map_or(0, |index| index.saturating_sub(1)),
+            "home" => 0,
+            "end" => self.history.files.len().saturating_sub(1),
+            "enter" | "space" => self.history.selected_file.unwrap_or(0),
+            _ => return,
+        };
+        if next < self.history.files.len() {
+            self.select_history_file(next, cx);
+            self.history
+                .files_scroll
+                .scroll_to_item(next, gpui_kit::ScrollStrategy::Nearest);
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+    }
+
     pub(super) fn render_history(
         &self,
         snapshot: &RepositorySnapshot,
@@ -439,7 +523,8 @@ impl GitDialog {
                                         )
                                         .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.history.focus.focus(window, cx);
                                                 this.select_commit(index, cx)
                                             }),
                                         )
@@ -447,6 +532,12 @@ impl GitDialog {
                                 .collect()
                         }),
                     )
+                    .track_focus(&self.history.focus)
+                    .track_scroll(&self.history.scroll)
+                    .on_key_down(cx.listener(Self::history_key_down))
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .focus(|style| style.border_color(cx.theme().ring))
                     .flex_1()
                     .min_h_0(),
                 )
@@ -682,6 +773,7 @@ impl GitDialog {
                                     format!("{}  {path}", file.change.kind.label())
                                 };
                                 Button::new(("history-file", index))
+                                    .tab_stop(false)
                                     .small()
                                     .ghost()
                                     .h(px(28.))
@@ -690,13 +782,20 @@ impl GitDialog {
                                     .when(this.history.selected_file == Some(index), |view| {
                                         view.bg(cx.theme().accent)
                                     })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.history.files_focus.focus(window, cx);
                                         this.select_history_file(index, cx)
                                     }))
                             })
                             .collect()
                     }),
                 )
+                .track_focus(&self.history.files_focus)
+                .track_scroll(&self.history.files_scroll)
+                .on_key_down(cx.listener(Self::history_file_key_down))
+                .border_1()
+                .border_color(cx.theme().border)
+                .focus(|style| style.border_color(cx.theme().ring))
                 .h(px(112.))
                 .flex_none(),
             )
@@ -798,6 +897,77 @@ mod tests {
             assert_eq!(this.history.files[0].change.path, Path::new("root.txt"));
         });
         test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.update(|window, cx| {
+            dialog.update(cx, |this, cx| {
+                this.history.focus.focus(window, cx);
+            });
+        });
+        test_cx.simulate_keystrokes("home");
+        assert_eq!(
+            dialog.read_with(test_cx, |this, _| this.history.selected),
+            Some(0)
+        );
+        test_cx.simulate_keystrokes("down");
+        assert_eq!(
+            dialog.read_with(test_cx, |this, _| this.history.selected),
+            Some(1)
+        );
+        test_cx.simulate_keystrokes("end up");
+        assert_eq!(
+            dialog.read_with(test_cx, |this, _| this.history.selected),
+            Some(0)
+        );
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            dialog.update(cx, |this, cx| {
+                this.history.files_focus.focus(window, cx);
+            });
+        });
+        test_cx.simulate_keystrokes("home");
+        assert_eq!(
+            dialog.read_with(test_cx, |this, _| this.history.selected_file),
+            Some(0)
+        );
+        dialog.update(test_cx, |this, cx| {
+            this.mode = GitMode::Changes;
+            cx.notify();
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.update(|window, cx| {
+            dialog.update(cx, |this, cx| {
+                this.restore_commit_message("keep this message", window, cx);
+                let focus = this.commit_message.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+                this.active_mutation = Some(Mutation::Commit {
+                    message: "keep this message".into(),
+                });
+                assert!(!this.request_close(cx));
+                this.active_mutation = None;
+                assert!(this.request_close(cx));
+                this.commit_completed("older message", window, cx);
+                assert_eq!(
+                    this.commit_message.read(cx).value().as_ref(),
+                    "keep this message"
+                );
+                this.commit_completed("keep this message", window, cx);
+                assert!(this.commit_message.read(cx).value().is_empty());
+                this.restore_commit_message("keep this message", window, cx);
+            });
+        });
+        test_cx.simulate_keystrokes("home down");
+        assert_eq!(
+            dialog.read_with(test_cx, |this, _| this.history.selected),
+            Some(0),
+            "editor arrows must not change history selection"
+        );
+        assert_eq!(
+            dialog.read_with(test_cx, |this, cx| this
+                .commit_message
+                .read(cx)
+                .value()
+                .to_string()),
+            "keep this message"
+        );
         dialog.update(test_cx, |this, cx| {
             let oid = this.history.commits[1].oid.clone();
             this.request_detach(oid, cx);

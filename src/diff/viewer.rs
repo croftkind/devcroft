@@ -9,8 +9,9 @@ use std::rc::Rc;
 use gpui_kit::component::{ActiveTheme as _, StyledExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled,
-    StyledText, Window, div, list, px, rgb,
+    AnyElement, App, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ListAlignment, ListState, ParentElement, Render, Styled, StyledText, Window, div,
+    list, px, rgb,
 };
 
 use crate::{fonts::TERMINAL_FONT_FAMILY, metrics::review_font_size};
@@ -67,13 +68,15 @@ enum ViewerState {
 }
 
 pub(crate) struct DiffViewer {
+    focus_handle: FocusHandle,
     state: ViewerState,
     list: ListState,
 }
 
 impl DiffViewer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            focus_handle: cx.focus_handle().tab_stop(true),
             state: ViewerState::Empty,
             list: ListState::new(0, ListAlignment::Top, px(300.)),
         }
@@ -100,6 +103,34 @@ impl DiffViewer {
     pub(crate) fn set_error(&mut self, path: String, message: String, cx: &mut Context<Self>) {
         self.state = ViewerState::Failed { path, message };
         self.list.reset(0);
+        cx.notify();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let distance = match event.keystroke.key.as_str() {
+            "up" => -ROW_HEIGHT,
+            "down" => ROW_HEIGHT,
+            "pageup" => -300.,
+            "pagedown" => 300.,
+            "home" => {
+                self.list.scroll_to(gpui_kit::ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.),
+                });
+                0.
+            }
+            "end" => {
+                self.list.scroll_to_end();
+                0.
+            }
+            _ => return,
+        };
+        self.list.scroll_by(px(distance));
+        window.prevent_default();
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -133,7 +164,7 @@ impl DiffViewer {
 
 impl Render for DiffViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match &self.state {
+        let body = match &self.state {
             ViewerState::Empty => Self::message(
                 "Select a changed file".into(),
                 "Its staged or working-tree diff will appear here.".into(),
@@ -154,7 +185,25 @@ impl Render for DiffViewer {
                 .size_full()
                 .into_any_element()
             }
-        }
+        };
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .border_1()
+            .border_color(cx.theme().border)
+            .focus(|style| style.border_color(cx.theme().ring))
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.focus_handle.focus(window, cx)),
+            )
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(body)
+    }
+}
+
+impl Focusable for DiffViewer {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -294,6 +343,63 @@ fn message_row(message: impl Into<String>, color: u32) -> AnyElement {
 mod tests {
     use super::*;
     use crate::diff::model::{FileStatus, diff_text};
+    use gpui_kit::AppContext as _;
+
+    #[gpui_kit::test]
+    fn focused_diff_scrolls_with_keyboard(cx: &mut gpui_kit::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let viewer = cx.new(DiffViewer::new);
+            let after = (0..200)
+                .map(|index| format!("line {index}\n"))
+                .collect::<String>();
+            let (hunks, truncated) = diff_text("", &after);
+            viewer.update(cx, |viewer, cx| {
+                viewer.set_loaded(
+                    PreparedFileDiff::new(ChangedFile {
+                        path: "large.txt".into(),
+                        old_path: None,
+                        status: FileStatus::Added,
+                        additions: 200,
+                        deletions: 0,
+                        content: FileContent::Text { hunks, truncated },
+                    }),
+                    cx,
+                )
+            });
+            viewer.focus_handle(cx).focus(window, cx);
+            *slot.borrow_mut() = Some(viewer.clone());
+            gpui_kit::component::Root::new(viewer, window, cx)
+        });
+        let viewer = holder.borrow().clone().unwrap();
+        test_cx.simulate_keystrokes("end");
+        assert!(
+            viewer.read_with(test_cx, |viewer, _| viewer
+                .list
+                .logical_scroll_top()
+                .item_ix)
+                > 0
+        );
+        test_cx.simulate_keystrokes("home");
+        assert_eq!(
+            viewer.read_with(test_cx, |viewer, _| viewer
+                .list
+                .logical_scroll_top()
+                .item_ix),
+            0
+        );
+        test_cx.simulate_keystrokes("pagedown");
+        assert!(
+            viewer.read_with(test_cx, |viewer, _| viewer
+                .list
+                .logical_scroll_top()
+                .item_ix)
+                > 0
+        );
+    }
 
     #[test]
     fn prepared_diff_flattens_hunks_for_virtual_rendering() {

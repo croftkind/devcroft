@@ -10,4 +10,4 @@ mod remote;
 mod repository;
 mod watch;
 
-pub(crate) use dialog::{GitDialog, OpenGitFile, SnapshotChanged};
+pub(crate) use dialog::{CommitDraftChanged, GitDialog, OpenGitFile, SnapshotChanged};

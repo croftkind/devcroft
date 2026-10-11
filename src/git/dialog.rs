@@ -9,18 +9,18 @@ use std::{
 };
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState, Textarea, TextareaState},
     scroll::ScrollableElement as _,
-    tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Styled, Window, div, px,
+    InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Window, div, px,
     rgb,
 };
 
@@ -68,6 +68,12 @@ pub(crate) struct OpenGitFile {
     pub(crate) path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CommitDraftChanged {
+    pub(crate) checkout: PathBuf,
+    pub(crate) message: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Confirmation {
     Remote {
@@ -93,6 +99,7 @@ struct OperationNotice {
 
 pub(crate) struct GitDialog {
     focus_handle: FocusHandle,
+    _tab_interceptor: Subscription,
     checkout: PathBuf,
     mode: GitMode,
     state: LoadState,
@@ -100,6 +107,7 @@ pub(crate) struct GitDialog {
     load_in_flight: bool,
     file_changes: FileChanges,
     selection: Option<DiffTarget>,
+    visible_changes: [usize; 4],
     diff_generation: u64,
     diff_viewer: Entity<DiffViewer>,
     commit_message: Entity<TextareaState>,
@@ -128,6 +136,7 @@ pub(crate) struct GitDialog {
 
 impl EventEmitter<SnapshotChanged> for GitDialog {}
 impl EventEmitter<OpenGitFile> for GitDialog {}
+impl EventEmitter<CommitDraftChanged> for GitDialog {}
 
 impl GitDialog {
     pub(crate) fn new(
@@ -143,7 +152,16 @@ impl GitDialog {
                 .auto_grow(3, 7)
                 .placeholder("Commit message")
         });
-        cx.observe(&commit_message, |_, _, cx| cx.notify()).detach();
+        cx.subscribe(
+            &commit_message,
+            |this, _, event: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    this.publish_commit_draft(cx);
+                }
+                cx.notify();
+            },
+        )
+        .detach();
         let branch_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search branches…"));
         let branch_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("New local branch name"));
@@ -164,8 +182,34 @@ impl GitDialog {
         .detach();
         cx.observe(&history.branch_name, |_, _, cx| cx.notify())
             .detach();
+        let focus_handle = cx.focus_handle();
+        let tab_focus = focus_handle.clone();
+        let target_window = window.window_handle();
+        // Intercept before input bindings resolve: code editors otherwise use
+        // Tab for indentation, trapping keyboard users inside Result.
+        let tab_interceptor = cx.intercept_keystrokes(move |event, window, cx| {
+            let key = &event.keystroke;
+            let modifiers = &key.modifiers;
+            if window.window_handle() == target_window
+                && tab_focus.contains_focused(window, cx)
+                && key.key == "tab"
+                && !modifiers.platform
+                && !modifiers.control
+                && !modifiers.alt
+                && !modifiers.function
+            {
+                if modifiers.shift {
+                    window.focus_prev(cx);
+                } else {
+                    window.focus_next(cx);
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+            }
+        });
         let mut dialog = Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle,
+            _tab_interceptor: tab_interceptor,
             file_changes: FileChanges::new(&checkout),
             checkout,
             mode: GitMode::Changes,
@@ -173,8 +217,9 @@ impl GitDialog {
             generation: 0,
             load_in_flight: false,
             selection: None,
+            visible_changes: [MAX_VISIBLE_CHANGES; 4],
             diff_generation: 0,
-            diff_viewer: cx.new(|_| DiffViewer::new()),
+            diff_viewer: cx.new(DiffViewer::new),
             commit_message,
             mutation_queue: VecDeque::new(),
             active_mutation: None,
@@ -202,6 +247,44 @@ impl GitDialog {
         dialog.reload(false, cx);
         dialog.start_refresh_loop(cx);
         dialog
+    }
+
+    pub(crate) fn request_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.active_mutation.is_some() || !self.mutation_queue.is_empty() {
+            self.notice = Some(OperationNotice {
+                message: "Wait for the active Git operation to finish before closing.".into(),
+                error: false,
+            });
+            cx.notify();
+            false
+        } else {
+            true
+        }
+    }
+
+    fn commit_completed(&mut self, submitted: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.commit_message.read(cx).value().as_ref() == submitted {
+            self.commit_message
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.publish_commit_draft(cx);
+    }
+
+    fn publish_commit_draft(&self, cx: &mut Context<Self>) {
+        cx.emit(CommitDraftChanged {
+            checkout: self.checkout.clone(),
+            message: self.commit_message.read(cx).value().to_string(),
+        });
+    }
+
+    pub(crate) fn restore_commit_message(
+        &mut self,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_message
+            .update(cx, |input, cx| input.set_value(message, window, cx));
     }
 
     fn start_refresh_loop(&self, cx: &mut Context<Self>) {
@@ -438,9 +521,8 @@ impl GitDialog {
                     }
                     match result {
                         Ok(message) => {
-                            if matches!(mutation, Mutation::Commit { .. }) {
-                                this.commit_message
-                                    .update(cx, |input, cx| input.set_value("", window, cx));
+                            if let Mutation::Commit { message: submitted } = &mutation {
+                                this.commit_completed(submitted, window, cx);
                             }
                             this.notice = Some(OperationNotice {
                                 message,
@@ -585,6 +667,9 @@ impl GitDialog {
     }
 
     fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.request_close(cx) {
+            return;
+        }
         if !self.checkout.join(&path).is_file() {
             self.notice = Some(OperationNotice {
                 message: format!("{} is unavailable in the working tree.", path.display()),
@@ -629,25 +714,28 @@ impl GitDialog {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                TabBar::new("git-dialog-mode")
-                    .segmented()
-                    .selected_index(self.mode as usize)
-                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        this.mode = match *index {
-                            1 => GitMode::Branches,
-                            2 => GitMode::History,
-                            _ => GitMode::Changes,
-                        };
-                        if this.mode == GitMode::History && this.history.commits.is_empty() {
-                            this.load_history_page(cx);
-                        }
-                        cx.notify();
-                    }))
-                    .children([
-                        Tab::new().label("Changes"),
-                        Tab::new().label("Branches"),
-                        Tab::new().label("History"),
-                    ]),
+                h_flex().gap_1().children(
+                    [
+                        (GitMode::Changes, "Changes"),
+                        (GitMode::Branches, "Branches"),
+                        (GitMode::History, "History"),
+                    ]
+                    .into_iter()
+                    .map(|(mode, label)| {
+                        Button::new(("git-dialog-mode", mode as usize))
+                            .small()
+                            .ghost()
+                            .label(label)
+                            .selected(self.mode == mode)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.mode = mode;
+                                if mode == GitMode::History && this.history.commits.is_empty() {
+                                    this.load_history_page(cx);
+                                }
+                                cx.notify();
+                            }))
+                    }),
+                ),
             )
             .child(
                 div()
@@ -831,7 +919,7 @@ impl GitDialog {
         busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let visible = changes.len().min(MAX_VISIBLE_CHANGES);
+        let visible = changes.len().min(self.visible_changes[area as usize]);
         v_flex()
             .w_full()
             .gap_1()
@@ -861,10 +949,7 @@ impl GitDialog {
                         let select_target = target.clone();
                         let path = change.path.to_string_lossy().into_owned();
                         let mut row = h_flex()
-                            .id((
-                                "git-change-row",
-                                area as usize * MAX_VISIBLE_CHANGES + index,
-                            ))
+                            .id(("git-change-row", index * 4 + area as usize))
                             .w_full()
                             .min_h(px(40.))
                             .px_2()
@@ -875,12 +960,6 @@ impl GitDialog {
                             .cursor_pointer()
                             .when(selected, |row| row.bg(rgb(0x203442)))
                             .hover(|style| style.bg(rgb(0x202222)))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.select_change(select_target.clone(), cx)
-                                }),
-                            )
                             .child(
                                 div()
                                     .w(px(16.))
@@ -891,24 +970,19 @@ impl GitDialog {
                                     .child(change.kind.label()),
                             )
                             .child(
-                                v_flex()
+                                Button::new(("git-select-file", index * 4 + area as usize))
+                                    .ghost()
                                     .flex_1()
                                     .min_w_0()
-                                    .child(div().text_sm().child(path))
-                                    .when_some(
-                                        change.original_path.as_ref(),
-                                        |column, original| {
-                                            column.child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(format!(
-                                                        "from {}",
-                                                        original.to_string_lossy()
-                                                    )),
-                                            )
-                                        },
-                                    ),
+                                    .label(if let Some(original) = &change.original_path {
+                                        format!("{path} (from {})", original.to_string_lossy())
+                                    } else {
+                                        path
+                                    })
+                                    .selected(selected)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.select_change(select_target.clone(), cx);
+                                    })),
                             );
                         row = match area {
                             ChangeArea::Staged => {
@@ -996,11 +1070,14 @@ impl GitDialog {
             })
             .when(changes.len() > visible, |view| {
                 view.child(
-                    div()
-                        .px_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{} more files", changes.len() - visible)),
+                    Button::new(("git-more-files", area as usize))
+                        .small()
+                        .ghost()
+                        .label(format!("Show more · {} remaining", changes.len() - visible))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.visible_changes[area as usize] += MAX_VISIBLE_CHANGES;
+                            cx.notify();
+                        })),
                 )
             })
             .into_any_element()
@@ -1345,6 +1422,115 @@ mod tests {
             index_mode: None,
             index_oid: None,
         }
+    }
+
+    #[gpui_kit::test]
+    fn mode_buttons_activate_through_dialog_tab_traversal(cx: &mut gpui_kit::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let dialog =
+                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+            dialog.update(cx, |dialog, cx| {
+                dialog.generation += 1;
+                dialog.load_in_flight = false;
+                dialog.state = LoadState::Loaded(Box::default());
+                dialog.focus_handle.focus(window, cx);
+            });
+            *slot.borrow_mut() = Some(dialog.clone());
+            gpui_kit::component::Root::new(dialog, window, cx)
+        });
+        let dialog = holder.borrow().clone().unwrap();
+        test_cx.simulate_keystrokes("tab tab enter");
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
+        });
+        assert_eq!(
+            dialog.read_with(test_cx, |dialog, _| dialog.mode),
+            GitMode::Branches
+        );
+        test_cx.update(|window, cx| dialog.focus_handle(cx).focus(window, cx));
+        test_cx.simulate_keystrokes("tab tab tab enter");
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
+        });
+        assert_eq!(
+            dialog.read_with(test_cx, |dialog, _| dialog.mode),
+            GitMode::History
+        );
+        test_cx.update(|window, cx| dialog.focus_handle(cx).focus(window, cx));
+        test_cx.simulate_keystrokes("tab space");
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("space").unwrap(),
+        });
+        assert_eq!(
+            dialog.read_with(test_cx, |dialog, _| dialog.mode),
+            GitMode::Changes
+        );
+    }
+
+    #[gpui_kit::test]
+    fn tab_traversal_leaves_merge_results_unchanged(cx: &mut gpui_kit::TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+        let directory = crate::git::conflicts::tests::setup();
+        crate::git::conflicts::tests::text_conflict(directory.path(), Path::new("file.txt"));
+        let snapshot = load_snapshot(directory.path()).unwrap();
+        let checkout = directory.path().to_owned();
+        cx.update(gpui_kit::init);
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let dialog =
+                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+            dialog.update(cx, |dialog, cx| {
+                dialog.generation += 1;
+                dialog.load_in_flight = false;
+                dialog.selection = reconcile_selection(None, &snapshot);
+                dialog.state = LoadState::Loaded(Box::new(snapshot));
+                dialog.focus_handle.focus(window, cx);
+            });
+            *slot.borrow_mut() = Some(dialog.clone());
+            gpui_kit::component::Root::new(dialog, window, cx)
+        });
+        let dialog = holder.borrow().clone().unwrap();
+        test_cx.run_until_parked();
+        dialog.read_with(test_cx, |dialog, cx| {
+            assert_eq!(dialog.merge_editors.len(), 1);
+            assert!(
+                !dialog
+                    .merge_editors
+                    .values()
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .dirty(cx)
+            );
+        });
+        // Traverse through Current, Incoming, Result, and the operation controls
+        // several times. No Tab may insert indentation into Result or Commit.
+        for _ in 0..60 {
+            test_cx.simulate_keystrokes("tab");
+        }
+        for _ in 0..60 {
+            test_cx.simulate_keystrokes("shift-tab");
+        }
+        dialog.read_with(test_cx, |dialog, cx| {
+            assert!(
+                !dialog
+                    .merge_editors
+                    .values()
+                    .next()
+                    .unwrap()
+                    .read(cx)
+                    .dirty(cx)
+            );
+            assert!(dialog.commit_message.read(cx).value().is_empty());
+        });
     }
 
     #[test]

@@ -9,10 +9,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::v_flex;
+use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
@@ -35,7 +34,7 @@ use crate::{
         WORKSPACE_HEADER_HEIGHT, app_font_size, cell_height, cell_width,
     },
     session::{BlockKind, CursorPresentation, CursorShape, RenderRun, TerminalSession},
-    workspace::{TERMINAL_DIALOG_KEY_CONTEXT, Workspace, WorkspaceTab},
+    workspace::WorkspaceTab,
 };
 
 pub(crate) struct TerminalPane {
@@ -94,16 +93,6 @@ pub(crate) struct TerminalPane {
 /// Marker id for the terminal copy confirmation toast. A stable id makes
 /// rapid copies replace one another instead of stacking.
 struct TerminalCopyFeedback;
-
-fn is_git_dialog_close_shortcut(keystroke: &gpui_kit::Keystroke) -> bool {
-    let modifiers = &keystroke.modifiers;
-    keystroke.key.eq_ignore_ascii_case("escape")
-        && modifiers.shift
-        && !modifiers.platform
-        && !modifiers.control
-        && !modifiers.alt
-        && !modifiers.function
-}
 
 impl TerminalPane {
     /// One pane for `tab`. The Agent tab launches `agent`; every other
@@ -511,17 +500,6 @@ impl TerminalPane {
                     window.dispatch_action(Box::new(ToggleProjectsPalette), cx);
                 }
             }
-            window.prevent_default();
-            cx.stop_propagation();
-            return;
-        }
-        // Plain Escape and Enter belong to lazygit. Shift+Esc closes only
-        // this dialog; the navigation toggle remains an alternative.
-        if self.tab == WorkspaceTab::Git
-            && (is_git_dialog_close_shortcut(&event.keystroke)
-                || Workspace::is_trigger(&event.keystroke))
-        {
-            window.close_dialog(cx);
             window.prevent_default();
             cx.stop_propagation();
             return;
@@ -1578,9 +1556,6 @@ impl Render for TerminalPane {
 
         div()
             .id(("terminal-pane", self.tab as usize))
-            .when(self.tab == WorkspaceTab::Git, |pane| {
-                pane.key_context(TERMINAL_DIALOG_KEY_CONTEXT)
-            })
             .size_full()
             .relative()
             .when(self.hovered_link.is_some(), |this| this.cursor_pointer())
@@ -1932,22 +1907,6 @@ mod tests {
         };
         assert!(is_copy_shortcut("c", modifiers));
         assert!(!is_copy_shortcut("v", modifiers));
-    }
-
-    #[test]
-    fn only_shift_escape_closes_the_git_dialog() {
-        let close =
-            |key: &str| is_git_dialog_close_shortcut(&gpui_kit::Keystroke::parse(key).unwrap());
-        assert!(close("shift-escape"));
-        for key in [
-            "escape",
-            "enter",
-            "shift-enter",
-            "cmd-shift-escape",
-            "ctrl-shift-escape",
-        ] {
-            assert!(!close(key), "{key} must remain terminal input");
-        }
     }
 
     #[test]
