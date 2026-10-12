@@ -2827,6 +2827,25 @@ impl Render for NativeEditor {
             .min_h_0()
             .items_stretch()
             .overflow_hidden()
+            // Save captures before the focused editor/input sees the key, so
+            // `Cmd+S`/`Ctrl+S` saves even when the code pane (or its
+            // find/replace bar) has focus. This mirrors the file finder's
+            // own `capture_key_down` below. Escape stays on bubble so inner
+            // find bars close before the banner/browser does.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if crate::command_palette::is_save_shortcut(
+                    &event.keystroke.key,
+                    event.keystroke.modifiers.platform,
+                    event.keystroke.modifiers.control,
+                    event.keystroke.modifiers.shift,
+                    event.keystroke.modifiers.alt,
+                ) && this.path.is_some()
+                {
+                    this.save(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape"
                     && (matches!(
@@ -2847,18 +2866,6 @@ impl Render for NativeEditor {
                     window.prevent_default();
                     cx.stop_propagation();
                     cx.notify();
-                } else if event.keystroke.key.eq_ignore_ascii_case("s")
-                    && crate::command_palette::is_primary_modifier(
-                        event.keystroke.modifiers.platform,
-                        event.keystroke.modifiers.control,
-                    )
-                    && !event.keystroke.modifiers.alt
-                    && !event.keystroke.modifiers.shift
-                    && this.path.is_some()
-                {
-                    this.save(window, cx);
-                    window.prevent_default();
-                    cx.stop_propagation();
                 }
             }))
             .when_some(browser, |row, browser| row.child(browser))
@@ -3887,6 +3894,43 @@ mod tests {
                 assert_eq!(fs::read_to_string(&first).unwrap(), "first\n");
             })
             .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn save_shortcut_cmd_and_ctrl_save_the_active_file(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        fs::write(&file, "before\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx).unwrap();
+                view.editor
+                    .update(cx, |editor, cx| editor.set_value("after cmd\n", window, cx));
+                view.dirty = true;
+            })
+            .unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("cmd-s");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| assert!(!view.dirty));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after cmd\n");
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.editor.update(cx, |editor, cx| {
+                    editor.set_value("after ctrl\n", window, cx)
+                });
+                view.dirty = true;
+            })
+            .unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("ctrl-s");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| assert!(!view.dirty));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "after ctrl\n");
     }
 
     #[gpui_kit::test]

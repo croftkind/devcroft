@@ -123,6 +123,29 @@ pub(crate) fn is_quit_shortcut(
     key.eq_ignore_ascii_case("q")
 }
 
+/// Match the editor save shortcut from a raw keystroke: `cmd-s` or `ctrl-s`
+/// on every OS. Unlike the palette and quit shortcuts (which stay
+/// OS-primary so `ctrl-k`/`ctrl-p` keep reaching macOS terminals as
+/// readline and `cmd` chords keep reaching Linux/Windows window managers),
+/// save accepts either modifier everywhere: the built-in editor never sends
+/// keys to a pty, so there is no XOFF/readline conflict to preserve, and
+/// users switching OS/keyboards expect both chords to save. Pure over the
+/// keystroke pieces (not `KeyDownEvent`) like [`palette_mode_for_shortcut`]
+/// so the mapping stays unit-testable without a window. `alt`/`shift`
+/// combinations never match.
+pub(crate) fn is_save_shortcut(
+    key: &str,
+    platform: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    if alt || shift || !(platform || control) {
+        return false;
+    }
+    key.eq_ignore_ascii_case("s")
+}
+
 /// Every static command the bar can run, in canonical order. Repository
 /// switching is dynamic (one [`PaletteItem::SwitchRepository`] per recent
 /// repository) and lives outside this enum.
@@ -864,6 +887,25 @@ mod tests {
         assert!(!is_quit_shortcut("q", false, false, false, false));
         assert!(!is_quit_shortcut("k", true, false, false, false));
         assert!(!is_quit_shortcut("k", false, true, false, false));
+    }
+
+    #[test]
+    fn save_shortcut_matches_cmd_or_ctrl_s_on_every_os() {
+        // The built-in editor never sends keys to a pty, so both `Cmd+S`
+        // and `Ctrl+S` save everywhere: users switching OS/keyboards expect
+        // either chord to work.
+        assert!(is_save_shortcut("s", true, false, false, false));
+        assert!(is_save_shortcut("S", true, false, false, false));
+        assert!(is_save_shortcut("s", false, true, false, false));
+        assert!(is_save_shortcut("S", false, true, false, false));
+        assert!(is_save_shortcut("s", true, true, false, false));
+        assert!(!is_save_shortcut("s", false, false, false, false));
+        assert!(!is_save_shortcut("s", true, false, true, false));
+        assert!(!is_save_shortcut("s", false, true, true, false));
+        assert!(!is_save_shortcut("s", true, false, false, true));
+        assert!(!is_save_shortcut("s", false, true, false, true));
+        assert!(!is_save_shortcut("k", true, false, false, false));
+        assert!(!is_save_shortcut("k", false, true, false, false));
     }
 
     #[test]
