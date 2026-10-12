@@ -1076,7 +1076,7 @@ mod tests {
                     .contains("root.txt"),
                 "obsolete results cannot replace the current file"
             );
-            window.click("history-diff-split", cx);
+            window.click("git-diff-split", cx);
             window.press("home", cx);
             window.press("down", cx);
             window.press("end", cx);

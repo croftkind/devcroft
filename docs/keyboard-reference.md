@@ -78,8 +78,8 @@ Open Git for the current checkout with `Cmd+J`, then `g` on macOS (`Ctrl+J`, the
 
 Changes, Branches, History, remote actions, rebase, and conflict continuation are described in [Git workflow](git.md). Operation and destructive controls stay inside the dialog. External repository changes refresh automatically.
 
-In a focused **Git History diff**, `Shift+Up` / `Shift+Down` extends a source-line
-selection; `Cmd+C` on macOS or `Ctrl+C` elsewhere copies the selected source.
+In a focused **Git Changes or History diff**, `Shift+Up` / `Shift+Down` extends
+a source-line selection; `Cmd+C` on macOS or `Ctrl+C` elsewhere copies the selected source.
 Use the diff's **Unified**, **Split**, **Wrap**, and change-navigation buttons
 to control its display.
 

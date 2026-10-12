@@ -34,6 +34,15 @@ compact, labeled-on-hover stage, unstage, discard, and trash controls. Select a 
 index-to-worktree, or empty-to-worktree content as appropriate. Renames show
 both paths. **Show more** exposes further files in large sections.
 
+Non-conflict Changes and History diffs support **Unified** and **Split**
+layouts, **Wrap** for long lines, and **Previous change / Next change**. These
+display choices remain through refreshes and when selecting another file. Drag over source text or select lines from the gutter,
+then use `Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff
+markers or line numbers. `Shift+Up` / `Shift+Down` extends a line selection.
+Only supplied patch context is available. Files beyond the existing 4 MiB
+read limit show an explanation; diffs beyond the 4,000 retained hunk-line limit
+show a persistent truncation notice. Omitted source cannot be expanded or copied.
+
 **Stage / Unstage** affect one file; **Stage All / Unstage All** affect all
 eligible changes. Bulk staging is blocked while conflicts remain. Enter a
 commit message and choose **Commit** after staging. Blank messages, an empty
@@ -84,14 +93,7 @@ immutable parent-to-commit diff. Root commits compare to an empty tree;
 merge commits explicitly compare to the first parent. Oversized metadata is
 truncated with a notice.
 
-The History diff supports **Unified** and **Split** layouts, **Wrap** for long
-lines, and **Previous change / Next change**. These display choices remain when
-selecting another file. Drag over source text or select lines from the gutter,
-then use `Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff
-markers or line numbers. `Shift+Up` / `Shift+Down` extends a line selection.
-Only supplied patch context is available. Files beyond the existing 4 MiB
-read limit show an explanation; diffs beyond the 4,000 retained hunk-line limit
-show a persistent truncation notice. Omitted source cannot be expanded or copied.
+History uses the same diff display and source-copy controls as Changes.
 
 **Copy commit id**, **Create branch here**, and confirmed **Check out commit**
 are available. Checking out a commit enters detached HEAD. Create or switch

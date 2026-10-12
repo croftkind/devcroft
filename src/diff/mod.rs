@@ -4,4 +4,3 @@ pub(crate) mod kit_viewer;
 pub(crate) mod model;
 mod patch;
 pub(crate) mod syntax;
-pub(crate) mod viewer;

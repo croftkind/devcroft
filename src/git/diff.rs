@@ -11,7 +11,6 @@ use std::{
 use crate::diff::{
     kit_viewer::PreparedKitDiff,
     model::{ChangedFile, FileContent, FileStatus, UnavailableReason, count_changes, diff_text},
-    viewer::PreparedFileDiff,
 };
 
 use super::{
@@ -46,16 +45,18 @@ impl DiffTarget {
 pub(super) fn load_change_diff(
     root: &Path,
     target: &DiffTarget,
-) -> Result<PreparedFileDiff, String> {
+) -> Result<PreparedKitDiff, String> {
     if target.area == ChangeArea::Conflict {
-        return Ok(PreparedFileDiff::new(unavailable_file(
-            &target.change,
-            UnavailableReason::Unsupported,
-        )));
+        return PreparedKitDiff::new(
+            unavailable_file(&target.change, UnavailableReason::Unsupported),
+            "",
+            "",
+            ["000000"; 2],
+        );
     }
     let path = &target.change.path;
     let original = target.change.original_path.as_ref().unwrap_or(path);
-    let (old, new) = match target.area {
+    let (old, mut new) = match target.area {
         ChangeArea::Staged => match target.change.kind {
             ChangeKind::Added | ChangeKind::Copied => (Content::empty(), read_index(root, path)?),
             ChangeKind::Deleted => (read_head(root, path)?, Content::empty()),
@@ -70,7 +71,52 @@ pub(super) fn load_change_diff(
         ChangeArea::Untracked => (Content::empty(), read_worktree(root, path)),
         ChangeArea::Conflict => unreachable!(),
     };
-    Ok(PreparedFileDiff::new(classify(target, old, new)))
+    if matches!(target.area, ChangeArea::Unstaged | ChangeArea::Untracked) {
+        normalize_worktree_mode(root, &old, &mut new)?;
+    }
+    PreparedKitDiff::new(
+        classify_content(target, &old, &new),
+        old.text(),
+        new.text(),
+        [old.mode(), new.mode()],
+    )
+}
+
+// Git may ignore executable-bit changes on this checkout. Preserve that
+// policy in patch metadata, including newly added worktree files.
+fn normalize_worktree_mode(root: &Path, old: &Content, new: &mut Content) -> Result<(), String> {
+    let Content::Bytes {
+        kind: ContentKind::File,
+        mode,
+        ..
+    } = new
+    else {
+        return Ok(());
+    };
+    let output = run(
+        root,
+        vec![
+            "config".into(),
+            "--bool".into(),
+            "--get".into(),
+            "core.filemode".into(),
+        ],
+        128,
+    )?;
+    if output.status.success() && output.stdout.starts_with(b"false") {
+        *mode = if matches!(
+            old,
+            Content::Bytes {
+                kind: ContentKind::File,
+                ..
+            }
+        ) {
+            old.mode().to_owned()
+        } else {
+            "100644".to_owned()
+        };
+    }
+    Ok(())
 }
 
 /// Raw tree entries pin both sides to immutable objects, independent of HEAD/index.
@@ -129,13 +175,24 @@ enum ContentKind {
 }
 
 enum Content {
-    Bytes { kind: ContentKind, bytes: Vec<u8> },
+    Bytes {
+        kind: ContentKind,
+        mode: String,
+        bytes: Vec<u8>,
+    },
     TooLarge,
     Missing,
     Submodule,
 }
 
 impl Content {
+    fn mode(&self) -> &str {
+        match self {
+            Self::Bytes { mode, .. } => mode,
+            _ => "000000",
+        }
+    }
+
     fn text(&self) -> &str {
         match self {
             Self::Bytes { bytes, .. } => std::str::from_utf8(bytes).unwrap_or(""),
@@ -146,13 +203,10 @@ impl Content {
     fn empty() -> Self {
         Self::Bytes {
             kind: ContentKind::Empty,
+            mode: "000000".into(),
             bytes: Vec::new(),
         }
     }
-}
-
-fn classify(target: &DiffTarget, old: Content, new: Content) -> ChangedFile {
-    classify_content(target, &old, &new)
 }
 
 fn classify_content(target: &DiffTarget, old: &Content, new: &Content) -> ChangedFile {
@@ -347,6 +401,7 @@ fn read_object_with_cancel(
         return Ok(Content::TooLarge);
     }
     Ok(Content::Bytes {
+        mode: String::from_utf8_lossy(mode).into_owned(),
         kind: if mode == b"120000" {
             ContentKind::Symlink
         } else {
@@ -380,6 +435,7 @@ fn read_worktree(root: &Path, path: &Path) -> Content {
     if metadata.file_type().is_symlink() {
         return fs::read_link(&candidate).map_or(Content::Missing, |target| Content::Bytes {
             kind: ContentKind::Symlink,
+            mode: "120000".into(),
             bytes: path_bytes(&target).to_vec(),
         });
     }
@@ -406,9 +462,23 @@ fn read_worktree(root: &Path, path: &Path) -> Content {
     } else {
         Content::Bytes {
             kind: ContentKind::File,
+            mode: worktree_file_mode(&metadata).into(),
             bytes,
         }
     }
+}
+
+fn worktree_file_mode(metadata: &fs::Metadata) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o100 != 0 {
+            return "100755";
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    "100644"
 }
 
 fn run(
@@ -481,6 +551,123 @@ mod tests {
         temp
     }
 
+    fn target(area: ChangeArea, path: &str, kind: ChangeKind) -> DiffTarget {
+        DiffTarget {
+            area,
+            change: Change {
+                path: path.into(),
+                original_path: None,
+                kind,
+                index_mode: None,
+                index_oid: None,
+            },
+        }
+    }
+
+    #[test]
+    fn changes_patch_preserves_rename_copy_delete_and_empty_addition() {
+        use gpui_kit::component::diff::DiffFileStatus;
+        let temp = setup();
+        let root = temp.path();
+        let renamed = "new \"বাংলা\".txt";
+        fs::rename(root.join("tracked.txt"), root.join(renamed)).unwrap();
+        git(root, &["add", "-A"]);
+        let snapshot = super::super::repository::load_snapshot(root).unwrap();
+        let diff = load_change_diff(
+            root,
+            &DiffTarget {
+                area: ChangeArea::Staged,
+                change: snapshot.staged[0].clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(diff.file.status, FileStatus::Renamed);
+        let parsed = &diff.files()[0];
+        assert_eq!(parsed.status(), DiffFileStatus::Renamed);
+        assert_eq!(parsed.path().as_str(), renamed);
+        assert_eq!(parsed.original_path().unwrap().as_str(), "tracked.txt");
+        assert!(parsed.has_changes());
+        assert_eq!((parsed.additions(), parsed.deletions()), (0, 0));
+
+        fs::write(root.join("copied.txt"), "before\n").unwrap();
+        git(root, &["add", "copied.txt"]);
+        let mut copied = target(ChangeArea::Staged, "copied.txt", ChangeKind::Copied);
+        copied.change.original_path = Some("tracked.txt".into());
+        let diff = load_change_diff(root, &copied).unwrap();
+        assert_eq!(diff.files()[0].status(), DiffFileStatus::Added);
+        assert_eq!(diff.files()[0].path().as_str(), "copied.txt");
+        assert_eq!((diff.file.additions, diff.file.deletions), (1, 0));
+
+        let deleted = load_change_diff(
+            root,
+            &target(ChangeArea::Staged, "tracked.txt", ChangeKind::Deleted),
+        )
+        .unwrap();
+        assert_eq!(deleted.files()[0].status(), DiffFileStatus::Deleted);
+        assert_eq!((deleted.file.additions, deleted.file.deletions), (0, 1));
+        fs::write(root.join("empty.txt"), "").unwrap();
+        git(root, &["add", "empty.txt"]);
+        let empty = load_change_diff(
+            root,
+            &target(ChangeArea::Staged, "empty.txt", ChangeKind::Added),
+        )
+        .unwrap();
+        assert_eq!(empty.files()[0].status(), DiffFileStatus::Added);
+        assert!(empty.files()[0].has_changes());
+        assert_eq!((empty.file.additions, empty.file.deletions), (0, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changes_patch_modes_follow_index_and_core_filemode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = setup();
+        let root = temp.path();
+        git(root, &["config", "core.filemode", "true"]);
+        let path = root.join("tracked.txt");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        git(root, &["add", "tracked.txt"]);
+        let staged = load_change_diff(
+            root,
+            &target(ChangeArea::Staged, "tracked.txt", ChangeKind::Modified),
+        )
+        .unwrap();
+        let headers = staged.files()[0].extended_headers();
+        assert!(headers.iter().any(|h| h == "old mode 100644"));
+        assert!(headers.iter().any(|h| h == "new mode 100755"));
+        assert!(staged.files()[0].has_changes());
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let unstaged_target = target(ChangeArea::Unstaged, "tracked.txt", ChangeKind::Modified);
+        let unstaged = load_change_diff(root, &unstaged_target).unwrap();
+        let headers = unstaged.files()[0].extended_headers();
+        assert!(headers.iter().any(|h| h == "old mode 100755"));
+        assert!(headers.iter().any(|h| h == "new mode 100644"));
+        git(root, &["config", "core.filemode", "false"]);
+        let ignored = load_change_diff(root, &unstaged_target).unwrap();
+        assert!(ignored.files()[0].extended_headers().is_empty());
+        assert!(!ignored.files()[0].has_changes());
+
+        fs::write(root.join("new.sh"), "run\n").unwrap();
+        fs::set_permissions(root.join("new.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let new = load_change_diff(
+            root,
+            &target(ChangeArea::Untracked, "new.sh", ChangeKind::Untracked),
+        )
+        .unwrap();
+        assert!(
+            new.files()[0]
+                .extended_headers()
+                .iter()
+                .any(|h| h == "new file mode 100644")
+        );
+        git(root, &["add", "new.sh"]);
+        assert_eq!(
+            read_index(root, Path::new("new.sh")).unwrap().mode(),
+            "100644"
+        );
+    }
+
     #[test]
     fn loads_staged_unstaged_and_untracked_content_pairs() {
         let temp = setup();
@@ -528,24 +715,38 @@ mod tests {
             ),
         ] {
             let target = DiffTarget { area, change };
-            let (old, new) = match area {
-                ChangeArea::Staged => (
-                    read_head(temp.path(), &target.change.path).unwrap(),
-                    read_index(temp.path(), &target.change.path).unwrap(),
-                ),
-                ChangeArea::Unstaged => (
-                    read_index(temp.path(), &target.change.path).unwrap(),
-                    read_worktree(temp.path(), &target.change.path),
-                ),
-                ChangeArea::Untracked => (
-                    Content::empty(),
-                    read_worktree(temp.path(), &target.change.path),
-                ),
-                ChangeArea::Conflict => unreachable!(),
-            };
-            let file = classify(&target, old, new);
+            let file = load_change_diff(temp.path(), &target).unwrap().file;
             assert_eq!((file.additions, file.deletions), (additions, deletions));
-            assert!(matches!(file.content, FileContent::Text { .. }));
+            let FileContent::Text { hunks, .. } = file.content else {
+                panic!("text diff expected");
+            };
+            let removed = hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.tag == crate::diff::model::LineTag::Deletion)
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>();
+            let added = hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.tag == crate::diff::model::LineTag::Addition)
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>();
+            match area {
+                ChangeArea::Staged => {
+                    assert_eq!(removed, ["before"]);
+                    assert_eq!(added, ["staged"]);
+                }
+                ChangeArea::Unstaged => {
+                    assert_eq!(removed, ["staged"]);
+                    assert_eq!(added, ["worktree"]);
+                }
+                ChangeArea::Untracked => {
+                    assert!(removed.is_empty());
+                    assert_eq!(added, ["new"]);
+                }
+                ChangeArea::Conflict => unreachable!(),
+            }
         }
     }
 
@@ -572,11 +773,7 @@ mod tests {
                     index_oid: None,
                 },
             };
-            let file = classify(
-                &target,
-                Content::empty(),
-                read_worktree(temp.path(), &target.change.path),
-            );
+            let file = load_change_diff(temp.path(), &target).unwrap().file;
             assert_eq!(file.content, FileContent::Unavailable(reason));
         }
     }
@@ -595,12 +792,10 @@ mod tests {
             },
         };
         assert_eq!(
-            classify(
-                &missing,
-                Content::empty(),
-                read_worktree(temp.path(), &missing.change.path)
-            )
-            .content,
+            load_change_diff(temp.path(), &missing)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::Missing)
         );
 
@@ -632,12 +827,10 @@ mod tests {
             },
         };
         assert_eq!(
-            classify(
-                &submodule,
-                Content::empty(),
-                read_index(temp.path(), &submodule.change.path).unwrap()
-            )
-            .content,
+            load_change_diff(temp.path(), &submodule)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::Submodule)
         );
     }
@@ -662,12 +855,10 @@ mod tests {
             },
         };
         assert_eq!(
-            classify(
-                &changed_type,
-                read_index(temp.path(), &changed_type.change.path).unwrap(),
-                read_worktree(temp.path(), &changed_type.change.path)
-            )
-            .content,
+            load_change_diff(temp.path(), &changed_type)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::Unsupported)
         );
 
@@ -689,12 +880,7 @@ mod tests {
             },
         };
         assert!(matches!(
-            classify(
-                &target,
-                Content::empty(),
-                read_worktree(temp.path(), &target.change.path)
-            )
-            .content,
+            load_change_diff(temp.path(), &target).unwrap().file.content,
             FileContent::Text { .. }
         ));
     }

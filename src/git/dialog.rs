@@ -24,7 +24,10 @@ use gpui_kit::{
     relative, rgb,
 };
 
-use crate::{diff::viewer::DiffViewer, git_status::GitStatus};
+use crate::{
+    diff::kit_viewer::{KitDiffViewer, PreparedKitDiff},
+    git_status::GitStatus,
+};
 
 use super::{
     diff::{ChangeArea, DiffTarget, load_change_diff},
@@ -109,7 +112,7 @@ pub(crate) struct GitDialog {
     selection: Option<DiffTarget>,
     visible_changes: [usize; 4],
     diff_generation: u64,
-    diff_viewer: Entity<DiffViewer>,
+    diff_viewer: Entity<KitDiffViewer>,
     commit_message: Entity<TextareaState>,
     mutation_queue: VecDeque<Mutation>,
     active_mutation: Option<Mutation>,
@@ -219,7 +222,7 @@ impl GitDialog {
             selection: None,
             visible_changes: [MAX_VISIBLE_CHANGES; 4],
             diff_generation: 0,
-            diff_viewer: cx.new(DiffViewer::new),
+            diff_viewer: cx.new(KitDiffViewer::new),
             commit_message,
             mutation_queue: VecDeque::new(),
             active_mutation: None,
@@ -410,20 +413,26 @@ impl GitDialog {
                 .background_spawn(async move { load_change_diff(&checkout, &target) })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.diff_generation != generation {
-                    return;
-                }
-                match result {
-                    Ok(diff) => this
-                        .diff_viewer
-                        .update(cx, |viewer, cx| viewer.set_loaded(diff, cx)),
-                    Err(message) => this.diff_viewer.update(cx, |viewer, cx| {
-                        viewer.set_error(label.clone(), message, cx)
-                    }),
-                }
+                this.complete_change_diff(generation, label, result, cx);
             });
         })
         .detach();
+    }
+
+    fn complete_change_diff(
+        &mut self,
+        generation: u64,
+        label: String,
+        result: Result<PreparedKitDiff, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.diff_generation != generation {
+            return;
+        }
+        self.diff_viewer.update(cx, |viewer, cx| match result {
+            Ok(diff) => viewer.set_loaded(diff, cx),
+            Err(message) => viewer.set_error(label, message, cx),
+        });
     }
 
     fn enqueue_mutation(
@@ -1548,6 +1557,200 @@ mod tests {
             index_mode: None,
             index_oid: None,
         }
+    }
+
+    #[gpui_kit::test]
+    fn changes_diff_rejects_stale_results_and_refreshes_source_without_editing_draft(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("tracked.txt"), "before\r\ncontext\r\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "initial"]);
+        std::fs::write(root.join("tracked.txt"), "staged\r\ncontext\r\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "worktree\r\ncontext\r\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        let snapshot = load_snapshot(root).unwrap();
+        let selected = DiffTarget {
+            area: ChangeArea::Unstaged,
+            change: snapshot.unstaged[0].clone(),
+        };
+        let obsolete = DiffTarget {
+            area: ChangeArea::Untracked,
+            change: snapshot.untracked[0].clone(),
+        };
+        let checkout = root.to_owned();
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let dialog =
+                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+            dialog.update(cx, |dialog, cx| {
+                dialog.generation += 1;
+                dialog.load_in_flight = false;
+                dialog.state = LoadState::Loaded(Box::new(snapshot));
+                dialog.restore_commit_message("keep this draft", window, cx);
+            });
+            *slot.borrow_mut() = Some(dialog.clone());
+            gpui_kit::component::Root::new(dialog, window, cx)
+        });
+        let dialog = holder.borrow().clone().unwrap();
+        let obsolete_generation = dialog.update(test_cx, |dialog, cx| {
+            dialog.select_change(obsolete.clone(), cx);
+            let generation = dialog.diff_generation;
+            dialog.select_change(selected.clone(), cx);
+            assert!(dialog.diff_generation > generation);
+            generation
+        });
+        test_cx.run_until_parked();
+        let stale = load_change_diff(root, &obsolete).unwrap();
+        dialog.update(test_cx, |dialog, cx| {
+            dialog.complete_change_diff(obsolete_generation, obsolete.label(), Ok(stale), cx);
+            dialog.complete_change_diff(
+                obsolete_generation,
+                obsolete.label(),
+                Err("obsolete error".into()),
+                cx,
+            );
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("diff-body")
+                    .label()
+                    .unwrap()
+                    .contains("tracked.txt")
+            );
+            window.click("git-diff-split", cx);
+            window.click("git-diff-wrap", cx);
+            window.press("home", cx);
+            window.press("shift-down", cx);
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-c"
+                } else {
+                    "ctrl-c"
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            test_cx
+                .read(|cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("worktree\r\n")
+        );
+        dialog.read_with(test_cx, |dialog, cx| {
+            assert_eq!(dialog.selection.as_ref(), Some(&selected));
+            assert_eq!(
+                dialog.commit_message.read(cx).value().as_ref(),
+                "keep this draft"
+            );
+        });
+
+        // Replacing the index changes the old side as well as the status identity.
+        // The selected area/path and display settings should survive the reload.
+        std::fs::write(root.join("tracked.txt"), "new index\r\ncontext\r\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        std::fs::write(
+            root.join("tracked.txt"),
+            "refreshed worktree\r\ncontext\r\n",
+        )
+        .unwrap();
+        let before_refresh = dialog.update(test_cx, |dialog, cx| {
+            let generation = dialog.diff_generation;
+            dialog.reload(true, cx);
+            generation
+        });
+        test_cx.run_until_parked();
+        let stale = load_change_diff(root, &obsolete).unwrap();
+        dialog.update(test_cx, |dialog, cx| {
+            assert!(dialog.diff_generation > before_refresh);
+            assert_eq!(
+                dialog.selection.as_ref().unwrap().area,
+                ChangeArea::Unstaged
+            );
+            assert_eq!(
+                dialog.selection.as_ref().unwrap().change.path,
+                Path::new("tracked.txt")
+            );
+            assert_ne!(
+                dialog.selection.as_ref().unwrap().change.index_oid,
+                selected.change.index_oid
+            );
+            dialog.complete_change_diff(before_refresh, obsolete.label(), Ok(stale), cx);
+        });
+        dialog.read_with(test_cx, |dialog, cx| {
+            assert_eq!(
+                dialog.diff_viewer.read(cx).display_settings(cx),
+                (gpui_kit::component::diff::DiffMode::Split, true)
+            );
+        });
+        test_cx.update(|window, cx| {
+            window.click("git-diff-next", cx);
+            window.press("home", cx);
+            window.press("shift-down", cx);
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-c"
+                } else {
+                    "ctrl-c"
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            test_cx
+                .read(|cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("refreshed worktree\r\n")
+        );
+        dialog.read_with(test_cx, |dialog, cx| {
+            assert_eq!(
+                dialog.commit_message.read(cx).value().as_ref(),
+                "keep this draft"
+            )
+        });
+
+        // A failed repository refresh must also invalidate any outstanding diff.
+        let stale = load_change_diff(root, &obsolete).unwrap();
+        dialog.update(test_cx, |dialog, cx| {
+            let generation = dialog.diff_generation;
+            dialog.fail_load(LoadState::Failed("repository error".into()), cx);
+            dialog.complete_change_diff(generation, obsolete.label(), Ok(stale), cx);
+            assert!(dialog.selection.is_none());
+            dialog.state = LoadState::Loaded(Box::default());
+            cx.notify();
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("diff-body").is_none());
+        });
     }
 
     #[gpui_kit::test]

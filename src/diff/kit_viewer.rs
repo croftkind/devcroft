@@ -1,4 +1,4 @@
-//! Retained GPUI Kit Diff prototype for immutable Git History content.
+//! Retained GPUI Kit Diff viewer for single-file Git comparisons.
 
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
@@ -24,6 +24,11 @@ pub(crate) struct PreparedKitDiff {
 }
 
 impl PreparedKitDiff {
+    #[cfg(test)]
+    pub(crate) fn files(&self) -> &[DiffFile] {
+        &self.files
+    }
+
     pub(crate) fn new(
         file: ChangedFile,
         old: &str,
@@ -49,6 +54,11 @@ pub(crate) struct KitDiffViewer {
 }
 
 impl KitDiffViewer {
+    #[cfg(test)]
+    pub(crate) fn display_settings(&self, cx: &App) -> (DiffMode, bool) {
+        (self.diff.read(cx).mode(), self.wrap)
+    }
+
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
             diff: cx.new(|cx| DiffState::new([], cx).with_context_lines(None)),
@@ -125,7 +135,7 @@ impl Render for KitDiffViewer {
             ViewerState::Empty => {
                 content = content.child(Self::message(
                     "Select a changed file",
-                    "Choose a file from this commit.",
+                    "Choose a file from the changes list.",
                 ))
             }
             ViewerState::Loading(path) => {
@@ -166,7 +176,7 @@ impl Render for KitDiffViewer {
                                     .px_2()
                                     .py_1()
                                     .child(
-                                        Button::new("history-diff-unified")
+                                        Button::new("git-diff-unified")
                                             .small()
                                             .ghost()
                                             .label("Unified")
@@ -176,7 +186,7 @@ impl Render for KitDiffViewer {
                                             })),
                                     )
                                     .child(
-                                        Button::new("history-diff-split")
+                                        Button::new("git-diff-split")
                                             .small()
                                             .ghost()
                                             .label("Split")
@@ -186,7 +196,7 @@ impl Render for KitDiffViewer {
                                             })),
                                     )
                                     .child(
-                                        Button::new("history-diff-wrap")
+                                        Button::new("git-diff-wrap")
                                             .small()
                                             .ghost()
                                             .label("Wrap")
@@ -198,7 +208,7 @@ impl Render for KitDiffViewer {
                                             })),
                                     )
                                     .child(
-                                        Button::new("history-diff-previous")
+                                        Button::new("git-diff-previous")
                                             .small()
                                             .ghost()
                                             .label("Previous change")
@@ -208,7 +218,7 @@ impl Render for KitDiffViewer {
                                             })),
                                     )
                                     .child(
-                                        Button::new("history-diff-next")
+                                        Button::new("git-diff-next")
                                             .small()
                                             .ghost()
                                             .label("Next change")
@@ -239,7 +249,7 @@ impl Render for KitDiffViewer {
                             ..
                         }
                     ) {
-                        content = content.child(div().id("history-diff-truncated").test_support().px_3().py_2().text_xs()
+                        content = content.child(div().id("git-diff-truncated").test_support().px_3().py_2().text_xs()
                             .text_color(cx.theme().warning)
                             .child("Diff truncated: only complete hunks within the 4,000-line display limit are shown. Omitted source cannot be expanded or copied."));
                     }
@@ -251,7 +261,7 @@ impl Render for KitDiffViewer {
         }) if !hunks.is_empty() || !truncated);
         let focus = self.focus_handle(cx);
         content
-            .id("history-diff-viewer")
+            .id("git-diff-viewer")
             .test_support()
             .when(!has_body, |view| {
                 view.track_focus(&focus).on_mouse_down(
@@ -314,7 +324,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn history_diff_controls_retain_state_copy_source_and_return_focus(
+    fn git_diff_controls_retain_state_copy_source_and_return_focus(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         cx.update(gpui_kit::init);
@@ -326,8 +336,8 @@ mod tests {
         test_cx.run_until_parked();
         let diff_id = view.read_with(test_cx, |view, _| view.diff.entity_id());
         for (button, expected) in [
-            ("history-diff-split", DiffMode::Split),
-            ("history-diff-unified", DiffMode::Unified),
+            ("git-diff-split", DiffMode::Split),
+            ("git-diff-unified", DiffMode::Unified),
         ] {
             test_cx.update(|window, cx| window.click(button, cx));
             test_cx.run_until_parked();
@@ -337,15 +347,15 @@ mod tests {
             });
             test_cx.update(|window, cx| assert!(view.read(cx).focus_handle(cx).is_focused(window)));
         }
-        test_cx.update(|window, cx| window.click("history-diff-wrap", cx));
+        test_cx.update(|window, cx| window.click("git-diff-wrap", cx));
         test_cx.run_until_parked();
         view.read_with(test_cx, |view, _| assert!(view.wrap));
         test_cx.update(|window, cx| {
-            window.click("history-diff-next", cx);
+            window.click("git-diff-next", cx);
             window.press("home", cx);
             window.press("down", cx);
             window.press("end", cx);
-            window.click("history-diff-previous", cx);
+            window.click("git-diff-previous", cx);
         });
         test_cx.run_until_parked();
         test_cx.update(|window, cx| {
@@ -397,7 +407,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn history_diff_keeps_truncation_visible_and_clears_unavailable_content(
+    fn git_diff_keeps_truncation_visible_and_clears_unavailable_content(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         cx.update(gpui_kit::init);
@@ -406,8 +416,8 @@ mod tests {
         test_cx.run_until_parked();
         test_cx.update(|window, cx| {
             window.render_frame(cx);
-            assert!(window.find("history-diff-truncated").visible());
-            assert!(window.find("history-diff-next").visible());
+            assert!(window.find("git-diff-truncated").visible());
+            assert!(window.find("git-diff-next").visible());
             assert!(window.try_find("diff-body").is_none());
         });
         view.update(test_cx, |view, cx| {
@@ -416,7 +426,7 @@ mod tests {
         test_cx.run_until_parked();
         test_cx.update(|window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find("history-diff-truncated").is_none());
+            assert!(window.try_find("git-diff-truncated").is_none());
             assert!(window.find("diff-body").visible());
         });
         let mut unavailable = prepared("", "");
@@ -425,7 +435,7 @@ mod tests {
         view.update(test_cx, |view, cx| view.set_loaded(unavailable, cx));
         test_cx.update(|window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find("history-diff-split").is_none());
+            assert!(window.try_find("git-diff-split").is_none());
             assert!(window.try_find("diff-body").is_none());
         });
         view.update(test_cx, |view, cx| {
