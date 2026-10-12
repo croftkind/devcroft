@@ -144,6 +144,16 @@ pub(crate) struct OpenReviewFile {
 impl EventEmitter<OpenReviewFile> for ReviewView {}
 
 impl ReviewView {
+    #[cfg(test)]
+    pub(crate) fn benchmark_list_state(&self) -> Option<(ListState, usize)> {
+        match &self.state {
+            ReviewState::Loaded(loaded) => {
+                Some((self.list_handle.clone(), loaded.diff.files.len()))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn open_file(&self, path: &str, line: Option<usize>, cx: &mut Context<Self>) {
         cx.emit(OpenReviewFile {
             path: path.to_owned(),

@@ -4085,6 +4085,7 @@ dependencies = [
  "gpui-component",
  "gpui-fast",
  "gpui-fast-platform",
+ "gpui-fast-web",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-macros",
@@ -4099,6 +4100,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7abc281dcbfe51c16a7e73189521a3a771168c31e3ab0db99e21e481d1b1b9a"
 dependencies = [
  "anyhow",
+ "gpui-fast",
  "gpui-pre",
  "gpui-pre-reqwest",
  "log",
@@ -4594,6 +4596,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9af79b39236b37b09ce6ef257e5d877ca3e63b9f0fb2656cf22420f353b0f70"
 dependencies = [
  "anyhow",
+ "gpui-fast",
  "gpui-pre",
  "lb-wry",
 ]

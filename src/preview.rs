@@ -404,6 +404,11 @@ pub(crate) struct OpenReference(pub crate::markdown_references::Reference);
 impl EventEmitter<OpenReference> for PreviewView {}
 
 impl PreviewView {
+    #[cfg(test)]
+    pub(crate) fn benchmark_list_state(&self, cx: &App) -> (gpui_kit::ListState, usize) {
+        (self.state.read(cx).list_state().clone(), self.blocks)
+    }
+
     fn reference_handler(&self, cx: &Context<Self>) -> crate::markdown_references::OpenHandler {
         let view = cx.entity().downgrade();
         std::sync::Arc::new(move |reference, window, cx| {

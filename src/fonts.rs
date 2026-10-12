@@ -12,6 +12,21 @@ pub(crate) const TERMINAL_FONT_FAMILY: &str = "JetBrainsMonoNL NFM";
 pub(crate) const MARKDOWN_FONT_FAMILY: &str = "Google Sans Flex";
 
 pub(crate) fn load_bundled_fonts(cx: &App) -> Result<()> {
+    register_bundled_fonts(cx)?;
+    let font_id = cx.text_system().resolve_font(&font(TERMINAL_FONT_FAMILY));
+    // Measure once at the reference size; `cell_width()` scales linearly
+    // from here for the live app-wide size.
+    let measured_width = cx
+        .text_system()
+        .advance(font_id, px(BASE_FONT_SIZE), 'M')?
+        .width
+        .as_f32();
+    init_cell_width(measured_width)
+}
+
+/// Registration can run for each test text system without reinitializing
+/// the process-wide terminal metrics used by the application boot path.
+pub(crate) fn register_bundled_fonts(cx: &App) -> Result<()> {
     cx.text_system().add_fonts(vec![
         Cow::Borrowed(include_bytes!(
             "../assets/fonts/google-sans-flex/GoogleSansFlex-Regular.ttf"
@@ -41,14 +56,5 @@ pub(crate) fn load_bundled_fonts(cx: &App) -> Result<()> {
         Cow::Borrowed(
             include_bytes!("../assets/JetBrainsMonoNLNerdFontMono-BoldItalic.ttf").as_slice(),
         ),
-    ])?;
-    let font_id = cx.text_system().resolve_font(&font(TERMINAL_FONT_FAMILY));
-    // Measure once at the reference size; `cell_width()` scales linearly
-    // from here for the live app-wide size.
-    let measured_width = cx
-        .text_system()
-        .advance(font_id, px(BASE_FONT_SIZE), 'M')?
-        .width
-        .as_f32();
-    init_cell_width(measured_width)
+    ])
 }

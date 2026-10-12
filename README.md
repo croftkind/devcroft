@@ -66,6 +66,37 @@ mise run check
 mise run test
 ```
 
+Ordinary builds use GPUI Fast. The default feature switches Kit and the macOS
+WebView wrapper together so they share GPUI types.
+
+```sh
+cargo run --locked -- app
+cargo test --locked
+```
+
+To use GPUI Pre, disable the application's default features:
+
+```sh
+cargo run --locked --no-default-features -- app
+cargo test --locked --no-default-features
+```
+
+To compare CPU rendering work, run the ignored reader/review benchmarks with
+each backend, using the same toolchain and an idle machine. Repeat each command
+several times; fixture construction and warmup are excluded from the reported
+median and p95 milliseconds per input/render cycle.
+
+```sh
+# GPUI Pre
+cargo test --locked --no-default-features backend_benchmark_ -- --ignored --nocapture --test-threads=1
+# GPUI Fast
+cargo test --locked backend_benchmark_ -- --ignored --nocapture --test-threads=1
+```
+
+These use GPUI's test platform. They do not measure native GPU presentation,
+display pacing, terminal output, or embedded WebView behavior. Native performance
+and interaction need separate verification.
+
 ## Docs
 
 - [Home dashboard](docs/home.md)

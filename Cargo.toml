@@ -8,6 +8,12 @@ description = "GPUI desktop workspace for agent harnesses with editor, terminal,
 repository = "https://github.com/hossainemruz/devcroft"
 readme = "README.md"
 
+[features]
+default = ["gpui-fast"]
+# Switch the facade and native WebView together so they share GPUI types.
+# Use --no-default-features to build with GPUI Pre.
+gpui-fast = ["gpui-kit/gpui-fast", "gpui-wry/gpui-fast"]
+
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22.1"
@@ -88,6 +94,8 @@ debug = "limited"
 [profile.dev.package]
 gpui-pre = { opt-level = 3 }
 gpui-pre-platform = { opt-level = 3 }
+gpui-fast = { opt-level = 3 }
+gpui-fast-platform = { opt-level = 3 }
 libghostty-vt = { opt-level = 3 }
 libghostty-vt-sys = { opt-level = 3 }
 # Per-frame text/render hot path. The terminal reshapes fresh glyph runs on
@@ -98,6 +106,8 @@ libghostty-vt-sys = { opt-level = 3 }
 # fast (the top-level crate stays unoptimized).
 gpui-pre-linux = { opt-level = 3 }
 gpui-pre-wgpu = { opt-level = 3 }
+gpui-fast-linux = { opt-level = 3 }
+gpui-fast-wgpu = { opt-level = 3 }
 cosmic-text = { opt-level = 3 }
 swash = { opt-level = 3 }
 # Diff highlighting: syntect parses every line of a review file or a pasted
