@@ -124,7 +124,7 @@ impl CompletionProvider for LspProviders {
         &self,
         text: &Rope,
         offset: usize,
-        _trigger: CompletionContext,
+        trigger: CompletionContext,
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
@@ -142,7 +142,7 @@ impl CompletionProvider for LspProviders {
             Ok(editor_completion(
                 &text,
                 client
-                    .completion(&uri, version, position)
+                    .completion(&uri, version, position, trigger)
                     .unwrap_or(lsp_types::CompletionResponse::Array(Vec::new())),
             ))
         })

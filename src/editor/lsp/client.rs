@@ -162,14 +162,19 @@ impl Client {
         super::process::log_text(&self.transport.log)
     }
     pub(crate) fn completion_trigger(&self, text: &str) -> bool {
+        self.completion_trigger_character(text).is_some()
+    }
+
+    fn completion_trigger_character<'a>(&'a self, text: &str) -> Option<&'a str> {
         self.capabilities
             .pointer("/completionProvider/triggerCharacters")
             .and_then(Value::as_array)
-            .is_some_and(|values| {
+            .and_then(|values| {
                 values
                     .iter()
                     .filter_map(Value::as_str)
-                    .any(|s| !s.is_empty() && text.ends_with(s))
+                    .filter(|s| !s.is_empty() && text.ends_with(s))
+                    .max_by_key(|s| s.len())
             })
     }
 
@@ -213,7 +218,7 @@ impl Client {
                     "workspace": {"configuration":true,"workspaceFolders":true},
                     "textDocument": {
                         "synchronization": {"didSave": true},
-                        "completion": {},
+                        "completion": { "contextSupport": true },
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "definition": {},
                         "publishDiagnostics": {
@@ -432,6 +437,7 @@ impl Client {
             uri,
             version,
             position,
+            None,
             REQUEST_TIMEOUT,
         )?;
         if result.is_null() {
@@ -451,6 +457,7 @@ impl Client {
             uri,
             version,
             position,
+            None,
             REQUEST_TIMEOUT,
         )?;
         if result.is_null() {
@@ -485,12 +492,26 @@ impl Client {
         uri: &lsp_types::Uri,
         version: i32,
         position: lsp_types::Position,
+        mut context: lsp_types::CompletionContext,
     ) -> Result<lsp_types::CompletionResponse> {
+        if context.trigger_kind == lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER {
+            // The component may supply the accumulated query (e.g. "..").
+            // LSP expects the registered trigger, not the entire query.
+            context.trigger_character = context
+                .trigger_character
+                .as_deref()
+                .and_then(|text| self.completion_trigger_character(text))
+                .map(str::to_owned);
+            if context.trigger_character.is_none() {
+                context.trigger_kind = lsp_types::CompletionTriggerKind::INVOKED;
+            }
+        }
         let result = self.request_at(
             "textDocument/completion",
             uri,
             version,
             position,
+            Some(context),
             REQUEST_TIMEOUT,
         )?;
         if result.is_null() {
@@ -518,6 +539,7 @@ impl Client {
         uri: &lsp_types::Uri,
         version: i32,
         position: lsp_types::Position,
+        context: Option<lsp_types::CompletionContext>,
         timeout: Duration,
     ) -> Result<Value> {
         if !self.supports(method) {
@@ -527,18 +549,18 @@ impl Client {
             self.doc_version(uri.as_str()) == version && version > 0,
             "Discarded a stale document request"
         );
+        let mut params = serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        if let Some(context) = context {
+            params["context"] = serde_json::to_value(context)?;
+        }
         let response = self
             .transport
-            .request_scoped_guarded(
-                method,
-                serde_json::json!({
-                    "textDocument": { "uri": uri },
-                    "position": position,
-                }),
-                timeout,
-                Some(uri.as_str()),
-                || self.doc_version(uri.as_str()) == version,
-            )
+            .request_scoped_guarded(method, params, timeout, Some(uri.as_str()), || {
+                self.doc_version(uri.as_str()) == version
+            })
             .inspect_err(|error| {
                 if !error.to_string().contains("cancelled") {
                     self.record_error(error);
@@ -894,6 +916,104 @@ mod tests {
     }
 
     #[test]
+    fn completion_requests_preserve_context_and_reject_stale_versions() {
+        use lsp_types::{CompletionContext, CompletionTriggerKind, Position};
+
+        let (client, seen) = configured_client(serde_json::json!({
+            "textDocumentSync": {"openClose": true, "change": 1},
+            "completionProvider": {"triggerCharacters": [".", ":", "::"]},
+        }));
+        let uri: lsp_types::Uri = "file:///tmp/completion.rs".parse().unwrap();
+        client.did_open(&uri, "rust", "value.").unwrap();
+        let version = client.doc_version(uri.as_str());
+        for context in [
+            CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(".".into()),
+            },
+            CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("..".into()),
+            },
+            CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("value::".into()),
+            },
+            CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("unregistered".into()),
+            },
+        ] {
+            let response = client
+                .completion(&uri, version, Position::new(0, 6), context)
+                .unwrap();
+            assert!(
+                matches!(response, lsp_types::CompletionResponse::Array(items) if items.is_empty())
+            );
+        }
+        client.did_change(uri.as_str(), "value.other").unwrap();
+        let error = client
+            .completion(
+                &uri,
+                version,
+                Position::new(0, 6),
+                CompletionContext {
+                    trigger_kind: CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        assert!(client.last_error().is_none());
+        client.shutdown();
+
+        let frames: Vec<_> = seen.try_iter().collect();
+        let initialize = frames.iter().find(|f| f["method"] == "initialize").unwrap();
+        assert_eq!(
+            initialize["params"]["capabilities"]["textDocument"]["completion"]["contextSupport"],
+            true
+        );
+        let requests: Vec<_> = frames
+            .iter()
+            .filter(|f| f["method"] == "textDocument/completion")
+            .collect();
+        assert_eq!(
+            requests.len(),
+            5,
+            "a stale request never reaches the server"
+        );
+        assert_eq!(requests[0]["params"]["textDocument"]["uri"], uri.as_str());
+        assert_eq!(
+            requests[0]["params"]["position"],
+            serde_json::json!({"line": 0, "character": 6})
+        );
+        assert_eq!(
+            requests[0]["params"]["context"],
+            serde_json::json!({"triggerKind": 1})
+        );
+        assert_eq!(
+            requests[1]["params"]["context"],
+            serde_json::json!({"triggerKind": 2, "triggerCharacter": "."})
+        );
+        assert_eq!(
+            requests[2]["params"]["context"],
+            serde_json::json!({"triggerKind": 2, "triggerCharacter": "."})
+        );
+        assert_eq!(
+            requests[3]["params"]["context"],
+            serde_json::json!({"triggerKind": 2, "triggerCharacter": "::"})
+        );
+        assert_eq!(
+            requests[4]["params"]["context"],
+            serde_json::json!({"triggerKind": 1})
+        );
+    }
+
+    #[test]
     fn multiple_documents_incremental_sync_save_close_and_reopen() {
         let (client, seen) = configured_client(
             serde_json::json!({"textDocumentSync":{"openClose":true,"change":2,"save":{"includeText":true}}}),
@@ -1019,7 +1139,15 @@ mod tests {
         assert_eq!(definitions.len(), 1);
         assert_eq!(definitions[0].target_selection_range.start.line, 1);
         let completion = client
-            .completion(&uri, 1, lsp_types::Position::new(6, 17))
+            .completion(
+                &uri,
+                1,
+                lsp_types::Position::new(6, 17),
+                lsp_types::CompletionContext {
+                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                },
+            )
             .unwrap();
         let items = match completion {
             lsp_types::CompletionResponse::Array(items) => items,

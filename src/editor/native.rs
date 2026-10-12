@@ -31,7 +31,10 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     dialog::{Confirm, DialogFooter},
     h_flex,
-    input::{Editor, EditorState, Input, InputEvent, InputState, MoveDown, MoveUp, Position},
+    input::{
+        Editor, EditorState, Input, InputEvent, InputState, MoveDown, MoveUp, Position,
+        ShowCompletions,
+    },
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     v_flex,
@@ -2158,12 +2161,23 @@ impl NativeEditor {
         let external_editors = self.external_editors.clone();
         let can_go_back = self.has_jump_history();
         let can_go_forward = !self.forward_locations.is_empty();
+        let editor = self.editor.read(cx);
+        let can_complete = has_file
+            && self.markdown_preview.is_none()
+            && editor.is_editable()
+            && editor.lsp().completion_provider.is_some();
+        let completion_focus = self.editor_focus(cx);
         Button::new("native-editor-actions")
             .label("⋯")
             .small()
             .ghost()
             .accessibility_label("Editor actions")
             .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.action_context(completion_focus.clone()).item(
+                    PopupMenuItem::new("Show completions")
+                        .action(Box::new(ShowCompletions))
+                        .disabled(!can_complete),
+                );
                 for (label, action, enabled) in [
                     ("Find in file", 0, has_file),
                     ("Replace in file", 1, has_file),
@@ -3045,6 +3059,281 @@ mod tests {
             gpui_kit::component::Root::new(editor, window, cx)
         });
         (holder.borrow().clone().unwrap(), test_cx)
+    }
+
+    #[derive(Default)]
+    struct ManualCompletions {
+        requests: RefCell<Vec<(String, usize, lsp_types::CompletionContext)>>,
+        pending: RefCell<Option<async_channel::Receiver<lsp_types::CompletionResponse>>>,
+    }
+
+    impl gpui_kit::component::input::CompletionProvider for ManualCompletions {
+        fn completions(
+            &self,
+            text: &gpui_kit::component::input::Rope,
+            offset: usize,
+            trigger: lsp_types::CompletionContext,
+            _: &mut Window,
+            cx: &mut App,
+        ) -> gpui_kit::Task<Result<lsp_types::CompletionResponse>> {
+            self.requests
+                .borrow_mut()
+                .push((text.to_string(), offset, trigger));
+            if let Some(response) = self.pending.borrow_mut().take() {
+                cx.spawn(async move |_| Ok(response.recv().await?))
+            } else {
+                gpui_kit::Task::ready(Ok(lsp_types::CompletionResponse::Array(vec![
+                    lsp_types::CompletionItem {
+                        label: "print".into(),
+                        ..Default::default()
+                    },
+                ])))
+            }
+        }
+
+        fn is_completion_trigger(&self, _: usize, _: &str, _: &mut App) -> bool {
+            false
+        }
+    }
+
+    fn completion_shortcut() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "cmd-shift-space"
+        } else {
+            "ctrl-shift-space"
+        }
+    }
+
+    #[gpui_kit::test]
+    fn manual_completion_shortcut_requests_at_caret_and_leaves_finder_inputs_alone(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.txt");
+        fs::write(&file, "").unwrap();
+        let provider = Rc::new(ManualCompletions::default());
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.lsp_mut().completion_provider = Some(provider.clone());
+                editor.focus(window, cx);
+            });
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes(completion_shortcut());
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), "");
+            assert!(!view.dirty, "requesting suggestions is not an edit");
+            assert!(view.editor.read(cx).completion_menu_state().open);
+        });
+        assert_eq!(provider.requests.borrow().len(), 1);
+        assert_eq!(provider.requests.borrow()[0].0, "");
+        assert_eq!(provider.requests.borrow()[0].1, 0);
+        assert_eq!(
+            provider.requests.borrow()[0].2.trigger_kind,
+            lsp_types::CompletionTriggerKind::INVOKED
+        );
+        assert!(provider.requests.borrow()[0].2.trigger_character.is_none());
+        test_cx.update(|window, cx| window.press("enter", cx));
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), "print");
+            assert!(
+                view.dirty,
+                "accepting a suggestion uses the normal edit lifecycle"
+            );
+        });
+
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_file_finder(window, cx)
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes(completion_shortcut());
+        test_cx.run_until_parked();
+        assert_eq!(provider.requests.borrow().len(), 1);
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.finder_open());
+            assert_eq!(view.file_query.read(cx).value(), "");
+            assert_eq!(view.editor.read(cx).value(), "print");
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.close_file_finder(window, cx);
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("printable", window, cx);
+                editor.set_selected_range(3..3, cx);
+            });
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes(completion_shortcut());
+        test_cx.run_until_parked();
+        assert_eq!(provider.requests.borrow().len(), 2);
+        assert_eq!(provider.requests.borrow()[1].0, "printable");
+        assert_eq!(provider.requests.borrow()[1].1, 3);
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), "printable")
+        });
+    }
+
+    #[gpui_kit::test]
+    fn manual_completion_menu_returns_focus_to_editor_and_requests_suggestions(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("menu.txt");
+        fs::write(&file, "pri").unwrap();
+        let provider = Rc::new(ManualCompletions::default());
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.lsp_mut().completion_provider = Some(provider.clone());
+                editor.set_selected_range(3..3, cx);
+            });
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("native-editor-actions", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+        });
+        test_cx.run_until_parked();
+        assert_eq!(provider.requests.borrow().len(), 1);
+        assert_eq!(provider.requests.borrow()[0].1, 3);
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), "pri");
+            assert!(!view.dirty);
+            assert!(view.editor.read(cx).completion_menu_state().open);
+        });
+        test_cx.update(|window, cx| window.press("enter", cx));
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), "print")
+        });
+    }
+
+    #[gpui_kit::test]
+    fn manual_completion_skips_unavailable_readonly_disabled_and_preview_editors(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("protected.md");
+        fs::write(&file, "# Heading").unwrap();
+        let provider = Rc::new(ManualCompletions::default());
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        test_cx.update(|window, cx| window.press(completion_shortcut(), cx));
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert!(!view.editor.read(cx).completion_menu_state().open)
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.editor.update(cx, |editor, cx| {
+                editor.lsp_mut().completion_provider = Some(provider.clone());
+                editor.set_readonly(true, cx);
+            });
+            // NativeEditor renders an editable view. Exercise the state guard
+            // before that presentation policy is reapplied by the next frame.
+            window.dispatch_action(Box::new(ShowCompletions), cx);
+        });
+        test_cx.run_until_parked();
+        assert!(provider.requests.borrow().is_empty());
+        view.update_in(test_cx, |view, window, cx| {
+            view.editor.update(cx, |editor, cx| {
+                editor.set_readonly(false, cx);
+                editor.set_disabled(true, cx);
+            });
+            window.dispatch_action(Box::new(ShowCompletions), cx);
+        });
+        test_cx.run_until_parked();
+        assert!(provider.requests.borrow().is_empty());
+        view.update_in(test_cx, |view, window, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.set_disabled(false, cx));
+            view.toggle_markdown_preview(window, cx);
+        });
+        test_cx.update(|window, cx| window.press(completion_shortcut(), cx));
+        test_cx.run_until_parked();
+        assert!(provider.requests.borrow().is_empty());
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.markdown_preview.is_some());
+            assert_eq!(view.editor.read(cx).value(), "# Heading");
+            assert!(!view.dirty);
+            assert!(!view.editor.read(cx).completion_menu_state().open);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn manual_completion_ignores_ime_and_discards_a_response_after_editing(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::EntityInputHandler as _;
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deferred.txt");
+        fs::write(&file, "").unwrap();
+        let provider = Rc::new(ManualCompletions::default());
+        let (sender, response) = async_channel::bounded(1);
+        *provider.pending.borrow_mut() = Some(response);
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.lsp_mut().completion_provider = Some(provider.clone());
+                editor.focus(window, cx);
+                editor.replace_and_mark_text_in_range(None, "中", Some(1..1), window, cx);
+            });
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes(completion_shortcut());
+        test_cx.run_until_parked();
+        assert!(provider.requests.borrow().is_empty());
+        view.update_in(test_cx, |view, window, cx| {
+            view.editor.update(cx, |editor, cx| {
+                editor.unmark_text(window, cx);
+                editor.set_value("", window, cx);
+                editor.focus(window, cx);
+            });
+        });
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes(completion_shortcut());
+        test_cx.run_until_parked();
+        assert_eq!(provider.requests.borrow().len(), 1);
+        test_cx.simulate_keystrokes("x");
+        let response = sender.try_send(lsp_types::CompletionResponse::Array(vec![
+            lsp_types::CompletionItem {
+                label: "print".into(),
+                ..Default::default()
+            },
+        ]));
+        assert!(
+            response.is_ok() || matches!(response, Err(async_channel::TrySendError::Closed(_))),
+            "editing may cancel the pending provider task"
+        );
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), "x");
+            assert!(!view.editor.read(cx).completion_menu_state().open);
+        });
     }
 
     #[gpui_kit::test]

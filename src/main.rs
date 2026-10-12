@@ -90,7 +90,8 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     // Windows projector, Cast, and Linux window managers; binding
     // `ctrl-*` on macOS would steal readline kill-line/history-prev
     // from terminals. One binding per OS avoids both.)
-    // Everything else keyboard-driven lives in navigation mode (`cmd-j`
+    // Editor completions have an Input/editor-scoped binding below. Other
+    // application commands live in navigation mode (`cmd-j`
     // on macOS, `ctrl-j` elsewhere, see `docs/keyboard-reference.md`)
     // and the palettes: tab jumps, session creation, and settings have no
     // direct bindings, so `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow
@@ -104,12 +105,22 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
             KeyBinding::new("cmd-k", ToggleActionsPalette, None),
             KeyBinding::new("cmd-p", ToggleProjectsPalette, None),
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new(
+                "cmd-shift-space",
+                gpui_kit::component::input::ShowCompletions,
+                Some("Input && mode == editor"),
+            ),
         ]);
     } else {
         cx.bind_keys([
             KeyBinding::new("ctrl-k", ToggleActionsPalette, None),
             KeyBinding::new("ctrl-p", ToggleProjectsPalette, None),
             KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new(
+                "ctrl-shift-space",
+                gpui_kit::component::input::ShowCompletions,
+                Some("Input && mode == editor"),
+            ),
         ]);
     }
     // Component focus traversal (gpui-component's `Root` Tab bindings, bound

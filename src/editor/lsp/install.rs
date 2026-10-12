@@ -816,7 +816,15 @@ mod tests {
                 client.logs()
             );
             let completion = client
-                .completion(&uri, client.doc_version(uri.as_str()), position)
+                .completion(
+                    &uri,
+                    client.doc_version(uri.as_str()),
+                    position,
+                    lsp_types::CompletionContext {
+                        trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                        trigger_character: None,
+                    },
+                )
                 .unwrap();
             assert!(
                 match completion {
