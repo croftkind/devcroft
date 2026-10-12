@@ -25,7 +25,6 @@ Use the `devcroft` CLI for Devcroft records. Artifact and review operations work
 | Read and manage document/block artifact comments | `devcroft artifact comment` — read [resources](references/resources.md) |
 | Discover session identities | `devcroft session list --json` |
 | Read and address local review comments | `devcroft review` — read [review](references/review.md) |
-| Show a Markdown file to the user | `devcroft preview /absolute/path/to/file.md` (opens a GUI window) |
 | Diagnose checkout Git status | `devcroft git-status --checkout /path/to/checkout` |
 
 For artifact, session, and repository commands, request `--json`. Review listing already emits JSON and has no `--json` flag. Inspect exit status and stderr as well as stdout.

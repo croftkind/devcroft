@@ -103,7 +103,7 @@ fn markdown_fixture() -> String {
 #[ignore = "CPU comparison; run explicitly with --ignored --nocapture --test-threads=1"]
 fn backend_benchmark_reader_scroll(cx: &mut TestAppContext) {
     init(cx);
-    let view = cx.new(|cx| crate::preview::PreviewView::new(markdown_fixture().into(), cx));
+    let view = cx.new(|cx| crate::preview::PreviewView::embedded(markdown_fixture().into(), cx));
     cx.run_until_parked();
     let (list, blocks) = view.read_with(cx, |view, cx| view.benchmark_list_state(cx));
     assert!(blocks >= 200, "expected the complete reader fixture");
@@ -119,7 +119,7 @@ fn backend_benchmark_reader_scroll(cx: &mut TestAppContext) {
 #[ignore = "CPU comparison; run explicitly with --ignored --nocapture --test-threads=1"]
 fn backend_benchmark_reader_resize(cx: &mut TestAppContext) {
     init(cx);
-    let view = cx.new(|cx| crate::preview::PreviewView::new(markdown_fixture().into(), cx));
+    let view = cx.new(|cx| crate::preview::PreviewView::embedded(markdown_fixture().into(), cx));
     cx.run_until_parked();
     let (_, cx) = cx.add_window_view(move |window, cx| Root::new(view, window, cx));
     let handle = prepare_window(cx);

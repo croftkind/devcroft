@@ -33,8 +33,8 @@ available on this device, and ambiguous matches are rejected.
 Click or keyboard-activate a reference to open it. Artifact links open in global
 Browse artifacts, including archived records and records outside the current
 page or kind filter. Existing drafts are retained; an active draft in the
-destination browser must be saved or cancelled first. Standalone previews open
-a workspace using `devcroft app --open-reference URL`.
+destination browser must be saved or cancelled first. To open a reference from
+the CLI, use `devcroft app --open-reference URL`.
 
 Hover metadata is read in the background for up to 128 unique references per
 document revision. Session details use the saved local catalog. These details

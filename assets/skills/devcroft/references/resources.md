@@ -31,7 +31,7 @@ segment. Session URLs support `opencode`, `codex`, and `claude`; never include
 device-local `store` or checkout paths in them. The desktop resolves the local
 checkout and unique session at click time. Keep labels short and meaningful.
 Hover details use local metadata; unavailable targets remain readable. These
-links work in Resources and standalone previews. To open one directly, use
+links work in Resources and the built-in editor’s Markdown preview. To open one directly, use
 `devcroft app --open-reference 'devcroft:artifact/ART_ID'`.
 
 This does not replace `--sessions-file` provenance. Mermaid and math rendering

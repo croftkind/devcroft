@@ -1,11 +1,9 @@
 //! Command-line surface; headless resources contract in `docs/resources.md`.
 //!
-//! Day-one contract: `devcroft app [--checkout <path>]` boots the GUI,
-//! bare `devcroft` prints help. `devcroft preview <path>` opens the file in
-//! a standalone preview window (no workspace, no socket — the lightweight
-//! MVP standing in for the Phase 2 `preview.open` socket method). Repository
-//! discovery and artifact commands are headless shared-store
-//! operations. Local review comments also have headless list/lifecycle commands.
+//! `devcroft app [--checkout <path>]` boots the GUI; bare `devcroft`
+//! prints help. Repository discovery and artifact commands are headless
+//! shared-store operations. Local review comments also have headless
+//! list/lifecycle commands.
 //! Sync and live-UI ref/focus commands remain future work.
 //! Dispatch in `main()` precedes GPUI initialization.
 
@@ -35,9 +33,6 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Boot the GPUI workspace, optionally opening a Markdown reference.
     App(AppArgs),
-    /// Preview a file in a dialog (currently Markdown; e.g. from Neovim:
-    /// `:!devcroft preview %`).
-    Preview(PreviewArgs),
     /// Print what the header git dot sees for a checkout: branch, tracked
     /// dirtiness, and the first few itemized gix status entries, plus the
     /// `git status --porcelain` line count for comparison.
@@ -65,19 +60,6 @@ pub(crate) struct AppArgs {
     /// Open a portable repository, artifact, or session reference after startup.
     #[arg(long, value_name = "URL")]
     pub(crate) open_reference: Option<crate::markdown_references::Reference>,
-}
-
-/// Arguments for `devcroft preview <path>`.
-///
-/// The previewed file resolves against the process cwd, so a Neovim
-/// `:!devcroft preview %` previews the current buffer wherever it lives.
-#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
-pub(crate) struct PreviewArgs {
-    /// File to preview. Currently rendered as Markdown regardless of
-    /// extension; must exist, be a regular file, be valid UTF-8, and stay
-    /// under the 4 MiB preview limit.
-    #[arg(value_name = "PATH")]
-    pub(crate) path: PathBuf,
 }
 
 /// Arguments for `devcroft git-status`.
@@ -158,24 +140,9 @@ mod tests {
     }
 
     #[test]
-    fn preview_parses_with_positional_path() {
-        let cli = Cli::try_parse_from(["devcroft", "preview", "README.md"]).unwrap();
-        assert_eq!(
-            cli.command,
-            Command::Preview(PreviewArgs {
-                path: PathBuf::from("README.md"),
-            })
-        );
-    }
-
-    #[test]
-    fn preview_requires_a_path() {
-        let error = Cli::try_parse_from(["devcroft", "preview"]).unwrap_err();
-        // Missing positional is a usage error (exit 2 per the CLI plan).
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+    fn standalone_preview_is_not_a_command() {
+        let error = Cli::try_parse_from(["devcroft", "preview", "README.md"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

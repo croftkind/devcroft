@@ -50,27 +50,22 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    App, AppContext as _, Focusable as _, KeyBinding, NoAction, SharedString, WindowBounds,
-    WindowOptions, px, rgb, size,
+    App, AppContext as _, KeyBinding, NoAction, WindowBounds, WindowOptions, px, rgb, size,
 };
 
 use crate::cli::{Cli, Command};
 use crate::{
     command_palette::{Quit, ToggleActionsPalette, ToggleProjectsPalette},
     fonts::load_bundled_fonts,
-    preview::PreviewView,
     workspace::Workspace,
 };
 
 fn main() -> Result<()> {
     // CLI dispatch happens before any GPUI init so headless commands
-    // stay fast. `app` boots the workspace;
-    // `preview` validates its file first so a bad path fails
-    // without ever opening a window.
+    // stay fast. `app` boots the workspace.
     let cli = Cli::parse();
     match cli.command {
         Command::App(args) => run_app(args),
-        Command::Preview(args) => run_preview(args.path),
         Command::GitStatus(args) => run_git_status(args.checkout, args.limit),
         Command::Session(args) => commands::sessions(args).context("devcroft session"),
         Command::Repository(args) => commands::repository(args).context("devcroft repository"),
@@ -217,10 +212,8 @@ fn install_panic_log() {
     }));
 }
 
-/// Persisted appearance (theme mode plus app font size) shared by every GUI
-/// entry point, so the preview window matches the workspace. Failures stay
-/// non-fatal with dark/default fallbacks — the terminal tabs and the
-/// preview remain usable without persisted state.
+/// Persisted workspace appearance (theme mode plus app font size).
+/// Failures stay non-fatal with dark/default fallbacks.
 fn resolve_appearance() -> (ThemeMode, f32) {
     // App-owned data root: resolve, `mkdir -p`, and first-run init of
     // `portable/`.
@@ -249,69 +242,6 @@ fn resolve_appearance() -> (ThemeMode, f32) {
             (ThemeMode::Dark, crate::metrics::DEFAULT_APP_FONT_SIZE)
         }
     }
-}
-
-/// Boot path for `devcroft preview <path>`: validates the file (failing
-/// fast with a runtime error, before any window exists), then opens a
-/// standalone preview window — no workspace, no terminal panes, no socket.
-/// From Neovim: `:!devcroft preview %`.
-fn run_preview(path: std::path::PathBuf) -> Result<()> {
-    let (title, content) = match crate::preview::read_markdown_file(&path) {
-        Ok(preview) => preview,
-        Err(error) => {
-            eprintln!("devcroft: preview: {}: {error:#}", path.display());
-            std::process::exit(1);
-        }
-    };
-    let (theme_mode, _) = resolve_appearance();
-    let content: SharedString = content.into();
-    let window_title = format!("Preview — {title}");
-    let reference_root = data::resolve_data_root().ok();
-
-    let app = gpui_kit::application().with_assets(app_assets::AppAssets);
-    app.run(move |cx| {
-        gpui_kit::init(cx);
-        // Same OS-primary quit as the workspace window (see `run_app`): the
-        // preview has no terminal to swallow keys, so the global binding is
-        // enough — no per-view forwarding needed here.
-        if cfg!(target_os = "macos") {
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-        } else {
-            cx.bind_keys([KeyBinding::new("ctrl-q", Quit, None)]);
-        }
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        load_bundled_fonts(cx).expect("failed to load bundled application fonts");
-        Theme::change(theme_mode, None, cx);
-        apply_focus_theme(cx);
-
-        let options = WindowOptions {
-            titlebar: Some(gpui_kit::TitlebarOptions {
-                title: Some(window_title.into()),
-                ..Default::default()
-            }),
-            window_bounds: Some(WindowBounds::centered(size(px(900.), px(700.)), cx)),
-            // Same identity as the workspace window (see `run_app`): the
-            // compositor, taskbars, and window rules key off this.
-            app_id: Some("devcroft".to_owned()),
-            ..Default::default()
-        };
-
-        // Match the workspace host: `gpui_kit::open_window` supplies the
-        // `Root` (rem sizing, text selection/copy, focus traversal and
-        // component overlays) itself.
-        gpui_kit::open_window(options, cx, move |window, cx| {
-            let view = cx.new(|cx| {
-                let mut view = PreviewView::new(content.clone(), cx);
-                view.set_reference_root(reference_root.clone(), cx);
-                view
-            });
-            view.read(cx).focus_handle(cx).focus(window, cx);
-            view
-        })
-        .map_err(|error| anyhow!("failed to open preview window: {error}"))
-        .expect("failed to open preview window");
-    });
-    Ok(())
 }
 
 /// Single blue used for every keyboard-focus border, applied to the shared

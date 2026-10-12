@@ -1,24 +1,13 @@
-//! File preview (`devcroft preview <path>`).
+//! Shared Markdown reader for Resources and the built-in editor.
 //!
-//! Headless validation (exists, is a file, size-bounded, UTF-8) runs before
-//! any GPUI init so bad paths fail fast from scripts and Neovim
-//! (`:!devcroft preview %`). [`PreviewView`] then renders the file in a
-//! standalone window — no workspace, no terminal panes, no socket — as a
-//! stateful scrollable [`TextView`](gpui_kit::component::text::TextView)
-//! with a hover-expandable table of contents and scrollspy.
-//! Resources embeds this same reader; only the outer spacing and outline
-//! controls differ. Both window entry points host it inside the component Root.
-//!
-//! Markdown is the first renderer; future kinds (images, …) add sibling
-//! readers and either extend [`PreviewView`] or add a parallel view,
-//! keeping the single `preview` command stable.
+//! [`PreviewView`] renders a stateful scrollable
+//! [`TextView`](gpui_kit::component::text::TextView) with find and scrollspy.
+//! Resources supplies comment controls and an outline rail; the editor uses
+//! a comment-free reader with its own outline.
 
 mod resource_blocks;
 pub(crate) use resource_blocks::{BlockAction, CommentHandler};
 
-use std::path::Path;
-
-use anyhow::{Context as _, Result};
 use gpui_kit::base::text::{RangeHighlight, RenderedText};
 use gpui_kit::base::{Scrollbar, TextView, TextViewStyle};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -38,9 +27,6 @@ use gpui_kit::{
 
 /// Shared column width for document content and resource metadata.
 pub(crate) const READING_WIDTH: f32 = 820.;
-
-/// Maximum previewed file size: matches the repository file-API limit.
-pub(crate) const MAX_MARKDOWN_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Preserve label/value metadata lines without preventing ordinary prose from
 /// reflowing. Work on parsed paragraphs so fences and frontmatter stay intact.
@@ -146,32 +132,6 @@ pub(crate) fn highlight_code(
         offset += line.len();
     }
     spans
-}
-
-/// Read and validate a preview target. Returns `(title, content)` where the
-/// title is the file name (falling back to the full path when it has none).
-pub(crate) fn read_markdown_file(path: &Path) -> Result<(String, String)> {
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
-    if !metadata.is_file() {
-        anyhow::bail!("not a file: {}", path.display());
-    }
-    if metadata.len() > MAX_MARKDOWN_BYTES {
-        anyhow::bail!(
-            "{} is {} bytes, over the {}-byte preview limit",
-            path.display(),
-            metadata.len(),
-            MAX_MARKDOWN_BYTES
-        );
-    }
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {} as UTF-8", path.display()))?;
-    let title = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| path.as_os_str().to_str().unwrap_or("Markdown preview"))
-        .to_owned();
-    Ok((title, content))
 }
 
 /// One table-of-contents entry: a top-level heading and the document block
@@ -369,9 +329,7 @@ struct FindState {
     truncated: bool,
 }
 
-/// Standalone preview window content: a centered document with an outline
-/// overlay. Focused on mount (see `run_preview`) so keyboard
-/// scrolling works without a click first.
+/// Shared document content, find state, and outline navigation.
 pub(crate) struct PreviewView {
     content: SharedString,
     resources: Option<resource_blocks::ResourceBlocks>,
@@ -386,9 +344,7 @@ pub(crate) struct PreviewView {
     blocks: usize,
     active: usize,
     focus_handle: FocusHandle,
-    toc_hovered: bool,
     toc_focus: FocusHandle,
-    embedded: bool,
     editor_preview: bool,
     code_highlights: std::sync::Arc<parking_lot::Mutex<CodeHighlights>>,
     /// Open find session; `None` while the bar is closed.
@@ -411,18 +367,12 @@ impl PreviewView {
 
     fn reference_handler(&self, cx: &Context<Self>) -> crate::markdown_references::OpenHandler {
         let view = cx.entity().downgrade();
-        std::sync::Arc::new(move |reference, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                if view.embedded {
-                    cx.emit(OpenReference(reference));
-                } else {
-                    crate::markdown_references::open_in_workspace(reference, window, cx);
-                }
-            });
+        std::sync::Arc::new(move |reference, _, cx| {
+            let _ = view.update(cx, |_, cx| cx.emit(OpenReference(reference)));
         })
     }
 
-    pub(crate) fn new(content: SharedString, cx: &mut Context<Self>) -> Self {
+    fn new(content: SharedString, cx: &mut Context<Self>) -> Self {
         let content = metadata_line_breaks(&content);
         let (toc, blocks) = extract_toc(&content);
         let state = cx.new(|cx| TextViewState::markdown(&content, cx));
@@ -463,9 +413,7 @@ impl PreviewView {
             blocks,
             active: 0,
             focus_handle: cx.focus_handle(),
-            toc_hovered: false,
             toc_focus: cx.focus_handle().tab_stop(true),
-            embedded: false,
             editor_preview: false,
             code_highlights: Default::default(),
             find: None,
@@ -476,14 +424,12 @@ impl PreviewView {
     pub(crate) fn embedded(content: SharedString, cx: &mut Context<Self>) -> Self {
         let mut view = Self::new(content.clone(), cx);
         view.resources = Some(resource_blocks::ResourceBlocks::new(content, &view.content));
-        view.embedded = true;
         view
     }
 
     /// Editor files use the reader without Resources' comment affordances.
     pub(crate) fn for_editor(content: SharedString, cx: &mut Context<Self>) -> Self {
         let mut view = Self::new(content, cx);
-        view.embedded = true;
         view.editor_preview = true;
         view
     }
@@ -520,14 +466,13 @@ impl PreviewView {
         let heading = self.toc.get(self.active).map(|entry| entry.title.clone());
         let mut next = if self.editor_preview {
             Self::for_editor(content, cx)
-        } else if self.embedded {
+        } else if self.resources.is_some() {
             Self::embedded(content, cx)
         } else {
             Self::new(content, cx)
         };
         next.focus_handle = self.focus_handle.clone();
         next.toc_focus = self.toc_focus.clone();
-        next.embedded = self.embedded;
         next.reference_generation = self.reference_generation;
         next.reference_root = self.reference_root.clone();
         // An open find session survives the swap; its matches are recomputed
@@ -808,8 +753,7 @@ impl PreviewView {
             .into_any_element()
     }
 
-    /// The outline overlays the document rather than changing its wrapping.
-    /// Focus expands it too; arrow keys navigate and Escape returns to reading.
+    /// Editor outline rail beside the document.
     fn render_editor_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .id("editor-preview-outline")
@@ -871,107 +815,6 @@ impl PreviewView {
                     })),
             )
     }
-
-    fn render_toc(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active;
-        let expanded = self.toc_hovered || self.toc_focus.is_focused(window);
-        v_flex()
-            .id("preview-toc")
-            .track_focus(&self.toc_focus)
-            .flex_none()
-            .w(px(if expanded { 280. } else { 40. }))
-            .max_w_full()
-            .h_auto()
-            .max_h((window.viewport_size().height - px(96.)).max(px(40.)))
-            .py_3()
-            .px_2()
-            .rounded_lg()
-            .when(expanded, |this| {
-                this.bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .shadow_lg()
-            })
-            .on_hover(cx.listener(|this, hovered, _, cx| {
-                this.toc_hovered = *hovered;
-                cx.notify();
-            }))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                let index = match event.keystroke.key.as_str() {
-                    "up" => this.active.saturating_sub(1),
-                    "down" => (this.active + 1).min(this.toc.len() - 1),
-                    "home" => 0,
-                    "end" => this.toc.len() - 1,
-                    "escape" => {
-                        this.focus_handle.focus(window, cx);
-                        cx.notify();
-                        cx.stop_propagation();
-                        return;
-                    }
-                    _ => return,
-                };
-                this.on_toc_click(index, cx);
-                window.prevent_default();
-                cx.stop_propagation();
-            }))
-            .overflow_y_scroll()
-            .when(expanded, |this| {
-                this.child(
-                    div()
-                        .px_2()
-                        .pb_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("On this page"),
-                )
-            })
-            .children(self.toc.iter().enumerate().map(|(index, entry)| {
-                let is_active = index == active;
-                // h1 flush; each deeper level indented one step.
-                let indent = px(8. + f32::from(entry.level.saturating_sub(1)) * 12.);
-                div()
-                    .id(("toc-row", index))
-                    .flex_none()
-                    .w_full()
-                    .py(px(if expanded { 6. } else { 4. }))
-                    .pl(if expanded { indent } else { px(0.) })
-                    .pr(px(if expanded { 8. } else { 0. }))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_sm()
-                    .when(is_active && expanded, |this| {
-                        this.bg(cx.theme().accent)
-                            .text_color(cx.theme().accent_foreground)
-                    })
-                    .when(!is_active, |this| {
-                        this.text_color(cx.theme().muted_foreground)
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.on_toc_click(index, cx);
-                        }),
-                    )
-                    .when(expanded, |this| this.child(entry.title.clone()))
-                    .when(!expanded, |this| {
-                        this.items_end().flex().justify_end().child(
-                            div()
-                                .flex_none()
-                                .w(px((26. - f32::from(entry.level - 1) * 4.).max(8.)))
-                                .h(px(2.))
-                                .rounded_full()
-                                .bg(if is_active {
-                                    cx.theme().foreground
-                                } else {
-                                    cx.theme().muted_foreground.opacity(0.45)
-                                }),
-                        )
-                    })
-            }))
-    }
 }
 
 impl Focusable for PreviewView {
@@ -981,11 +824,11 @@ impl Focusable for PreviewView {
 }
 
 impl Render for PreviewView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Embedded readers sit below the host view's own compact header,
         // so they keep only a small top margin. Bottom keeps 32px to
         // match the scrollbar insets below.
-        let reader_top = if self.embedded { px(8.) } else { px(32.) };
+        let reader_top = px(8.);
         let list_state = self.state.read(cx).list_state().clone();
         let mut table = StyleRefinement::default();
         table.overflow.x = Some(Overflow::Scroll);
@@ -1068,27 +911,11 @@ impl Render for PreviewView {
                     this.close_find(window, cx);
                     window.prevent_default();
                     cx.stop_propagation();
-                    return;
-                }
-                if !this.embedded
-                    && this.find.is_none()
-                    && event.keystroke.key == "tab"
-                    && !this.toc.is_empty()
-                {
-                    if this.toc_focus.is_focused(window) {
-                        this.focus_handle.focus(window, cx);
-                    } else {
-                        this.toc_focus.focus(window, cx);
-                    }
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    cx.notify();
                 }
             }))
             .relative()
             .size_full()
             .justify_center()
-            .when(!self.embedded, |this| this.px(px(40.)))
             .bg(cx.theme().background)
             .text_color(body)
             .font_family(crate::fonts::MARKDOWN_FONT_FAMILY)
@@ -1148,20 +975,7 @@ impl Render for PreviewView {
                             .id("preview-scrollbar")
                             .viewport_from_layout(),
                     ),
-            )
-            .when(!self.toc.is_empty() && !self.embedded, |this| {
-                this.child(
-                    v_flex()
-                        .absolute()
-                        .right(px(24.))
-                        .top_0()
-                        .h_full()
-                        .max_w_full()
-                        .py(px(48.))
-                        .justify_center()
-                        .child(self.render_toc(window, cx)),
-                )
-            });
+            );
         if self.editor_preview {
             h_flex()
                 .size_full()
@@ -1204,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn both_hosts_reserve_space_for_wrapped_headings() {
+    fn core_and_resources_reserve_space_for_wrapped_headings() {
         use gpui_kit::component::Root;
         use gpui_kit::{Bounds, Pixels, TestApp, WindowBounds, WindowOptions, point, size};
 
@@ -1216,9 +1030,8 @@ mod tests {
             let mut layouts = Vec::new();
             for embedded in [false, true] {
                 let mut reader = None;
-                // Give both hosts the same content width; standalone adds
-                // 40px side margins while Resources supplies its own spacing.
-                let width = column_width + if embedded { 0. } else { 80. };
+                // Compare the core reader and Resources at the same column width.
+                let width = column_width;
                 let mut window = app.open_window_with_options(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -1317,65 +1130,6 @@ mod tests {
         }
         assert!(highlight_code("plain", None, true).is_empty());
         assert!(highlight_code("plain", Some("unknown-language"), true).is_empty());
-    }
-
-    #[test]
-    fn reads_file_with_file_name_as_title() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notes.md");
-        std::fs::write(&path, "# Hello\n\nSome **text**.\n").unwrap();
-
-        let (title, content) = read_markdown_file(&path).unwrap();
-        assert_eq!(title, "notes.md");
-        assert!(content.contains("# Hello"));
-    }
-
-    #[test]
-    fn missing_path_errors_with_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("no-such.md");
-        let error = read_markdown_file(&missing).unwrap_err();
-        assert!(
-            error.to_string().contains(&missing.display().to_string()),
-            "error should name the path, got: {error:#}"
-        );
-    }
-
-    #[test]
-    fn directory_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let error = read_markdown_file(dir.path()).unwrap_err();
-        assert!(
-            error.to_string().contains("not a file"),
-            "expected not-a-file, got: {error:#}"
-        );
-    }
-
-    #[test]
-    fn oversized_file_is_rejected_before_reading() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.md");
-        let content = vec![b'a'; MAX_MARKDOWN_BYTES as usize + 1];
-        std::fs::write(&path, content).unwrap();
-
-        let error = read_markdown_file(&path).unwrap_err();
-        assert!(
-            error.to_string().contains("over the"),
-            "expected size-limit error, got: {error:#}"
-        );
-    }
-
-    #[test]
-    fn non_utf8_file_is_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("binary.md");
-        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x28]).unwrap();
-
-        let error = read_markdown_file(&path).unwrap_err();
-        assert!(
-            error.to_string().contains("UTF-8"),
-            "expected UTF-8 error, got: {error:#}"
-        );
     }
 
     #[test]
