@@ -78,6 +78,11 @@ Open Git for the current checkout with `Cmd+J`, then `g` on macOS (`Ctrl+J`, the
 
 Changes, Branches, History, remote actions, rebase, and conflict continuation are described in [Git workflow](git.md). Operation and destructive controls stay inside the dialog. External repository changes refresh automatically.
 
+In a focused **Git History diff**, `Shift+Up` / `Shift+Down` extends a source-line
+selection; `Cmd+C` on macOS or `Ctrl+C` elsewhere copies the selected source.
+Use the diff's **Unified**, **Split**, **Wrap**, and change-navigation buttons
+to control its display.
+
 ## Preview window
 
 The standalone preview window (`devcroft preview <path>`) and the Resources reader share one document reader, so find works identically in both. `Cmd+F` on macOS (`Ctrl+F` on Linux/Windows) opens the find bar over the document; `Enter` steps to the next match and `Shift+Enter` to the previous one (both wrap); `Escape` closes the bar, clears its highlights, and returns focus to the document. Matching is case-insensitive and runs over the rendered text, so it crosses Markdown formatting.

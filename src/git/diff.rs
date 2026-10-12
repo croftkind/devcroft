@@ -9,6 +9,7 @@ use std::{
 };
 
 use crate::diff::{
+    kit_viewer::PreparedKitDiff,
     model::{ChangedFile, FileContent, FileStatus, UnavailableReason, count_changes, diff_text},
     viewer::PreparedFileDiff,
 };
@@ -77,17 +78,26 @@ pub(super) fn load_history_diff(
     root: &Path,
     file: &super::history::HistoryFile,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<PreparedFileDiff, String> {
-    Ok(PreparedFileDiff::new(load_history_file(
-        root, file, cancel,
-    )?))
+) -> Result<PreparedKitDiff, String> {
+    let (old, new) = load_history_pair(root, file, cancel)?;
+    let target = DiffTarget {
+        area: ChangeArea::Staged,
+        change: file.change.clone(),
+    };
+    let changed = classify_content(&target, &old, &new);
+    PreparedKitDiff::new(
+        changed,
+        old.text(),
+        new.text(),
+        [&file.old_mode, &file.new_mode],
+    )
 }
 
-fn load_history_file(
+fn load_history_pair(
     root: &Path,
     file: &super::history::HistoryFile,
     cancel: &std::sync::atomic::AtomicBool,
-) -> Result<ChangedFile, String> {
+) -> Result<(Content, Content), String> {
     let old = if file.old_mode == "000000" {
         Content::empty()
     } else {
@@ -108,11 +118,7 @@ fn load_history_file(
             Some(cancel),
         )?
     };
-    let target = DiffTarget {
-        area: ChangeArea::Staged,
-        change: file.change.clone(),
-    };
-    Ok(classify(&target, old, new))
+    Ok((old, new))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,6 +136,13 @@ enum Content {
 }
 
 impl Content {
+    fn text(&self) -> &str {
+        match self {
+            Self::Bytes { bytes, .. } => std::str::from_utf8(bytes).unwrap_or(""),
+            _ => "",
+        }
+    }
+
     fn empty() -> Self {
         Self::Bytes {
             kind: ContentKind::Empty,
@@ -139,7 +152,11 @@ impl Content {
 }
 
 fn classify(target: &DiffTarget, old: Content, new: Content) -> ChangedFile {
-    let unavailable = match (&old, &new) {
+    classify_content(target, &old, &new)
+}
+
+fn classify_content(target: &DiffTarget, old: &Content, new: &Content) -> ChangedFile {
+    let unavailable = match (old, new) {
         (Content::Submodule, _) | (_, Content::Submodule) => Some(UnavailableReason::Submodule),
         (Content::TooLarge, _) | (_, Content::TooLarge) => Some(UnavailableReason::TooLarge),
         (Content::Missing, _) | (_, Content::Missing) => Some(UnavailableReason::Missing),
@@ -158,10 +175,10 @@ fn classify(target: &DiffTarget, old: Content, new: Content) -> ChangedFile {
     let (Content::Bytes { bytes: old, .. }, Content::Bytes { bytes: new, .. }) = (old, new) else {
         unreachable!("unavailable content returned above")
     };
-    if is_binary(&old) || is_binary(&new) {
+    if is_binary(old) || is_binary(new) {
         return unavailable_file(&target.change, UnavailableReason::Binary);
     }
-    let (Ok(old), Ok(new)) = (std::str::from_utf8(&old), std::str::from_utf8(&new)) else {
+    let (Ok(old), Ok(new)) = (std::str::from_utf8(old), std::str::from_utf8(new)) else {
         return unavailable_file(&target.change, UnavailableReason::InvalidUtf8);
     };
     let (additions, deletions) = count_changes(old, new);
@@ -724,7 +741,7 @@ mod history_tests {
             new_oid: new,
         };
         let cancel = AtomicBool::new(false);
-        let diff = load_history_file(root, &file, &cancel).unwrap();
+        let diff = load_history_diff(root, &file, &cancel).unwrap().file;
         assert_eq!((diff.additions, diff.deletions), (1, 1));
         let FileContent::Text { hunks, .. } = diff.content else {
             panic!("text diff expected")
@@ -736,41 +753,60 @@ mod history_tests {
         file.old_mode = "000000".into();
         file.change.kind = ChangeKind::Added;
         assert_eq!(
-            load_history_file(root, &file, &cancel).unwrap().deletions,
+            load_history_diff(root, &file, &cancel)
+                .unwrap()
+                .file
+                .deletions,
             0
         );
         file.old_mode = "100644".into();
         file.new_mode = "000000".into();
         file.change.kind = ChangeKind::Deleted;
         assert_eq!(
-            load_history_file(root, &file, &cancel).unwrap().additions,
+            load_history_diff(root, &file, &cancel)
+                .unwrap()
+                .file
+                .additions,
             0
         );
         file.new_mode = "120000".into();
         assert_eq!(
-            load_history_file(root, &file, &cancel).unwrap().content,
+            load_history_diff(root, &file, &cancel)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::Unsupported)
         );
         file.new_mode = "160000".into();
         assert_eq!(
-            load_history_file(root, &file, &cancel).unwrap().content,
+            load_history_diff(root, &file, &cancel)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::Submodule)
         );
         file.new_mode = "100644".into();
         file.new_oid = git(&["hash-object", "-w", "--stdin"], Some(&[0, 1]));
         assert_eq!(
-            load_history_file(root, &file, &cancel).unwrap().content,
+            load_history_diff(root, &file, &cancel)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::Binary)
         );
         file.new_oid = git(&["hash-object", "-w", "--stdin"], Some(&[0xff]));
         assert_eq!(
-            load_history_file(root, &file, &cancel).unwrap().content,
+            load_history_diff(root, &file, &cancel)
+                .unwrap()
+                .file
+                .content,
             FileContent::Unavailable(UnavailableReason::InvalidUtf8)
         );
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(
-            load_history_file(root, &file, &cancel)
-                .unwrap_err()
+            load_history_diff(root, &file, &cancel)
+                .err()
+                .unwrap()
                 .contains("cancelled")
         );
     }

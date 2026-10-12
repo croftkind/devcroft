@@ -84,6 +84,15 @@ immutable parent-to-commit diff. Root commits compare to an empty tree;
 merge commits explicitly compare to the first parent. Oversized metadata is
 truncated with a notice.
 
+The History diff supports **Unified** and **Split** layouts, **Wrap** for long
+lines, and **Previous change / Next change**. These display choices remain when
+selecting another file. Drag over source text or select lines from the gutter,
+then use `Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff
+markers or line numbers. `Shift+Up` / `Shift+Down` extends a line selection.
+Only supplied patch context is available. Files beyond the existing 4 MiB
+read limit show an explanation; diffs beyond the 4,000 retained hunk-line limit
+show a persistent truncation notice. Omitted source cannot be expanded or copied.
+
 **Copy commit id**, **Create branch here**, and confirmed **Check out commit**
 are available. Checking out a commit enters detached HEAD. Create or switch
 to a branch before committing work you intend to keep.

@@ -1,4 +1,5 @@
 use super::*;
+use crate::diff::kit_viewer::{KitDiffViewer, PreparedKitDiff};
 use crate::git::{
     history::{self, Commit, HistoryFile},
     remote::{Action, Source},
@@ -37,7 +38,7 @@ pub(super) struct HistoryState {
     selected_file: Option<usize>,
     diff_generation: u64,
     diff_cancel: Arc<AtomicBool>,
-    viewer: Entity<DiffViewer>,
+    viewer: Entity<KitDiffViewer>,
     choose_scope: bool,
     create_branch: bool,
     show_metadata: bool,
@@ -69,7 +70,7 @@ impl HistoryState {
             selected_file: None,
             diff_generation: 0,
             diff_cancel: Arc::new(AtomicBool::new(false)),
-            viewer: cx.new(DiffViewer::new),
+            viewer: cx.new(KitDiffViewer::new),
             choose_scope: false,
             create_branch: false,
             show_metadata: false,
@@ -249,17 +250,27 @@ impl GitDialog {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.history.diff_generation != generation {
-                    return;
-                }
-                this.history.viewer.update(cx, |viewer, cx| match result {
-                    Ok(diff) => viewer.set_loaded(diff, cx),
-                    Err(error) => viewer.set_error(label, error, cx),
-                });
+                this.complete_history_diff(generation, label, result, cx);
             });
         })
         .detach();
         cx.notify();
+    }
+
+    fn complete_history_diff(
+        &mut self,
+        generation: u64,
+        label: String,
+        result: Result<PreparedKitDiff, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history.diff_generation != generation {
+            return;
+        }
+        self.history.viewer.update(cx, |viewer, cx| match result {
+            Ok(diff) => viewer.set_loaded(diff, cx),
+            Err(error) => viewer.set_error(label, error, cx),
+        });
     }
 
     fn request_detach(&mut self, oid: String, cx: &mut Context<Self>) {
@@ -949,6 +960,7 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-m", "root commit"]);
         std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        std::fs::write(root.join("root.txt"), "root updated\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-m", "new commit"]);
         let snapshot = load_snapshot(root).unwrap();
@@ -1031,6 +1043,52 @@ mod tests {
             dialog.read_with(test_cx, |this, _| this.history.selected_file),
             Some(0)
         );
+        let (obsolete_generation, obsolete_file) = dialog.update(test_cx, |this, cx| {
+            this.select_history_file(0, cx);
+            let cancel = this.history.diff_cancel.clone();
+            let generation = this.history.diff_generation;
+            let file = this.history.files[0].clone();
+            this.select_history_file(1, cx);
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(this.history.diff_generation > generation);
+            (generation, file)
+        });
+        test_cx.run_until_parked();
+        let stale_diff =
+            crate::git::diff::load_history_diff(root, &obsolete_file, &AtomicBool::new(false))
+                .unwrap();
+        dialog.update(test_cx, |this, cx| {
+            this.complete_history_diff(obsolete_generation, "new.txt".into(), Ok(stale_diff), cx);
+            this.complete_history_diff(
+                obsolete_generation,
+                "new.txt".into(),
+                Err("obsolete error".into()),
+                cx,
+            );
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("diff-body")
+                    .label()
+                    .unwrap()
+                    .contains("root.txt"),
+                "obsolete results cannot replace the current file"
+            );
+            window.click("history-diff-split", cx);
+            window.press("home", cx);
+            window.press("down", cx);
+            window.press("end", cx);
+        });
+        dialog.read_with(test_cx, |this, _| {
+            assert_eq!(
+                this.history.selected,
+                Some(0),
+                "diff keys leave the commit selection alone"
+            );
+            assert_eq!(this.history.selected_file, Some(1));
+        });
         dialog.update(test_cx, |this, cx| {
             this.mode = GitMode::Changes;
             cx.notify();
