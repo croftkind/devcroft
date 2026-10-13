@@ -487,7 +487,8 @@ impl Workspace {
                 workspace.on_navigation_keystroke(event, window, cx);
             });
         });
-        let (agent_activity, activity_updates) = AgentActivityStore::new();
+        let (agent_activity, activity_updates) =
+            AgentActivityStore::with_data_root(data_root.clone());
         cx.spawn(async move |this, cx| {
             while activity_updates.recv().await.is_ok() {
                 while activity_updates.try_recv().is_ok() {}
@@ -759,7 +760,9 @@ impl Workspace {
         .detach();
         let relationships =
             cx.new(|cx| crate::repository_graph::GraphPage::new(data_root.clone(), window, cx));
+        let workspace = cx.entity().downgrade();
         relationships.update(cx, |view, cx| {
+            view.set_workspace(workspace);
             view.set_space(active_space.clone(), spaces.names(), cx)
         });
         cx.subscribe_in(
@@ -775,6 +778,8 @@ impl Workspace {
                 crate::repository_graph::GraphEvent::MetadataChanged => {
                     this.home.update(cx, |view, cx| view.reload(cx));
                     this.reload_recent_repositories();
+                    this.publish_sessions(cx);
+                    this.refresh_sessions(cx);
                 }
             },
         )
@@ -1464,6 +1469,8 @@ impl Workspace {
                         active_space,
                     )
                 });
+                let workspace = cx.entity().downgrade();
+                view.update(cx, |view, _| view.set_workspace(workspace));
                 cx.subscribe(
                     &view,
                     |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
@@ -1740,6 +1747,20 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Repository ownership can change while a pane is retained. Never
+        // silently restore an agent running under the previous account.
+        let account = crate::agent_accounts::Accounts::load(self.data_root.as_ref())
+            .map(|accounts| accounts.for_checkout(&self.working_directory));
+        let agent_index = WorkspaceTab::Agent as usize;
+        if self.tabs[agent_index].as_ref().is_some_and(|pane| {
+            !account
+                .as_ref()
+                .is_ok_and(|account| pane.read(cx).account_matches(account))
+        }) {
+            self.remember_agent_pane(cx);
+            self.tabs[agent_index] = None;
+            self.agent_autostart.remove(&self.working_directory);
+        }
         self.relationships_visible = false;
         self.relationships
             .update(cx, |view, cx| view.set_active(false, cx));
@@ -1886,6 +1907,7 @@ impl Workspace {
         });
         self.reload_recent_repositories();
         self.publish_sessions(cx);
+        self.refresh_sessions(cx);
         cx.notify();
     }
 
@@ -1978,6 +2000,7 @@ impl Workspace {
         });
         self.reload_recent_repositories();
         self.publish_sessions(cx);
+        self.refresh_sessions(cx);
         cx.notify();
     }
 

@@ -95,6 +95,7 @@ impl ActivitySnapshot {
 
 #[derive(Clone)]
 pub(crate) struct AgentActivityStore {
+    data_root: Option<crate::data::DataRoot>,
     inner: Arc<Mutex<StoreInner>>,
     updates: Sender<()>,
 }
@@ -179,10 +180,16 @@ impl ActivityRecord {
 }
 
 impl AgentActivityStore {
+    #[cfg(test)]
     pub(crate) fn new() -> (Self, Receiver<()>) {
+        Self::with_data_root(None)
+    }
+
+    pub(crate) fn with_data_root(data_root: Option<crate::data::DataRoot>) -> (Self, Receiver<()>) {
         let (updates, receiver) = async_channel::unbounded();
         (
             Self {
+                data_root,
                 inner: Arc::new(Mutex::new(StoreInner::default())),
                 updates,
             },
@@ -212,6 +219,20 @@ impl AgentActivityStore {
         session: Option<&crate::agent_sessions::SessionSummary>,
         prompt: Option<&str>,
     ) -> PreparedAgentLaunch {
+        let account = (|| -> anyhow::Result<crate::agent_accounts::Account> {
+            let accounts = crate::agent_accounts::Accounts::load(self.data_root.as_ref())?;
+            if let Some(session) = session {
+                anyhow::ensure!(
+                    accounts.permits(session),
+                    "This session belongs to a different profile's agent account"
+                );
+            }
+            let account = accounts.for_checkout(checkout);
+            account.prepare(agent)?;
+            Ok(account)
+        })();
+        let launch_error = account.as_ref().err().map(|error| format!("{error:#}"));
+        let account = account.unwrap_or_default();
         let checkout = checkout
             .canonicalize()
             .unwrap_or_else(|_| checkout.to_owned());
@@ -264,8 +285,24 @@ impl AgentActivityStore {
             provider.arguments.extend(agent.prompt_arguments(prompt));
         }
         let exit_marker = format!("devcroft-agent-exit-{generation}-");
-        let command_line = shell_command(agent, generation, &provider);
+        let mut command_line =
+            account.wrap_command(agent, &shell_command(agent, generation, &provider));
+        // Isolated launches run in a subshell. Also clear observer secrets in
+        // the parent login shell after it returns.
+        if !provider.environment.is_empty() {
+            command_line.push_str(&format!(
+                "; unset {}",
+                provider
+                    .environment
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
         PreparedAgentLaunch {
+            account,
+            launch_error,
             command_line,
             exit_marker,
             environment: provider.environment,
@@ -382,6 +419,8 @@ impl AgentActivityStore {
 }
 
 pub(crate) struct PreparedAgentLaunch {
+    pub(crate) account: crate::agent_accounts::Account,
+    pub(crate) launch_error: Option<String>,
     command_line: String,
     exit_marker: String,
     environment: Vec<(String, String)>,

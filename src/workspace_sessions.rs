@@ -133,6 +133,52 @@ impl ListDelegate for AgentPicker {
 }
 
 impl Workspace {
+    pub(crate) fn ensure_repository_agent_idle(
+        &mut self,
+        key: &str,
+        cx: &App,
+    ) -> anyhow::Result<()> {
+        self.remember_agent_pane(cx);
+        if let Some(root) = &self.data_root
+            && let Some(checkout) = crate::data::checkout_for(root, key)
+        {
+            anyhow::ensure!(
+                !self
+                    .open_sessions
+                    .values()
+                    .any(|session| session.checkout == checkout_identity(&checkout)),
+                "Close this repository's open agent sessions before moving it to another space."
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_agent_accounts_idle(
+        &mut self,
+        space: &str,
+        cx: &App,
+    ) -> anyhow::Result<()> {
+        self.remember_agent_pane(cx);
+        if let Some(root) = &self.data_root {
+            let (repositories, errors) = crate::data::all_repositories(root)?;
+            anyhow::ensure!(errors.is_empty(), "Could not check open agent accounts");
+            let busy = repositories
+                .iter()
+                .filter(|repo| crate::data::space_eq(&repo.space, space))
+                .filter_map(|repo| repo.checkout_path.as_ref())
+                .any(|checkout| {
+                    self.open_sessions
+                        .values()
+                        .any(|session| session.checkout == checkout_identity(checkout))
+                });
+            anyhow::ensure!(
+                !busy,
+                "Close the open agent sessions in {space} before changing its accounts."
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn new_review(cwd: &Path, cx: &mut Context<Self>) -> Entity<ReviewView> {
         let review = cx.new(|cx| ReviewView::new(cwd, cx));
         let checkout = cwd.to_owned();
@@ -242,7 +288,28 @@ impl Workspace {
     pub(super) fn publish_sessions(&mut self, cx: &mut Context<Self>) {
         self.session_snapshot = self.session_catalog.snapshot();
         self.remember_agent_pane(cx);
+        let accounts = crate::agent_accounts::Accounts::load(self.data_root.as_ref());
+        let index = WorkspaceTab::Agent as usize;
+        // External metadata edits or portable sync can also change ownership.
+        // Retain old processes for explicit closing, but detach their panes.
+        if self.tabs[index].as_ref().is_some_and(|pane| {
+            !pane.read(cx).launch_failed()
+                && !accounts.as_ref().is_ok_and(|accounts| {
+                    pane.read(cx)
+                        .account_matches(&accounts.for_checkout(&self.working_directory))
+                })
+        }) {
+            self.tabs[index] = None;
+            self.agent_autostart.remove(&self.working_directory);
+        }
         for open in self.open_sessions.values_mut() {
+            if !accounts.as_ref().is_ok_and(|accounts| {
+                open.pane
+                    .read(cx)
+                    .account_matches(&accounts.for_checkout(&open.checkout))
+            }) {
+                continue;
+            }
             if let Some(native) = open.pane.read(cx).native_session() {
                 // The provider signal, not recency or title, establishes identity.
                 if let Some(session) = self.session_snapshot.sessions.iter().find(|s| {
@@ -269,6 +336,13 @@ impl Workspace {
             .collect();
         let mut candidates_by_open: HashMap<u64, Vec<SessionKey>> = HashMap::new();
         for (&id, open) in &self.open_sessions {
+            if !accounts.as_ref().is_ok_and(|accounts| {
+                open.pane
+                    .read(cx)
+                    .account_matches(&accounts.for_checkout(&open.checkout))
+            }) {
+                continue;
+            }
             if open.key.is_some() || open.pane.read(cx).native_session().is_some() {
                 continue;
             }
@@ -522,6 +596,16 @@ impl Workspace {
         let Some(open) = self.open_sessions.get(&id) else {
             return;
         };
+        let valid =
+            crate::agent_accounts::Accounts::load(self.data_root.as_ref()).is_ok_and(|accounts| {
+                open.pane
+                    .read(cx)
+                    .account_matches(&accounts.for_checkout(&open.checkout))
+            });
+        if !valid {
+            window.push_notification("This session uses the repository's previous agent account. Close it and start a new session.", cx);
+            return;
+        }
         let (pane, checkout, agent) = (open.pane.clone(), open.checkout.clone(), open.agent);
         self.restore_repository_tabs(&checkout, cx);
         self.tabs[WorkspaceTab::Agent as usize] = Some(pane);

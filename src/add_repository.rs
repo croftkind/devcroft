@@ -50,6 +50,8 @@ pub(crate) enum RepositoryDialogMode {
 }
 
 pub(crate) struct AddRepositoryView {
+    workspace: Option<gpui_kit::WeakEntity<crate::workspace::Workspace>>,
+    original_space: Option<String>,
     focus_handle: FocusHandle,
     mode: RepositoryDialogMode,
     data_root: Option<DataRoot>,
@@ -86,6 +88,8 @@ impl AddRepositoryView {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
         Self {
+            workspace: None,
+            original_space: None,
             focus_handle: cx.focus_handle(),
             mode: RepositoryDialogMode::Create,
             data_root,
@@ -166,7 +170,15 @@ impl AddRepositoryView {
             metadata.base_branch.as_deref().unwrap_or(""),
         );
         view.mode = RepositoryDialogMode::Edit { key };
+        view.original_space = Some(view.space.clone());
         view
+    }
+
+    pub(crate) fn set_workspace(
+        &mut self,
+        workspace: gpui_kit::WeakEntity<crate::workspace::Workspace>,
+    ) {
+        self.workspace = Some(workspace);
     }
 
     /// Pure form snapshot for validation: whitespace-only counts as absent.
@@ -328,6 +340,25 @@ impl AddRepositoryView {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
+        }
+        if let RepositoryDialogMode::Edit { key } = &self.mode
+            && self
+                .original_space
+                .as_ref()
+                .is_some_and(|original| !crate::data::space_eq(original, &self.space))
+            && let Some(workspace) = self.workspace.clone()
+        {
+            let result = workspace
+                .update(cx, |workspace, cx| {
+                    workspace.ensure_repository_agent_idle(key, cx)
+                })
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
         }
         let Some(root) = self.data_root.clone() else {
             self.error = Some("portable data is unavailable".to_owned());

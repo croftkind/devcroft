@@ -54,6 +54,7 @@ pub(crate) enum GraphEvent {
 
 pub(crate) struct GraphPage {
     pub(crate) focus_handle: FocusHandle,
+    workspace: Option<gpui_kit::WeakEntity<crate::workspace::Workspace>>,
     root: Option<DataRoot>,
     active: bool,
     /// Active isolation profile: the graph shows only this space's
@@ -126,6 +127,7 @@ impl GraphPage {
         let layouts = Layouts::default();
         Self {
             focus_handle,
+            workspace: None,
             root,
             active: false,
             space: crate::data::DEFAULT_SPACE.into(),
@@ -150,6 +152,13 @@ impl GraphPage {
             bounds: Rc::new(Cell::new(Bounds::default())),
             gesture: None,
         }
+    }
+
+    pub(crate) fn set_workspace(
+        &mut self,
+        workspace: gpui_kit::WeakEntity<crate::workspace::Workspace>,
+    ) {
+        self.workspace = Some(workspace);
     }
 
     /// Follow the active space: filter the canvas, swap to that space's
@@ -543,6 +552,26 @@ impl GraphPage {
         let (Some(root), Some(draft)) = (self.root.clone(), self.draft.clone()) else {
             return;
         };
+        if let Draft::Node { key, space, .. } = &draft
+            && self.graph.as_ref().is_some_and(|graph| {
+                graph.nodes.iter().any(|node| {
+                    node.key() == key && !crate::data::space_eq(&node.repository.space, space)
+                })
+            })
+            && let Some(workspace) = self.workspace.clone()
+        {
+            let result = workspace
+                .update(cx, |workspace, cx| {
+                    workspace.ensure_repository_agent_idle(key, cx)
+                })
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            if let Err(error) = result {
+                self.error = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        }
         let description = self.description.read(cx).value().to_string();
         let from = self.from.read(cx).value().trim().to_owned();
         let to = self.to.read(cx).value().trim().to_owned();

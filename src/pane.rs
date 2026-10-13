@@ -119,6 +119,12 @@ impl TerminalPane {
         self.error.is_some()
     }
 
+    pub(crate) fn account_matches(&self, account: &crate::agent_accounts::Account) -> bool {
+        self.agent_activity
+            .as_ref()
+            .is_some_and(|launch| launch.launch_error.is_none() && &launch.account == account)
+    }
+
     pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.session = None;
         if let Some(activity) = &self.agent_activity {
@@ -180,13 +186,23 @@ impl TerminalPane {
             .as_ref()
             .map(|activity| (Some(activity.command_line()), activity.environment()))
             .unwrap_or((None, &[]));
-        let output = match TerminalSession::spawn_with_startup(
-            tab,
-            cwd,
-            agent,
-            startup,
-            startup_environment,
-        ) {
+        let launch = pane
+            .agent_activity
+            .as_ref()
+            .and_then(|launch| launch.launch_error.as_ref())
+            .map_or_else(
+                || {
+                    TerminalSession::spawn_with_startup(
+                        tab,
+                        cwd,
+                        agent,
+                        startup,
+                        startup_environment,
+                    )
+                },
+                |error| Err(anyhow::anyhow!("{error}")),
+            );
+        let output = match launch {
             Ok((session, output)) => {
                 pane.session = Some(session);
                 Some(output)

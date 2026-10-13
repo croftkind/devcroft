@@ -1,5 +1,6 @@
 mod add_repository;
 mod agent;
+mod agent_accounts;
 mod agent_activity;
 mod agent_icons;
 mod agent_sessions;

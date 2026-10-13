@@ -160,6 +160,7 @@ pub(crate) struct SettingsView {
     /// Spaces section: the portable catalog, the new-space input, and the
     /// inline rename/delete editor for one row at a time.
     spaces: Vec<String>,
+    isolated_agent_spaces: Vec<String>,
     space_input: Entity<InputState>,
     space_rename_input: Entity<InputState>,
     space_edit: Option<SpaceEdit>,
@@ -283,6 +284,7 @@ impl SettingsView {
             neovim_check_error: None,
             neovim_checking: false,
             editor_card_focus: [cx.focus_handle(), cx.focus_handle()],
+            isolated_agent_spaces: load_isolated_agent_spaces(data_root.as_ref()),
             data_root,
             sync_tracker,
             sync_interval,
@@ -417,6 +419,7 @@ impl SettingsView {
         // Spaces: re-read the portable catalog and drop any inline editor
         // whose row no longer exists.
         self.spaces = load_space_names(self.data_root.as_ref());
+        self.isolated_agent_spaces = load_isolated_agent_spaces(self.data_root.as_ref());
         if let Some(SpaceEdit::Rename(name)) = &self.space_edit
             && !self.spaces.iter().any(|space| space_eq(space, name))
         {
@@ -1044,7 +1047,15 @@ impl SettingsView {
             cx.notify();
             return;
         };
-        match delete_space(&root, &name, &destination) {
+        let result = (|| -> anyhow::Result<SpaceRewrite> {
+            if let Some(workspace) = self.workspace.clone() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.ensure_agent_accounts_idle(&name, cx)
+                })??;
+            }
+            delete_space(&root, &name, &destination)
+        })();
+        match result {
             Ok(touched) => self.after_space_change(
                 Some(space_rewrite_notice(
                     &format!("Deleted {name:?} · records moved to {destination:?}"),
@@ -1095,6 +1106,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         self.spaces = load_space_names(self.data_root.as_ref());
+        self.isolated_agent_spaces = load_isolated_agent_spaces(self.data_root.as_ref());
         self.space_edit = None;
         self.spaces_error = error;
         self.spaces_notice = notice;
@@ -1102,6 +1114,32 @@ impl SettingsView {
             workspace.update(cx, |this, cx| this.reload_spaces(cx)).ok();
         }
         cx.notify();
+    }
+
+    fn set_agent_isolation(&mut self, name: &str, enabled: bool, cx: &mut Context<Self>) {
+        let result = (|| -> anyhow::Result<()> {
+            let root = self
+                .data_root
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Portable data is unavailable"))?;
+            if let Some(workspace) = self.workspace.clone() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.ensure_agent_accounts_idle(name, cx)
+                })??;
+            }
+            let mut spaces = Spaces::load(root)?;
+            let expected = spaces.clone();
+            spaces.set_agent_isolation(name, enabled)?;
+            spaces.save(root, &expected)
+        })();
+        match result {
+            Ok(()) => self.after_space_change(Some(if enabled {
+                format!("{name} now has separate agent accounts. Open a repository in this space and sign in to each agent once.")
+            } else {
+                format!("{name} now uses shared agent accounts. Its separate logins are kept for re-enabling.")
+            }), None, cx),
+            Err(error) => self.after_space_change(None, Some(format!("{error:#}")), cx),
+        }
     }
 
     /// Forward the command-bar toggles to the workspace, mirroring
@@ -1276,6 +1314,17 @@ impl SettingsView {
                     .text_color(cx.theme().muted_foreground)
                     .child("Deleting moves records to another space. Keep at least one space, and save artifact drafts before renaming or deleting."),
             )
+            .child(group(cx, "Agent accounts", Some("Give a space its own agent logins, settings, and history. Sign in once per agent on each device. Repositories automatically use their space's accounts, including in All. Close that space's agent sessions before changing this setting."))
+                .children(self.spaces.iter().map(|name| {
+                    let enabled = self.isolated_agent_spaces.iter().any(|space| space_eq(space, name));
+                    let target = name.clone();
+                    let view = cx.entity().downgrade();
+                    live_row(cx, name, if enabled { "Separate accounts" } else { "Shared machine accounts" },
+                        Switch::new(format!("isolate-agents-{name}")).checked(enabled)
+                            .on_change(move |enabled, _, cx| {
+                                view.update(cx, |this, cx| this.set_agent_isolation(&target, *enabled, cx)).ok();
+                            }))
+                })))
     }
 
     /// One space row: the name plus rename/delete actions, or the inline
@@ -2432,6 +2481,20 @@ fn checkout_notice(outcome: CheckoutOutcome, name: &str) -> String {
         }
         CheckoutOutcome::Created => format!("Created and switched to new branch {name}."),
     }
+}
+
+/// Spaces using separate accounts, re-read with the visible catalog.
+fn load_isolated_agent_spaces(root: Option<&DataRoot>) -> Vec<String> {
+    root.and_then(|root| Spaces::load(root).ok())
+        .map(|spaces| {
+            spaces
+                .spaces
+                .into_iter()
+                .filter(|space| space.isolate_agents)
+                .map(|space| space.name)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Catalog names for the Spaces section (best effort; empty when the

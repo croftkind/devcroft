@@ -110,6 +110,20 @@ pub(crate) const DEFAULT_SEED: [&str; 2] = ["Personal", "Work"];
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Space {
     pub(crate) name: String,
+    /// Portable identity only. Credentials live in the machine-local data root.
+    /// Keep the identity when disabled or renamed so re-enabling restores login.
+    #[serde(
+        default,
+        rename = "agentAccountId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) agent_account_id: Option<String>,
+    #[serde(
+        default,
+        rename = "isolateAgents",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub(crate) isolate_agents: bool,
     #[serde(flatten, default)]
     pub(crate) extra: BTreeMap<String, Value>,
 }
@@ -118,6 +132,8 @@ impl Space {
     fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            agent_account_id: None,
+            isolate_agents: false,
             extra: BTreeMap::new(),
         }
     }
@@ -179,6 +195,29 @@ pub(crate) fn space_matches(stored: Option<&str>, active: &str) -> bool {
 }
 
 impl Spaces {
+    pub(crate) fn set_agent_isolation(&mut self, name: &str, enabled: bool) -> Result<()> {
+        let id = loop {
+            let candidate = super::record::random_id().replacen("art-", "account-", 1);
+            if !self
+                .spaces
+                .iter()
+                .any(|s| s.agent_account_id.as_ref() == Some(&candidate))
+            {
+                break candidate;
+            }
+        };
+        let space = self
+            .spaces
+            .iter_mut()
+            .find(|s| space_eq(&s.name, name))
+            .context("Space was removed. Reload spaces")?;
+        if enabled && space.agent_account_id.is_none() {
+            space.agent_account_id = Some(id);
+        }
+        space.isolate_agents = enabled;
+        Ok(())
+    }
+
     /// Restore the machine-local browsing choice; unknown named spaces
     /// follow the first catalog entry after a remote rename/delete.
     pub(crate) fn selection(&self, stored: Option<&str>, all: bool) -> SpaceSelection {

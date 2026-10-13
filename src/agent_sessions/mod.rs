@@ -37,6 +37,7 @@ struct Cache {
 }
 #[derive(Clone)]
 pub(crate) struct Catalog {
+    root: Option<DataRoot>,
     snapshot: Arc<Mutex<Snapshot>>,
     scan: Arc<Mutex<Cache>>,
     cache: Option<PathBuf>,
@@ -44,13 +45,26 @@ pub(crate) struct Catalog {
 impl Catalog {
     pub fn new(root: Option<&DataRoot>) -> Self {
         Self {
+            root: root.cloned(),
             snapshot: Arc::default(),
             scan: Arc::default(),
             cache: root.map(|r| r.root().join("cache/agent-sessions")),
         }
     }
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.lock().clone()
+        let mut snapshot = self.snapshot.lock().clone();
+        match crate::agent_accounts::Accounts::load(self.root.as_ref()) {
+            Ok(accounts) => snapshot
+                .sessions
+                .retain(|session| accounts.permits(session)),
+            Err(error) => {
+                snapshot.sessions.clear();
+                snapshot
+                    .errors
+                    .push(format!("Agent accounts unavailable: {error:#}"));
+            }
+        }
+        snapshot
     }
     /// Runs on a worker. Cached metadata is published before any provider calls.
     pub fn load_cache(&self) {
@@ -69,7 +83,10 @@ impl Catalog {
         if cache.version != 1 {
             return;
         }
-        let sources = providers::sources();
+        let Ok(accounts) = crate::agent_accounts::Accounts::load(self.root.as_ref()) else {
+            return;
+        };
+        let sources = providers::sources(&accounts);
         cache.sessions.retain(|s| {
             sources
                 .iter()
@@ -84,7 +101,8 @@ impl Catalog {
         *self.scan.lock() = cache;
     }
     pub fn prepare_open(&self, key: &SessionKey) -> anyhow::Result<SessionSummary> {
-        let source = providers::sources()
+        let accounts = crate::agent_accounts::Accounts::load(self.root.as_ref())?;
+        let source = providers::sources(&accounts)
             .into_iter()
             .find(|s| s.provider == key.provider && s.root == key.store)
             .ok_or_else(|| anyhow::anyhow!("Session source is no longer configured"))?;
@@ -96,6 +114,10 @@ impl Catalog {
             anyhow::anyhow!("Session was deleted, archived, or is no longer resumable")
         })?;
         session.validate()?;
+        anyhow::ensure!(
+            accounts.permits(&session),
+            "This session belongs to a different profile's agent account"
+        );
         Ok(session)
     }
     pub fn refresh(&self) {
@@ -103,7 +125,18 @@ impl Catalog {
             return;
         };
         let mut errors = Vec::new();
-        let sources = providers::sources();
+        let accounts = match crate::agent_accounts::Accounts::load(self.root.as_ref()) {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                *self.snapshot.lock() = Snapshot {
+                    sessions: Vec::new(),
+                    errors: vec![format!("Agent accounts unavailable: {error:#}")],
+                    loaded: true,
+                };
+                return;
+            }
+        };
+        let sources = providers::sources(&accounts);
         cache.sessions.retain(|s| {
             sources
                 .iter()

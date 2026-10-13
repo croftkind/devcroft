@@ -19,9 +19,9 @@ pub(super) struct Source {
     pub provider: &'static str,
     pub root: PathBuf,
 }
-pub(super) fn sources() -> Vec<Source> {
+pub(super) fn sources(accounts: &crate::agent_accounts::Accounts) -> Vec<Source> {
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    vec![
+    let mut sources = vec![
         Source {
             provider: "opencode",
             root: env::var_os("XDG_DATA_HOME")
@@ -40,13 +40,28 @@ pub(super) fn sources() -> Vec<Source> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".claude")),
         },
-    ]
-    .into_iter()
-    .map(|mut s| {
-        s.root = canonical(&s.root);
-        s
-    })
-    .collect()
+    ];
+    for account in &accounts.isolated {
+        for agent in [
+            crate::agent::AgentKind::Opencode,
+            crate::agent::AgentKind::Codex,
+            crate::agent::AgentKind::Claude,
+        ] {
+            if let Some(root) = account.store(agent) {
+                sources.push(Source {
+                    provider: agent.id(),
+                    root,
+                });
+            }
+        }
+    }
+    sources
+        .into_iter()
+        .map(|mut s| {
+            s.root = canonical(&s.root);
+            s
+        })
+        .collect()
 }
 
 pub(super) fn discover(
@@ -526,7 +541,7 @@ mod tests {
     #[ignore = "reads installed agents' local metadata; requires local provider access"]
     fn installed_provider_metadata_smoke() {
         let mut files = HashMap::new();
-        for source in sources() {
+        for source in sources(&crate::agent_accounts::Accounts::default()) {
             let start = std::time::Instant::now();
             let sessions = discover(&source, &mut files)
                 .unwrap_or_else(|error| panic!("{}: {error:#}", source.provider));
