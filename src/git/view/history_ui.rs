@@ -44,7 +44,7 @@ pub(super) struct HistoryState {
     show_metadata: bool,
 }
 impl HistoryState {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<GitDialog>) -> Self {
+    pub(super) fn new(window: &mut Window, cx: &mut Context<GitView>) -> Self {
         Self {
             query: cx.new(|cx| InputState::new(window, cx).placeholder("Filter loaded commits…")),
             branch_name: cx.new(|cx| InputState::new(window, cx).placeholder("New branch name")),
@@ -102,7 +102,7 @@ impl Drop for HistoryState {
     }
 }
 
-impl GitDialog {
+impl GitView {
     pub(super) fn reset_history(&mut self, cx: &mut Context<Self>) {
         self.history.cancel_page();
         self.history.cancel_detail();
@@ -978,7 +978,7 @@ mod tests {
         let checkout = root.to_owned();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
             let dialog =
-                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+                cx.new(|cx| GitView::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
             dialog.update(cx, |this, cx| {
                 this.generation += 1; // reject the initial status request
                 this.load_in_flight = false;
@@ -1102,9 +1102,13 @@ mod tests {
                 this.active_mutation = Some(Mutation::Commit {
                     message: "keep this message".into(),
                 });
-                assert!(!this.request_close(cx));
+                this.set_active(false, cx);
+                assert!(
+                    this.active_mutation.is_some(),
+                    "leaving Git keeps the operation alive"
+                );
+                this.set_active(true, cx);
                 this.active_mutation = None;
-                assert!(this.request_close(cx));
                 this.commit_completed("older message", window, cx);
                 assert_eq!(
                     this.commit_message.read(cx).value().as_ref(),

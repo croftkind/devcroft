@@ -12,8 +12,10 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
     StyledExt as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    dialog::{Confirm, DialogFooter},
     h_flex,
     input::{Input, InputState, Textarea, TextareaState},
+    popover::Popover,
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -36,12 +38,14 @@ use super::{
         Mutation, TargetFingerprint, capture_restore_target, capture_trash_target, execute,
         trash_available,
     },
+    remote::Action,
     repository::{LoadError, load_snapshot},
     watch::FileChanges,
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_VISIBLE_CHANGES: usize = 250;
+const MAX_SWITCHER_BRANCHES: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GitMode {
@@ -69,6 +73,20 @@ pub(crate) struct SnapshotChanged {
 pub(crate) struct OpenGitFile {
     pub(crate) checkout: PathBuf,
     pub(crate) path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BranchPickerAction {
+    OpenGit,
+    ManageBranches,
+    Switch(String),
+    NewBranch,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BranchPickerRequested {
+    pub(crate) checkout: PathBuf,
+    pub(crate) action: BranchPickerAction,
 }
 
 #[derive(Clone, Debug)]
@@ -100,8 +118,9 @@ struct OperationNotice {
     error: bool,
 }
 
-pub(crate) struct GitDialog {
+pub(crate) struct GitView {
     focus_handle: FocusHandle,
+    branch_picker_focus: FocusHandle,
     _tab_interceptor: Subscription,
     checkout: PathBuf,
     mode: GitMode,
@@ -121,11 +140,16 @@ pub(crate) struct GitDialog {
     confirmation: Option<Confirmation>,
     dirty_editor_paths: HashSet<PathBuf>,
     branch_query: Entity<InputState>,
+    branch_switcher_query: Entity<InputState>,
     branch_name: Entity<InputState>,
+    new_branch_name: Entity<InputState>,
     push_branch: Entity<InputState>,
     selected_ref: Option<String>,
     selected_remote: Option<String>,
     remote_form: Option<remote_ui::RemoteForm>,
+    branch_switcher_open: bool,
+    active: bool,
+    page_visible: bool,
     active_started: Option<Instant>,
     check_conflicts: bool,
     continuation_loading: bool,
@@ -137,11 +161,12 @@ pub(crate) struct GitDialog {
     external_editors: Vec<crate::editor::ExternalEditorKind>,
 }
 
-impl EventEmitter<SnapshotChanged> for GitDialog {}
-impl EventEmitter<OpenGitFile> for GitDialog {}
-impl EventEmitter<CommitDraftChanged> for GitDialog {}
+impl EventEmitter<SnapshotChanged> for GitView {}
+impl EventEmitter<OpenGitFile> for GitView {}
+impl EventEmitter<CommitDraftChanged> for GitView {}
+impl EventEmitter<BranchPickerRequested> for GitView {}
 
-impl GitDialog {
+impl GitView {
     pub(crate) fn new(
         checkout: PathBuf,
         dirty_editor_paths: HashSet<PathBuf>,
@@ -166,11 +191,21 @@ impl GitDialog {
         )
         .detach();
         let branch_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search branches…"));
+        let branch_switcher_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search branches…"));
         let branch_name =
+            cx.new(|cx| InputState::new(window, cx).placeholder("New local branch name"));
+        let new_branch_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("New local branch name"));
         let push_branch =
             cx.new(|cx| InputState::new(window, cx).placeholder("Remote branch name"));
-        for input in [&branch_query, &branch_name, &push_branch] {
+        for input in [
+            &branch_query,
+            &branch_switcher_query,
+            &branch_name,
+            &new_branch_name,
+            &push_branch,
+        ] {
             cx.observe(input, |_, _, cx| cx.notify()).detach();
         }
         let history = history_ui::HistoryState::new(window, cx);
@@ -186,7 +221,9 @@ impl GitDialog {
         cx.observe(&history.branch_name, |_, _, cx| cx.notify())
             .detach();
         let focus_handle = cx.focus_handle();
+        let branch_picker_focus = cx.focus_handle();
         let tab_focus = focus_handle.clone();
+        let picker_focus = branch_picker_focus.clone();
         let target_window = window.window_handle();
         // Intercept before input bindings resolve: code editors otherwise use
         // Tab for indentation, trapping keyboard users inside Result.
@@ -194,7 +231,8 @@ impl GitDialog {
             let key = &event.keystroke;
             let modifiers = &key.modifiers;
             if window.window_handle() == target_window
-                && tab_focus.contains_focused(window, cx)
+                && (tab_focus.contains_focused(window, cx)
+                    || picker_focus.contains_focused(window, cx))
                 && key.key == "tab"
                 && !modifiers.platform
                 && !modifiers.control
@@ -212,6 +250,7 @@ impl GitDialog {
         });
         let mut dialog = Self {
             focus_handle,
+            branch_picker_focus,
             _tab_interceptor: tab_interceptor,
             file_changes: FileChanges::new(&checkout),
             checkout,
@@ -231,11 +270,16 @@ impl GitDialog {
             confirmation: None,
             dirty_editor_paths,
             branch_query,
+            branch_switcher_query,
             branch_name,
+            new_branch_name,
             push_branch,
             selected_ref: None,
             selected_remote: None,
             remote_form: None,
+            branch_switcher_open: false,
+            active: true,
+            page_visible: true,
             active_started: None,
             check_conflicts: false,
             continuation_loading: false,
@@ -252,17 +296,61 @@ impl GitDialog {
         dialog
     }
 
-    pub(crate) fn request_close(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.active_mutation.is_some() || !self.mutation_queue.is_empty() {
-            self.notice = Some(OperationNotice {
-                message: "Wait for the active Git operation to finish before closing.".into(),
-                error: false,
-            });
-            cx.notify();
-            false
-        } else {
-            true
+    pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
         }
+        self.active = active;
+        if active {
+            if let LoadState::Loaded(snapshot) = &self.state {
+                cx.emit(SnapshotChanged {
+                    checkout: self.checkout.clone(),
+                    status: snapshot.header_status(),
+                });
+            }
+            self.file_changes.mark_changed();
+            self.refresh_if_changed(cx);
+        } else {
+            self.branch_switcher_open = false;
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub(crate) fn busy(&self) -> bool {
+        self.active_mutation.is_some() || !self.mutation_queue.is_empty()
+    }
+
+    pub(crate) fn set_page_visible(&mut self, visible: bool) {
+        self.page_visible = visible;
+    }
+
+    pub(crate) fn operation_notice(&self) -> Option<(&str, bool)> {
+        self.notice
+            .as_ref()
+            .map(|notice| (notice.message.as_str(), notice.error))
+    }
+
+    pub(crate) fn show_branches(&mut self, cx: &mut Context<Self>) {
+        self.mode = GitMode::Branches;
+        cx.notify();
+    }
+
+    pub(crate) fn set_external_editors(
+        &mut self,
+        editors: Vec<crate::editor::ExternalEditorKind>,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_editors = editors;
+        cx.notify();
+    }
+
+    pub(crate) fn set_dirty_editor_paths(&mut self, paths: HashSet<PathBuf>) {
+        self.dirty_editor_paths = paths;
     }
 
     fn commit_completed(&mut self, submitted: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -306,6 +394,9 @@ impl GitDialog {
     }
 
     fn refresh_if_changed(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
         if self.active_mutation.is_some() {
             cx.notify();
             return;
@@ -675,8 +766,14 @@ impl GitDialog {
                 .is_ok_and(|canonical| self.dirty_editor_paths.contains(&canonical))
     }
 
-    fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.request_close(cx) {
+    fn open_file(&mut self, path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            self.notice = Some(OperationNotice {
+                message: "Wait for the active Git operation before opening a file in the editor."
+                    .into(),
+                error: false,
+            });
+            cx.notify();
             return;
         }
         if !self.checkout.join(&path).is_file() {
@@ -691,7 +788,6 @@ impl GitDialog {
             checkout: self.checkout.clone(),
             path,
         });
-        window.close_dialog(cx);
     }
 
     fn summary(&self) -> String {
@@ -713,84 +809,345 @@ impl GitDialog {
         }
     }
 
-    fn render_repository_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let repository = self
-            .checkout
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        h_flex()
-            .h(px(68.))
-            .flex_none()
-            .px_5()
-            .pr_12()
-            .gap_3()
-            .child(
-                h_flex()
-                    .size(px(36.))
-                    .justify_center()
-                    .rounded_lg()
-                    .bg(cx.theme().muted)
-                    .child(Icon::new(gpui_kit::assets::IconName::GitBranch).size(px(18.))),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .min_w_0()
-                    .flex_1()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().text_base().font_semibold().child("Git"))
-                            .child(div().text_color(cx.theme().muted_foreground).child("/"))
-                            .child(div().min_w_0().truncate().text_base().child(repository)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .truncate()
-                            .child(self.checkout.to_string_lossy().into_owned()),
-                    ),
-            )
-            .when(matches!(self.state, LoadState::Loaded(_)), |view| {
-                let upstream = match &self.state {
-                    LoadState::Loaded(snapshot) => snapshot
-                        .upstream
-                        .as_ref()
-                        .map(|name| format!("Tracking {name}"))
-                        .unwrap_or_else(|| "No upstream configured".into()),
-                    _ => String::new(),
-                };
-                view.child(
+    fn on_branch_switcher_open_change(
+        &mut self,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.branch_switcher_open = open;
+        if open {
+            self.branch_switcher_query
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.branch_switcher_query
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn switch_to_local_branch(
+        &mut self,
+        reference: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.branch_switcher_open = false;
+        cx.notify();
+        self.request_remote(Action::Switch { reference }, window, cx);
+    }
+
+    pub(crate) fn open_new_branch_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let LoadState::Loaded(snapshot) = &self.state else {
+            return;
+        };
+        if self.busy() || snapshot.unborn || snapshot.operation.is_some() {
+            return;
+        }
+        let start_oid = snapshot.oid.clone().unwrap_or_default();
+        if start_oid.is_empty() {
+            return;
+        }
+        let start_label = snapshot.branch_label();
+        self.branch_switcher_open = false;
+        self.new_branch_name
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let git = cx.entity().downgrade();
+        let name_input = self.new_branch_name.clone();
+        cx.notify();
+        // Focus the page root first so the create dialog restores focus to a
+        // live handle when it closes (the popover search input unmounts with
+        // the switcher).
+        if self.page_visible {
+            self.focus_handle.focus(window, cx);
+        } else {
+            self.branch_picker_focus.focus(window, cx);
+        }
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let git = git.clone();
+            let name_input = name_input.clone();
+            let start_oid = start_oid.clone();
+            dialog
+                .title("Create new branch")
+                .w(px(420.))
+                .child(
                     v_flex()
-                        .gap_1()
-                        .max_w(relative(0.45))
-                        .items_end()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .px_3()
-                                .py_1()
-                                .max_w_full()
-                                .rounded_md()
-                                .bg(cx.theme().muted)
-                                .child(
-                                    Icon::new(gpui_kit::assets::IconName::GitBranch).size(px(14.)),
-                                )
-                                .child(div().min_w_0().truncate().text_xs().child(self.summary())),
-                        )
+                        .gap_2()
                         .child(
                             div()
-                                .max_w_full()
-                                .truncate()
                                 .text_xs()
                                 .text_color(cx.theme().muted_foreground)
-                                .child(upstream),
+                                .child(format!("Starting from {start_label}")),
+                        )
+                        .child(div().text_xs().child("Branch name"))
+                        .child(Input::new(&name_input)),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-new-branch")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-new-branch")
+                                .primary()
+                                .label("Create and switch")
+                                .on_click(|_, window, cx| {
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
                         ),
                 )
-            })
+                .on_ok(move |_, window, cx| {
+                    let name = name_input.read(cx).value().to_string();
+                    let name = name.trim().to_owned();
+                    if name.is_empty() {
+                        window.push_notification("Enter a branch name", cx);
+                        return false;
+                    }
+                    let _ = git.update(cx, |this, cx| {
+                        this.request_remote(
+                            Action::Create {
+                                name,
+                                start: "HEAD".into(),
+                                start_oid: start_oid.clone(),
+                                track: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                    true
+                })
+        });
+        self.new_branch_name
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+    }
+
+    fn request_picker_action(
+        &mut self,
+        action: BranchPickerAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.branch_switcher_open = false;
+        self.branch_picker_focus.focus(window, cx);
+        cx.emit(BranchPickerRequested {
+            checkout: self.checkout.clone(),
+            action,
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn render_branch_picker(
+        &self,
+        status: &GitStatus,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let loaded = matches!(self.state, LoadState::Loaded(_));
+        let query = self.branch_switcher_query.read(cx).value().to_lowercase();
+        let busy = self.busy();
+        let (switchable, can_create) = match &self.state {
+            LoadState::Loaded(snapshot) => (
+                !busy && snapshot.operation.is_none(),
+                !busy && !snapshot.unborn && snapshot.operation.is_none(),
+            ),
+            _ => (false, false),
+        };
+        let (branches, branches_truncated): (Vec<(String, String, String, bool)>, bool) =
+            match &self.state {
+                LoadState::Loaded(snapshot) => switcher_branches(snapshot, &query),
+                _ => (Vec::new(), false),
+            };
+        let empty_label = if matches!(self.state, LoadState::Loading) {
+            "Loading branches…"
+        } else if query.is_empty() {
+            "No branches yet"
+        } else {
+            "No matching branches"
+        };
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let git = cx.entity().downgrade();
+        let search_input = self.branch_switcher_query.clone();
+        let summary = self.summary();
+        let upstream = match &self.state {
+            LoadState::Loaded(snapshot) => snapshot
+                .upstream
+                .as_ref()
+                .map(|name| format!("Tracking {name}"))
+                .unwrap_or_else(|| "No upstream configured".into()),
+            _ => String::new(),
+        };
+        let checkout_detail = format!(
+            "Switch branch · {}\n{}\n{upstream}",
+            summary,
+            self.checkout.display()
+        );
+        div().track_focus(&self.branch_picker_focus).min_w_0().child(
+                    Popover::new("git-branch-switcher")
+                        .open(self.branch_switcher_open)
+                        .track_focus(&self.branch_switcher_query.read(cx).focus_handle(cx))
+                        .on_open_change(cx.listener(|this, open, window, cx| {
+                            this.on_branch_switcher_open_change(*open, window, cx);
+                        }))
+                        .trigger(
+                            Button::new("git-branch-switcher")
+                                .small()
+                                .ghost()
+                                .icon(if status.detached { gpui_kit::assets::IconName::GitCommitHorizontal } else { gpui_kit::assets::IconName::GitBranch })
+                                .label(status.branch.clone().unwrap_or_else(|| "Git".into()))
+                                .accessibility_label("Switch branch")
+                                .h(px(28.))
+                                .when(status.dirty, |button| button.child(div().text_xs().text_color(rgb(0xeab308)).child("●")))
+                                .when_some(status.ahead_label(), |button, ahead| button.child(div().text_xs().text_color(muted).child(ahead)))
+                                .when_some(status.behind_label(), |button, behind| button.child(div().text_xs().text_color(muted).child(behind)))
+                                .dropdown_caret(true)
+                                .tooltip(checkout_detail)
+                                .max_w(px(260.)),
+                        )
+                        .content(move |_, _, _| {
+                            let git_open = git.clone();
+                            let git_list = git.clone();
+                            let git_new = git.clone();
+                            let git_manage = git.clone();
+                            let search_input = search_input.clone();
+                            v_flex()
+                                .min_w(px(300.))
+                                .gap_1()
+                                .child(Button::new("git-picker-open-page").small().ghost().w_full().label("Open Git").on_click(move |_, window, cx| {
+                                    let _ = git_open.update(cx, |this, cx| this.request_picker_action(BranchPickerAction::OpenGit, window, cx));
+                                }))
+                                .child(div().text_xs().text_color(muted).child("Local branches"))
+                                .child(div().child(Input::new(&search_input).small()))
+                                .child(
+                                    div().max_h(px(300.)).overflow_y_scrollbar().child(
+                                        v_flex().gap_1()
+                                            .when(branches.is_empty(), |list| {
+                                                list.child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_2()
+                                                        .text_xs()
+                                                        .text_color(muted)
+                                                        .child(empty_label),
+                                                )
+                                            })
+                                            .children(branches.iter().enumerate().map(
+                                                |(
+                                                    index,
+                                                    (reference, name, subject, current),
+                                                )| {
+                                                    let reference = reference.clone();
+                                                    let git = git_list.clone();
+                                                    Button::new((
+                                                        "git-branch-switcher-item",
+                                                        index,
+                                                    ))
+                                                    .ghost()
+                                                    .w_full()
+                                                    .child(
+                                                        h_flex()
+                                                            .w_full()
+                                                            .min_w_0()
+                                                            .gap_2()
+                                                            .items_center()
+                                                            .child(
+                                                                Icon::new(
+                                                                    gpui_kit::assets::IconName::GitBranch,
+                                                                )
+                                                                .size(px(14.))
+                                                                .text_color(muted),
+                                                            )
+                                                            .child(
+                                                                v_flex()
+                                                                    .flex_1()
+                                                                    .min_w_0()
+                                                                    .child(
+                                                                        div()
+                                                                            .truncate()
+                                                                            .text_sm()
+                                                                            .child(name.clone()),
+                                                                    )
+                                                                    .when(!subject.is_empty(), |row| {
+                                                                        row.child(
+                                                                            div()
+                                                                                .truncate()
+                                                                                .text_xs()
+                                                                                .text_color(muted)
+                                                                                .child(subject.clone()),
+                                                                        )
+                                                                    }),
+                                                            )
+                                                            .when(*current, |row| {
+                                                                row.child(
+                                                                    Icon::new(IconName::Check)
+                                                                        .size(px(14.))
+                                                                        .text_color(success),
+                                                                )
+                                                            }),
+                                                    )
+                                                    .selected(*current)
+                                                    .disabled(!switchable || *current)
+                                                    .tooltip(name.clone())
+                                                    .accessibility_label(name.clone())
+                                                    .on_click(move |_, window, cx| {
+                                                        let _ = git.update(cx, |this, cx| {
+                                                            this.request_picker_action(
+                                                                BranchPickerAction::Switch(reference.clone()),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    })
+                                                },
+                                            )),
+                                    ),
+                                )
+                                .when(branches_truncated, |view| {
+                                    view.child(
+                                        div()
+                                            .px_2()
+                                            .text_xs()
+                                            .text_color(muted)
+                                            .child(format!(
+                                                "Showing first {MAX_SWITCHER_BRANCHES}. Type to narrow the search."
+                                            )),
+                                    )
+                                })
+                                .child(
+                                    Button::new("git-branch-switcher-new")
+                                        .small()
+                                        .w_full()
+                                        .icon(IconName::Plus)
+                                        .label("New branch")
+                                        .disabled(!can_create)
+                                        .tooltip(if can_create {
+                                            "Create and switch to a new branch"
+                                        } else {
+                                            "Create a first commit and finish any active Git operation before creating a branch"
+                                        })
+                                        .on_click(move |_, window, cx| {
+                                            let _ = git_new.update(cx, |this, cx| {
+                                                this.request_picker_action(BranchPickerAction::NewBranch, window, cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("git-manage-branches")
+                                        .small().ghost().w_full()
+                                        .label("Manage branches…").disabled(!loaded)
+                                        .on_click(move |_, window, cx| {
+                                            let _ = git_manage.update(cx, |this, cx| {
+                                                this.request_picker_action(BranchPickerAction::ManageBranches, window, cx);
+                                            });
+                                        }),
+                                )
+                        }),        ).into_any_element()
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -810,11 +1167,6 @@ impl GitDialog {
                             GitMode::Changes,
                             "Changes",
                             gpui_kit::assets::IconName::Diff,
-                        ),
-                        (
-                            GitMode::Branches,
-                            "Branches",
-                            gpui_kit::assets::IconName::GitBranch,
                         ),
                         (
                             GitMode::History,
@@ -842,6 +1194,14 @@ impl GitDialog {
                     }),
                 ),
             )
+            .when(self.mode == GitMode::Branches, |view| {
+                view.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Manage branches"),
+                )
+            })
             .child(div().flex_1())
             .child(self.render_remote_toolbar(cx))
             .child(
@@ -1319,6 +1679,7 @@ impl GitDialog {
         };
         let path = target.change.path.clone();
         let label = path.to_string_lossy().into_owned();
+        let busy = self.busy();
         let can_open = self.checkout.join(&path).is_file();
         let comparison = match target.area {
             ChangeArea::Staged => "Staged · HEAD → index",
@@ -1357,8 +1718,10 @@ impl GitDialog {
                     .small()
                     .ghost()
                     .label("Open in editor")
-                    .disabled(!can_open)
-                    .tooltip(if can_open {
+                    .disabled(busy || !can_open)
+                    .tooltip(if busy {
+                        "Wait for the active Git operation"
+                    } else if can_open {
                         "Open this working-tree file in the built-in editor"
                     } else {
                         "This path is not a regular working-tree file"
@@ -1415,13 +1778,13 @@ impl GitDialog {
     }
 }
 
-impl Focusable for GitDialog {
+impl Focusable for GitView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl Render for GitDialog {
+impl Render for GitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_merge_editor(window, cx);
         let body = match &self.state {
@@ -1457,7 +1820,6 @@ impl Render for GitDialog {
             .track_focus(&self.focus_handle)
             .tab_group()
             .bg(cx.theme().background)
-            .child(self.render_repository_header(cx))
             .child(self.render_toolbar(cx))
             .when(matches!(&self.state, LoadState::Loaded(snapshot) if snapshot.operation_details.is_some()), |view| view.child(self.render_operation_banner(cx)))
             .when_some(self.confirmation.as_ref(), |view, confirmation| {
@@ -1487,6 +1849,40 @@ impl Render for GitDialog {
             })
             .child(div().flex_1().min_h_0().w_full().child(body))
     }
+}
+
+fn switcher_branches(
+    snapshot: &RepositorySnapshot,
+    query: &str,
+) -> (Vec<(String, String, String, bool)>, bool) {
+    let query = query.to_lowercase();
+    let mut matching = snapshot
+        .branches
+        .iter()
+        .filter(|branch| !branch.remote)
+        .filter(|branch| {
+            query.is_empty()
+                || format!("{} {}", branch.name, branch.subject)
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect::<Vec<_>>();
+    // Preserve the repository's alphabetical ordering within each group.
+    matching.sort_by_key(|branch| !branch.current);
+    let truncated = matching.len() > MAX_SWITCHER_BRANCHES;
+    let branches = matching
+        .into_iter()
+        .take(MAX_SWITCHER_BRANCHES)
+        .map(|branch| {
+            (
+                branch.reference.clone(),
+                branch.name.clone(),
+                branch.subject.clone(),
+                branch.current,
+            )
+        })
+        .collect();
+    (branches, truncated)
 }
 
 fn change_paths(change: &Change) -> Vec<PathBuf> {
@@ -1559,6 +1955,156 @@ mod tests {
         }
     }
 
+    fn switcher_branch(name: &str, remote: bool, current: bool) -> super::super::branches::Branch {
+        super::super::branches::Branch {
+            reference: if remote {
+                format!("refs/remotes/origin/{name}")
+            } else {
+                format!("refs/heads/{name}")
+            },
+            name: if remote {
+                format!("origin/{name}")
+            } else {
+                name.into()
+            },
+            remote,
+            current,
+            oid: "abc123".into(),
+            subject: format!("{name} subject"),
+            upstream: String::new(),
+            tracking: String::new(),
+            push_remote: String::new(),
+            push_ref: String::new(),
+        }
+    }
+
+    #[test]
+    fn switcher_lists_local_branches_and_filters_by_query() {
+        let snapshot = RepositorySnapshot {
+            branches: vec![
+                switcher_branch("main", false, true),
+                switcher_branch("feature", false, false),
+                switcher_branch("main", true, false),
+            ],
+            ..RepositorySnapshot::default()
+        };
+        let (all, truncated) = switcher_branches(&snapshot, "");
+        assert!(!truncated);
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .all(|(reference, _, _, _)| reference.starts_with("refs/heads/"))
+        );
+        assert!(
+            all.iter()
+                .any(|(_, name, _, current)| name == "main" && *current)
+        );
+
+        let (filtered, _) = switcher_branches(&snapshot, "FEAT");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].1, "feature");
+
+        let (subject_match, _) = switcher_branches(&snapshot, "main subject");
+        assert_eq!(subject_match.len(), 1);
+        assert_eq!(subject_match[0].1, "main");
+
+        let (none, _) = switcher_branches(&snapshot, "zzz-no-such-branch");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn switcher_reports_truncation_beyond_the_display_limit() {
+        let branches = (0..=MAX_SWITCHER_BRANCHES)
+            .map(|index| switcher_branch(&format!("branch-{index:03}"), false, index == 0))
+            .collect::<Vec<_>>();
+        let snapshot = RepositorySnapshot {
+            branches,
+            ..RepositorySnapshot::default()
+        };
+        let (listed, truncated) = switcher_branches(&snapshot, "");
+        assert_eq!(listed.len(), MAX_SWITCHER_BRANCHES);
+        assert!(truncated);
+
+        let exact = RepositorySnapshot {
+            branches: (0..MAX_SWITCHER_BRANCHES)
+                .map(|index| switcher_branch(&format!("branch-{index:03}"), false, false))
+                .collect(),
+            ..RepositorySnapshot::default()
+        };
+        let (listed, truncated) = switcher_branches(&exact, "");
+        assert_eq!(listed.len(), MAX_SWITCHER_BRANCHES);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn switcher_pins_current_branch_before_the_limit_without_bypassing_search() {
+        let snapshot = RepositorySnapshot {
+            branches: (0..=MAX_SWITCHER_BRANCHES)
+                .map(|index| {
+                    switcher_branch(
+                        &format!("branch-{index:03}"),
+                        false,
+                        index == MAX_SWITCHER_BRANCHES,
+                    )
+                })
+                .collect(),
+            ..RepositorySnapshot::default()
+        };
+        let (listed, truncated) = switcher_branches(&snapshot, "");
+        assert!(truncated);
+        assert_eq!(listed.len(), MAX_SWITCHER_BRANCHES);
+        assert!(listed[0].3);
+        assert_eq!(listed[0].1, "branch-100");
+        let (filtered, _) = switcher_branches(&snapshot, "branch-000");
+        assert_eq!(filtered.len(), 1);
+        assert!(!filtered[0].3);
+    }
+
+    #[gpui_kit::test]
+    fn branch_modal_cancel_preserves_tracking_draft_and_page(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let directory = crate::git::conflicts::tests::setup();
+        let snapshot = load_snapshot(directory.path()).unwrap();
+        let checkout = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let view =
+                cx.new(|cx| GitView::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+            view.update(cx, |view, cx| {
+                view.generation += 1;
+                view.load_in_flight = false;
+                view.state = LoadState::Loaded(Box::new(snapshot));
+                view.mode = GitMode::Branches;
+                view.remote_form = Some(remote_ui::RemoteForm::Track);
+                view.branch_name.update(cx, |input, cx| {
+                    input.set_value("tracking-draft", window, cx)
+                });
+            });
+            *slot.borrow_mut() = Some(view.clone());
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        let view = holder.borrow().clone().unwrap();
+        test_cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            view.update(cx, |view, cx| view.open_new_branch_dialog(window, cx));
+            window.render_frame(cx);
+            assert!(window.has_active_dialog(cx));
+            window.click("cancel-new-branch", cx);
+            window.render_frame(cx);
+            assert!(!window.has_active_dialog(cx));
+            assert!(view.focus_handle(cx).contains_focused(window, cx));
+        });
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.branch_name.read(cx).value().as_ref(), "tracking-draft");
+            assert!(view.remote_form == Some(remote_ui::RemoteForm::Track));
+            assert_eq!(view.mode, GitMode::Branches);
+        });
+    }
+
     #[gpui_kit::test]
     fn changes_diff_rejects_stale_results_and_refreshes_source_without_editing_draft(
         cx: &mut gpui_kit::TestAppContext,
@@ -1606,7 +2152,7 @@ mod tests {
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
             let dialog =
-                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+                cx.new(|cx| GitView::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
             dialog.update(cx, |dialog, cx| {
                 dialog.generation += 1;
                 dialog.load_in_flight = false;
@@ -1754,7 +2300,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn mode_buttons_activate_through_dialog_tab_traversal(cx: &mut gpui_kit::TestAppContext) {
+    fn primary_modes_activate_through_page_tab_traversal(cx: &mut gpui_kit::TestAppContext) {
         use std::{cell::RefCell, rc::Rc};
         cx.update(gpui_kit::init);
         cx.update(crate::bind_app_keys);
@@ -1764,7 +2310,7 @@ mod tests {
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
             let dialog =
-                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+                cx.new(|cx| GitView::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
             dialog.update(cx, |dialog, cx| {
                 dialog.generation += 1;
                 dialog.load_in_flight = false;
@@ -1775,16 +2321,9 @@ mod tests {
             gpui_kit::component::Root::new(dialog, window, cx)
         });
         let dialog = holder.borrow().clone().unwrap();
+        // The shared branch picker lives in the workspace header. The page
+        // starts with Changes and History.
         test_cx.simulate_keystrokes("tab tab enter");
-        test_cx.simulate_event(gpui_kit::KeyUpEvent {
-            keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
-        });
-        assert_eq!(
-            dialog.read_with(test_cx, |dialog, _| dialog.mode),
-            GitMode::Branches
-        );
-        test_cx.update(|window, cx| dialog.focus_handle(cx).focus(window, cx));
-        test_cx.simulate_keystrokes("tab tab tab enter");
         test_cx.simulate_event(gpui_kit::KeyUpEvent {
             keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
         });
@@ -1815,7 +2354,7 @@ mod tests {
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
             let dialog =
-                cx.new(|cx| GitDialog::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
+                cx.new(|cx| GitView::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
             dialog.update(cx, |dialog, cx| {
                 dialog.generation += 1;
                 dialog.load_in_flight = false;

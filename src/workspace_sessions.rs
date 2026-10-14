@@ -452,7 +452,9 @@ impl Workspace {
     /// periodic catalog refresh and the relative-time repaint so they run
     /// exactly while their labels are visible.
     pub(super) fn sessions_visible(&self) -> bool {
-        self.home_visible || self.active_tab == WorkspaceTab::Agent
+        self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && (self.home_visible || self.active_tab == WorkspaceTab::Agent)
     }
 
     pub(super) fn open_agent_session(
@@ -461,6 +463,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         // Location changes (including async completions racing an open HUD)
         // clear stale navigation state.
         self.close_navigation(cx);
@@ -525,6 +530,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         if let Some((&id, _)) = self
             .open_sessions
             .iter()
@@ -591,6 +599,9 @@ impl Workspace {
     }
 
     fn activate_open_session(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         self.close_navigation(cx);
         self.remember_agent_pane(cx);
         let Some(open) = self.open_sessions.get(&id) else {
@@ -641,6 +652,9 @@ impl Workspace {
     /// historical session. The picker is a real `List`, so arrow keys move
     /// the highlight and Enter confirms.
     pub(super) fn prompt_new_agent_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_header_busy && !self.can_leave_git(window, cx) {
+            return;
+        }
         // Opening a dialog clears stale navigation state; the dialog trap
         // owns the keyboard from here.
         self.close_navigation(cx);
@@ -717,6 +731,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         self.remember_agent_pane(cx);
         // An explicit New wins over an in-flight auto-resume: bump the
         // navigation so a stale open completion cannot replace this pane,

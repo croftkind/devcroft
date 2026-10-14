@@ -1,6 +1,5 @@
 mod branches;
 mod conflicts;
-mod dialog;
 mod diff;
 mod history;
 mod merge_editor;
@@ -8,6 +7,10 @@ mod model;
 mod operations;
 mod remote;
 mod repository;
+mod view;
 mod watch;
 
-pub(crate) use dialog::{CommitDraftChanged, GitDialog, OpenGitFile, SnapshotChanged};
+pub(crate) use view::{
+    BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitView, OpenGitFile,
+    SnapshotChanged,
+};

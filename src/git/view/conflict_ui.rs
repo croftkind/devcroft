@@ -3,7 +3,7 @@ use crate::git::{
     conflicts::{Continuation, OperationDetails, Resolution},
     merge_editor::{MergeEditor, RecoveryChanged, ResolveRequest},
 };
-impl GitDialog {
+impl GitView {
     pub(super) fn discover_conflict_drafts(&self, cx: &mut Context<Self>) {
         let Some(data_root) = self.data_root.clone() else {
             return;

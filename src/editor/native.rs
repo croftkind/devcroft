@@ -980,7 +980,7 @@ impl NativeEditor {
     }
 
     /// Absolute paths whose built-in editor buffers contain unsaved text.
-    /// Git uses this snapshot while its modal is open to block operations
+    /// Git uses this snapshot to block operations
     /// that would replace or remove a working-tree file.
     pub(crate) fn dirty_paths(&self) -> HashSet<PathBuf> {
         let mut paths = self

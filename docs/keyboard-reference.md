@@ -25,7 +25,7 @@ can scroll the overlay. Very narrow tab rows use abbreviated names
 - `Cmd+P` on macOS (`Ctrl+P` on Linux/Windows): projects palette
 - `Cmd+Q` on macOS (`Ctrl+Q` on Linux/Windows): quit (works even with a terminal focused or navigation mode open; never sent to the pty)
 
-These three also work inside navigation mode: the palettes exit to normal mode and open, while quit closes navigation and quits. There are no other global direct shortcuts — tab jumps, session creation, and settings live in navigation mode and the palettes. In normal mode **Tab** and **Shift+Tab** belong to the focused component: terminal panes send them to the pty (agent harnesses such as opencode switch agents/models/modes with them), inputs and lists keep them, and nothing moves focus. Dialogs, including Git, use gpui-kit's normal Tab traversal.
+These three also work inside navigation mode: the palettes exit to normal mode and open, while quit closes navigation and quits. There are no other global direct shortcuts — tab jumps, session creation, and settings live in navigation mode and the palettes. In normal mode **Tab** and **Shift+Tab** belong to the focused component: terminal panes send them to the pty (agent harnesses such as opencode switch agents/models/modes with them), inputs and lists keep them, and nothing moves focus. Git and dialogs use gpui-kit's normal Tab traversal.
 
 ## While navigation mode is open
 
@@ -48,6 +48,7 @@ These three also work inside navigation mode: the palettes exit to normal mode a
 | Home dashboard | `a` Add repository, `r` Browse artifacts, `s` Switch space |
 | Space switcher (open) | `↑`/`↓` Highlight a space, `Enter` switch to it, `Escape` close |
 | Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git, `Space` Home |
+| Git page | Repository navigation keys, plus `b` Back to the previous view |
 | Editor tab (Built-in selected) | `f` Find project file, `b` Switch open tab, `w` Search project |
 | Agent tab | `n` New agent session |
 | Global Artifacts page | `Space` Home, `b` Back to origin, `s` Switch space, plus artifact actions below when available |
@@ -72,11 +73,11 @@ On the Editor tab with Built-in selected, `Cmd+J`, then `f` on macOS (`Ctrl+J`, 
 
 While the code editor has focus, `Cmd+Shift+Space` on macOS or `Ctrl+Shift+Space` on Linux/Windows requests language-server completions at the caret. **… → Show completions** requests the same suggestions and returns focus to the editor. A language server with completion support must be available; the menu item is disabled in Markdown preview and when no completion provider is attached. Requesting suggestions leaves the text unchanged; use `↑`/`↓` to choose, `Enter` to accept, or `Escape` to dismiss. Active IME composition is left alone.
 
-## Git dialog
+## Git page
 
-Open Git for the current checkout with `Cmd+J`, then `g` on macOS (`Ctrl+J`, then `g` elsewhere), or **Open Git** in the actions palette. Tab and Shift+Tab traverse the mode buttons, lists, editors, and action controls. Enter or Space activates focused buttons, files, and branches. In the history commit list, Up/Down and Home/End select commits; Enter or Space selects the current row. In a focused diff, Up/Down scroll one line, Page Up/Page Down scroll a page, and Home/End reach its ends. Commit and merge Result editors retain their normal editing, clipboard, search, and undo/redo shortcuts. Escape dismisses an open editor search first; otherwise Escape or the close button closes Git and restores workspace focus. Commit messages survive reopening within the same workspace; dirty merge Results also support restart recovery.
+Choose **Open Git** from the branch/status menu in the workspace header for the current checkout, use `Cmd+J`, then `g` on macOS (`Ctrl+J`, then `g` elsewhere), or **Open Git** in the actions palette. Tab and Shift+Tab traverse the mode buttons, lists, editors, and action controls. Enter or Space activates focused buttons, files, and branches. In the history commit list, Up/Down and Home/End select commits; Enter or Space selects the current row. In a focused diff, Up/Down scroll one line, Page Up/Page Down scroll a page, and Home/End reach its ends. Commit and merge Result editors retain their normal editing, clipboard, search, and undo/redo shortcuts. Escape dismisses an open editor search, popover, or modal. **Back**, or navigation mode followed by `b`, returns to the previous view and focus. Navigation mode can also open another workspace tab or Home. Commit messages survive navigation within the same workspace; dirty merge Results also support restart recovery.
 
-Changes, Branches, History, remote actions, rebase, and conflict continuation are described in [Git workflow](git.md). Operation and destructive controls stay inside the dialog. External repository changes refresh automatically.
+Changes, the branch picker and **Manage branches…**, History, remote actions, rebase, and conflict continuation are described in [Git workflow](git.md). The header branch menu stays available in normal workspace views and on the Git page. Switch or create branches there; other Git operations stay on the page. Dialogs open above the current view. External repository changes refresh automatically.
 
 In a focused **Git Changes or History diff**, `Shift+Up` / `Shift+Down` extends
 a source-line selection; `Cmd+C` on macOS or `Ctrl+C` elsewhere copies the selected source.

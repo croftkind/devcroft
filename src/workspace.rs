@@ -51,7 +51,10 @@ use crate::data::{
     sync_portable_with_tracker,
 };
 use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
-use crate::git::{CommitDraftChanged, GitDialog, OpenGitFile, SnapshotChanged};
+use crate::git::{
+    BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitView, OpenGitFile,
+    SnapshotChanged,
+};
 use crate::git_status::{GitStatus, load_git_status};
 use crate::home::{HomeEvent, HomeView, project_state_tag};
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, WORKSPACE_HEADER_HEIGHT};
@@ -130,7 +133,7 @@ impl WorkspaceTab {
         }
     }
 
-    /// Review and Resources render native content instead of hosting a shell.
+    /// Native pages render content instead of hosting a shell.
     pub(crate) fn has_terminal(self) -> bool {
         !matches!(self, Self::Review | Self::Resources)
     }
@@ -143,6 +146,13 @@ impl WorkspaceTab {
 enum PageOrigin {
     Home,
     Repository,
+}
+
+/// The Git page temporarily replaces the current view without selecting a tab.
+struct GitPageOrigin {
+    home_visible: bool,
+    relationships_visible: bool,
+    focus: Option<FocusHandle>,
 }
 
 /// Generation-guarded holder for the header's git status. Background loads
@@ -190,10 +200,10 @@ impl GitPoll {
 }
 
 fn visible_git_status<'a>(
-    dialog_status: Option<&'a GitStatus>,
+    page_status: Option<&'a GitStatus>,
     polled_status: &'a GitStatus,
 ) -> &'a GitStatus {
-    dialog_status.unwrap_or(polled_status)
+    page_status.unwrap_or(polled_status)
 }
 
 pub(crate) struct Workspace {
@@ -247,12 +257,20 @@ pub(crate) struct Workspace {
     tool_views: HashMap<ToolKind, Entity<ToolView>>,
     project_name: SharedString,
     git_poll: GitPoll,
-    /// While the native Git dialog is open, its repository snapshot owns the
-    /// header projection so the independent lightweight poll cannot replace
-    /// it with facts computed under different Git configuration.
-    git_dialog_status: Option<GitStatus>,
+    /// The shared Git view owns the header projection while its snapshot loads.
+    /// Views are retained with checkout tabs so drafts and operations survive navigation.
+    git_page_status: Option<GitStatus>,
+    git_view: Option<Entity<GitView>>,
+    git_page_origin: Option<GitPageOrigin>,
+    git_header_busy: bool,
+    git_header_busy_focus: FocusHandle,
+    git_header_return_focus: Option<FocusHandle>,
+    git_picker_origin_focus: Option<FocusHandle>,
+    git_header_notice: Option<String>,
     git_commit_drafts: HashMap<PathBuf, String>,
     command_open: bool,
+    /// Pane focus before the palette takes it, for page routes with Back.
+    command_origin_focus: Option<FocusHandle>,
     /// Which filtered view the open bar shows. Set on every opening (and on
     /// mode switches while open); the render model follows it, so confirmations
     /// always resolve against the visible rows.
@@ -350,6 +368,7 @@ struct OpenAgentSession {
 }
 
 struct RepositoryTabs {
+    git_view: Option<Entity<GitView>>,
     active_tab: WorkspaceTab,
     tabs: Vec<Option<Entity<TerminalPane>>>,
     editor_instance: Option<EditorChoice>,
@@ -382,6 +401,7 @@ impl RepositoryTabs {
         let review = Workspace::new_review(working_directory, cx);
         Self {
             active_tab: WorkspaceTab::Agent,
+            git_view: None,
             tabs,
             editor_instance: Some(editor),
             native_editor: None,
@@ -539,7 +559,8 @@ impl Workspace {
                         if this.git_poll.commit(generation, status) {
                             cx.notify();
                         }
-                        if !this.home_visible
+                        if this.git_page_origin.is_none()
+                            && !this.home_visible
                             && !this.relationships_visible
                             && this.active_tab == WorkspaceTab::Review
                         {
@@ -570,7 +591,10 @@ impl Workspace {
                 if this
                     .update(cx, |this, cx| {
                         if this.portable_git_poll.commit(generation, status) {
-                            if !this.home_visible && this.active_tab == WorkspaceTab::Resources {
+                            if this.git_page_origin.is_none()
+                                && !this.home_visible
+                                && this.active_tab == WorkspaceTab::Resources
+                            {
                                 this.resources.update(cx, |view, cx| view.refresh(cx));
                             }
                             this.home.update(cx, |view, cx| view.refresh_artifacts(cx));
@@ -814,9 +838,17 @@ impl Workspace {
             tool_views: HashMap::new(),
             project_name: project_name.into(),
             git_poll: GitPoll::default(),
-            git_dialog_status: None,
+            git_page_status: None,
+            git_page_origin: None,
+            git_header_busy: false,
+            git_header_busy_focus: cx.focus_handle(),
+            git_header_return_focus: None,
+            git_picker_origin_focus: None,
+            git_header_notice: None,
+            git_view: None,
             git_commit_drafts: HashMap::new(),
             command_open: false,
+            command_origin_focus: None,
             palette_mode: PaletteMode::Actions,
             palette_has_query: false,
             attention_only: false,
@@ -848,10 +880,26 @@ impl Workspace {
         }
     }
 
+    fn can_leave_git(&self, window: &mut Window, cx: &mut App) -> bool {
+        if self
+            .git_view
+            .as_ref()
+            .is_some_and(|git| git.read(cx).busy())
+        {
+            window.push_notification("Wait for the active Git operation before leaving Git", cx);
+            false
+        } else {
+            true
+        }
+    }
+
     fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = WorkspaceTab::ALL.get(index).copied() else {
             return;
         };
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         self.close_navigation(cx);
         self.active_tab = tab;
         self.enter_repository(window, cx);
@@ -865,6 +913,16 @@ impl Workspace {
     fn focus_active_pane(&mut self, window: &mut Window, cx: &mut App) {
         self.remember_agent_pane(cx);
         self.sync_activity_visibility(window, cx);
+        if self.git_page_origin.is_some() {
+            if let Some(git) = &self.git_view {
+                git.focus_handle(cx).focus(window, cx);
+            }
+            return;
+        }
+        if self.git_header_busy {
+            self.git_header_busy_focus.focus(window, cx);
+            return;
+        }
         if self.relationships_visible {
             self.relationships
                 .read(cx)
@@ -904,7 +962,11 @@ impl Workspace {
     }
 
     fn sync_activity_visibility(&self, window: &Window, cx: &App) {
-        let visible = if !self.home_visible && window.is_window_active() {
+        let visible = if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
+            && window.is_window_active()
+        {
             match self.active_tab {
                 WorkspaceTab::Agent => self.tabs[WorkspaceTab::Agent as usize]
                     .as_ref()
@@ -945,7 +1007,7 @@ impl Workspace {
             .native_editor
             .as_ref()
             .is_some_and(|editor| editor.read(cx).has_jump_history());
-        if self.home_visible || !has_history {
+        if self.home_visible || !has_history || !self.can_leave_git(window, cx) {
             return;
         }
         self.select_tab(WorkspaceTab::Editor as usize, window, cx);
@@ -1004,6 +1066,22 @@ impl Workspace {
     ) {
         self.external_editors.insert(kind.id().to_owned(), enabled);
         let external_editors = self.external_editors.clone();
+        let available = ExternalEditorKind::ALL
+            .into_iter()
+            .filter(|kind| external_editors.get(kind.id()).copied().unwrap_or(false))
+            .collect::<Vec<_>>();
+        if let Some(git) = &self.git_view {
+            git.update(cx, |git, cx| {
+                git.set_external_editors(available.clone(), cx)
+            });
+        }
+        for tabs in self.inactive_repositories.values() {
+            if let Some(git) = &tabs.git_view {
+                git.update(cx, |git, cx| {
+                    git.set_external_editors(available.clone(), cx)
+                });
+            }
+        }
         if let Some(editor) = self.native_editor.as_ref() {
             editor.update(cx, |view, cx| {
                 view.set_external_editors(external_editors.clone(), cx)
@@ -1092,6 +1170,7 @@ impl Workspace {
         if self.command_open {
             return;
         }
+        self.command_origin_focus = self.focused_content_handle(window, cx);
         // Opening another overlay clears stale navigation state: the palette
         // trap owns the keyboard from here, so the HUD must not stay behind it.
         self.close_navigation(cx);
@@ -1135,6 +1214,7 @@ impl Workspace {
             return;
         }
         self.command_open = false;
+        self.command_origin_focus = None;
         self.sync_tutorial_palette(cx);
         self.focus_active_pane(window, cx);
         cx.notify();
@@ -1144,7 +1224,7 @@ impl Workspace {
     /// GPUI popups, so both artifact browsers hide while the bar is open and
     /// re-show on the next render once it closes.
     fn sync_tutorial_palette(&mut self, cx: &mut Context<Self>) {
-        let open = self.command_open;
+        let open = self.command_open || self.git_page_origin.is_some() || self.git_header_busy;
         self.home
             .update(cx, |view, cx| view.set_palette_open(open, cx));
         self.resources
@@ -1166,6 +1246,9 @@ impl Workspace {
     /// survive close/reopen. Esc, backdrop click, and the close button all
     /// dismiss via the dialog layer; nothing here tracks open state.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_header_busy && !self.can_leave_git(window, cx) {
+            return;
+        }
         let settings = self.settings.clone();
         let workspace = cx.entity().downgrade();
         // Link the workspace for Sync-now delegation and reload the persisted
@@ -1189,6 +1272,9 @@ impl Workspace {
     /// close/reopen; the tool view owns the dialog chrome, including the
     /// close-time save flush.
     fn open_tool(&mut self, tool: ToolKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_header_busy && !self.can_leave_git(window, cx) {
+            return;
+        }
         let view = match self.tool_views.get(&tool) {
             Some(view) => view.clone(),
             None => {
@@ -1201,18 +1287,19 @@ impl Workspace {
         ToolView::open_dialog(view, window, cx);
     }
 
-    /// Open a fresh native Git projection for the current checkout. Keeping
-    /// the entity scoped to the dialog makes every opening re-read the
-    /// repository and avoids carrying stale selection state across checkouts.
-    fn open_git_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.git_dialog_status = None;
+    /// Retain one native Git projection per checkout, refreshing on entry.
+    fn ensure_git_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_view.is_some() {
+            return;
+        }
+        self.git_page_status = None;
         let dirty_editor_paths = self
             .native_editor
             .as_ref()
             .map(|editor| editor.read(cx).dirty_paths())
             .unwrap_or_default();
         let git = cx.new(|cx| {
-            GitDialog::new(
+            GitView::new(
                 self.working_directory.clone(),
                 dirty_editor_paths,
                 self.data_root.as_ref().map(|root| root.root().to_owned()),
@@ -1231,9 +1318,11 @@ impl Workspace {
         });
         cx.subscribe(&git, |this, _, event: &SnapshotChanged, cx| {
             if this.working_directory == event.checkout
-                && this.git_dialog_status.as_ref() != Some(&event.status)
+                && !this.home_visible
+                && !this.relationships_visible
+                && this.git_page_status.as_ref() != Some(&event.status)
             {
-                this.git_dialog_status = Some(event.status.clone());
+                this.git_page_status = Some(event.status.clone());
                 cx.notify();
             }
         })
@@ -1257,34 +1346,180 @@ impl Workspace {
             cx.notify();
         })
         .detach();
-        let dialog_git = git.clone();
-        let workspace = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, window, _| {
-            dialog
-                .w(window.viewport_size().width)
-                .h(window.viewport_size().height)
-                .margin_top(px(0.))
-                .p(px(0.))
-                .on_cancel({
-                    let git = dialog_git.clone();
-                    move |_, _, cx| git.update(cx, |git, cx| git.request_close(cx))
-                })
-                .on_close({
-                    let workspace = workspace.clone();
-                    move |_, _, cx| {
-                        let _ = workspace.update(cx, |this, cx| {
-                            this.git_dialog_status = None;
-                            cx.notify();
+        cx.subscribe_in(
+            &git,
+            window,
+            |this, _, event: &BranchPickerRequested, window, cx| {
+                if event.checkout != this.working_directory {
+                    return;
+                }
+                this.sync_git_view(cx);
+                let Some(git) = this.git_view.clone() else {
+                    return;
+                };
+                match &event.action {
+                    BranchPickerAction::OpenGit => {
+                        this.command_origin_focus = this.git_picker_origin_focus.take();
+                        this.open_git_page(window, cx);
+                    }
+                    BranchPickerAction::ManageBranches => {
+                        this.command_origin_focus = this.git_picker_origin_focus.take();
+                        git.update(cx, |git, cx| git.show_branches(cx));
+                        this.open_git_page(window, cx);
+                    }
+                    BranchPickerAction::Switch(reference) => {
+                        this.git_header_return_focus = this.git_picker_origin_focus.take();
+                        git.update(cx, |git, cx| {
+                            git.switch_to_local_branch(reference.clone(), window, cx)
                         });
                     }
-                })
-                .child(dialog_git.clone().into_any_element())
-        });
-        let focus = git.focus_handle(cx);
-        focus.focus(window, cx);
+                    BranchPickerAction::NewBranch => {
+                        this.git_header_return_focus = this.git_picker_origin_focus.take();
+                        git.update(cx, |git, cx| git.open_new_branch_dialog(window, cx));
+                    }
+                }
+            },
+        )
+        .detach();
+        cx.observe_in(&git, window, |this, git, window, cx| {
+            if this.git_view.as_ref() != Some(&git) {
+                return;
+            }
+            let busy = git.read(cx).busy();
+            if busy && this.git_page_origin.is_none() && !this.git_header_busy {
+                if this.git_header_return_focus.is_none() {
+                    this.git_header_return_focus = this.focused_content_handle(window, cx);
+                }
+                this.git_header_busy = true;
+                this.git_header_busy_focus.focus(window, cx);
+            } else if !busy && this.git_header_busy {
+                this.git_header_busy = false;
+                let focus = this.git_header_return_focus.take();
+                if this.git_page_origin.is_none()
+                    && !window.has_active_dialog(cx)
+                    && !this.command_open
+                {
+                    this.focus_active_pane(window, cx);
+                    if let Some(focus) = focus {
+                        focus.focus(window, cx);
+                    }
+                }
+            }
+            let notice = git
+                .read(cx)
+                .operation_notice()
+                .map(|(message, error)| (message.to_owned(), error));
+            if this.git_header_notice.as_deref()
+                != notice.as_ref().map(|(message, _)| message.as_str())
+            {
+                this.git_header_notice = notice.as_ref().map(|(message, _)| message.clone());
+                if this.git_page_origin.is_none()
+                    && let Some((message, true)) = notice
+                {
+                    window.push_notification(message, cx);
+                }
+            }
+            this.sync_tutorial_palette(cx);
+            cx.notify();
+        })
+        .detach();
+        self.git_view = Some(git);
+    }
+
+    fn open_git_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_page_origin.is_none() {
+            let focus = self
+                .command_origin_focus
+                .take()
+                .or_else(|| self.focused_content_handle(window, cx));
+            self.git_page_origin = Some(GitPageOrigin {
+                home_visible: self.home_visible,
+                relationships_visible: self.relationships_visible,
+                focus,
+            });
+        }
+        self.close_navigation(cx);
+        self.command_open = false;
+        self.home_visible = false;
+        self.relationships_visible = false;
+        self.home.update(cx, |view, cx| view.deactivate(cx));
+        self.relationships
+            .update(cx, |view, cx| view.set_active(false, cx));
+        self.resources
+            .update(cx, |view, cx| view.set_active(false, cx));
+        self.ensure_git_view(window, cx);
+        self.sync_git_view(cx);
+        self.sync_tutorial_palette(cx);
+        self.sync_tutorial_navigation(cx);
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    /// Overlay focus must never become a page's return target.
+    fn focused_content_handle(&self, window: &Window, cx: &App) -> Option<FocusHandle> {
+        if self.git_header_busy {
+            return None;
+        }
+        self.navigation_panes(cx)
+            .into_iter()
+            .any(|(_, pane)| pane.contains_focused(window, cx))
+            .then(|| window.focused(cx))
+            .flatten()
+    }
+
+    fn back_from_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
+        let Some(origin) = self.git_page_origin.take() else {
+            return;
+        };
+        self.close_navigation(cx);
+        self.home_visible = origin.home_visible;
+        self.relationships_visible = origin.relationships_visible;
+        self.sync_git_view(cx);
+        if self.relationships_visible {
+            self.relationships
+                .update(cx, |view, cx| view.set_active(true, cx));
+        } else if self.home_visible {
+            self.home.update(cx, |view, cx| view.resume_page(cx));
+        } else {
+            self.resources.update(cx, |view, cx| {
+                view.set_active(self.active_tab == WorkspaceTab::Resources, cx)
+            });
+        }
+        self.sync_tutorial_palette(cx);
+        self.sync_tutorial_navigation(cx);
+        self.focus_active_pane(window, cx);
+        if let Some(focus) = origin.focus {
+            focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn sync_git_view(&mut self, cx: &mut Context<Self>) {
+        let active = !self.home_visible && !self.relationships_visible;
+        if !active {
+            self.git_page_status = None;
+        }
+        if let Some(git) = &self.git_view {
+            let dirty = self
+                .native_editor
+                .as_ref()
+                .map(|editor| editor.read(cx).dirty_paths())
+                .unwrap_or_default();
+            git.update(cx, |git, cx| {
+                git.set_dirty_editor_paths(dirty);
+                git.set_page_visible(self.git_page_origin.is_some());
+                git.set_active(active, cx);
+            });
+        }
     }
 
     fn open_git_file(&mut self, event: &OpenGitFile, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         if event.checkout != self.working_directory
             || event.path.is_absolute()
             || event
@@ -1310,6 +1545,10 @@ impl Workspace {
         if let Some(editor) = self.native_editor.as_ref() {
             editor.update(cx, |editor, cx| editor.request_open(file, None, cx));
             self.active_tab = WorkspaceTab::Editor;
+            self.git_page_origin = None;
+            self.sync_git_view(cx);
+            self.sync_tutorial_palette(cx);
+            self.sync_tutorial_navigation(cx);
             self.home_visible = false;
             self.focus_active_pane(window, cx);
             cx.notify();
@@ -1359,7 +1598,7 @@ impl Workspace {
                 PaletteCommand::GoTerminal => self.select_tab(2, window, cx),
                 PaletteCommand::GoReview => self.select_tab(3, window, cx),
                 PaletteCommand::GoResources => self.select_tab(4, window, cx),
-                PaletteCommand::OpenGit => self.open_git_dialog(window, cx),
+                PaletteCommand::OpenGit => self.open_git_page(window, cx),
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::EditorGoBack => self.editor_go_back(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
@@ -1373,12 +1612,16 @@ impl Workspace {
                 }
             },
         }
+        self.command_origin_focus = None;
     }
 
     /// Open the Add Repository dialog with a fresh form: re-harvesting on
     /// every opening beats reasoning about stale prefill. The dialog owns
     /// open/close; the view is dropped with it.
     fn open_add_repository(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_header_busy && !self.can_leave_git(window, cx) {
+            return;
+        }
         let data_root = self.data_root.clone();
         let spaces = self.spaces.names();
         let active_space = self.active_space.creation_space(&spaces);
@@ -1603,6 +1846,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         self.close_navigation(cx);
         // Resolve and record even on re-entry from Home. Restoring the same
         // checkout is a no-op, so its running PTYs remain untouched.
@@ -1676,6 +1922,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         // A location change clears stale navigation state.
         self.close_navigation(cx);
         let checkout = checkout_identity(checkout);
@@ -1714,7 +1963,11 @@ impl Workspace {
         if self.working_directory == checkout {
             return;
         }
-        self.git_dialog_status = None;
+        self.git_page_status = None;
+        self.git_page_origin = None;
+        self.git_header_notice = None;
+        self.git_picker_origin_focus = None;
+        self.git_header_return_focus = None;
         // Restored tabs keep their running session; unseen checkouts start
         // fresh and resolve to the global default on entry.
         let next = self
@@ -1729,7 +1982,11 @@ impl Workspace {
                     cx,
                 )
             });
+        if let Some(git) = &self.git_view {
+            git.update(cx, |git, cx| git.set_active(false, cx));
+        }
         let previous = RepositoryTabs {
+            git_view: std::mem::replace(&mut self.git_view, next.git_view),
             active_tab: std::mem::replace(&mut self.active_tab, next.active_tab),
             tabs: std::mem::replace(&mut self.tabs, next.tabs),
             editor_instance: std::mem::replace(&mut self.editor_instance, next.editor_instance),
@@ -1747,6 +2004,9 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.git_page_origin = None;
+        self.sync_tutorial_palette(cx);
+        self.sync_tutorial_navigation(cx);
         // Repository ownership can change while a pane is retained. Never
         // silently restore an agent running under the previous account.
         let account = crate::agent_accounts::Accounts::load(self.data_root.as_ref())
@@ -1790,6 +2050,7 @@ impl Workspace {
             }));
         }
         self.refresh_review_editor_action(cx);
+        self.sync_git_view(cx);
         for tab in WorkspaceTab::ALL {
             if tab.has_terminal()
                 && self.tabs[tab as usize].is_none()
@@ -1829,6 +2090,10 @@ impl Workspace {
     }
 
     fn open_relationships(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
+        self.git_page_origin = None;
         if !self.relationships_visible {
             self.relationships_origin = Some(if self.home_visible {
                 PageOrigin::Home
@@ -1842,6 +2107,7 @@ impl Workspace {
             .update(cx, |view, cx| view.set_active(false, cx));
         self.relationships_visible = true;
         self.home_visible = true;
+        self.sync_git_view(cx);
         self.command_open = false;
         self.sync_tutorial_palette(cx);
         self.relationships
@@ -2108,6 +2374,10 @@ impl Workspace {
     }
 
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
+        self.git_page_origin = None;
         self.relationships_visible = false;
         self.relationships
             .update(cx, |view, cx| view.set_active(false, cx));
@@ -2116,6 +2386,7 @@ impl Workspace {
         self.resources
             .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
+        self.sync_git_view(cx);
         self.command_open = false;
         self.sync_tutorial_palette(cx);
         self.home.update(cx, |view, cx| view.activate(cx));
@@ -2130,6 +2401,10 @@ impl Workspace {
     /// while Home is visible. Captures the origin so the titlebar back
     /// button returns where the user came from.
     fn browse_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
+        self.git_page_origin = None;
         self.relationships_visible = false;
         self.relationships
             .update(cx, |view, cx| view.set_active(false, cx));
@@ -2146,6 +2421,7 @@ impl Workspace {
         self.resources
             .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
+        self.sync_git_view(cx);
         self.command_open = false;
         self.sync_tutorial_palette(cx);
         self.home
@@ -2160,6 +2436,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
         use crate::markdown_references::Reference;
         match reference {
             Reference::Repository(key) => self.switch_repository(&key, &key, window, cx),
@@ -2344,7 +2623,11 @@ impl Workspace {
     /// switch. Shared so both paths reload exactly the same set.
     pub(crate) fn reload_portable_projections(&mut self, cx: &mut Context<Self>) {
         self.relationships.update(cx, |view, cx| view.refresh(cx));
-        if !self.home_visible && self.active_tab == WorkspaceTab::Resources {
+        if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
+            && self.active_tab == WorkspaceTab::Resources
+        {
             self.resources.update(cx, |view, cx| view.refresh(cx));
         }
         self.home.update(cx, |view, cx| view.reload(cx));
@@ -2707,6 +2990,34 @@ impl Workspace {
     }
 
     fn render_active_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.git_page_origin.is_none()
+            && self
+                .git_view
+                .as_ref()
+                .is_some_and(|git| git.read(cx).busy())
+        {
+            let message = self
+                .git_view
+                .as_ref()
+                .and_then(|git| git.read(cx).operation_notice())
+                .map(|(message, _)| message.to_owned())
+                .unwrap_or_else(|| "Working…".into());
+            return v_flex()
+                .id("git-header-operation")
+                .size_full()
+                .items_center()
+                .justify_center()
+                .track_focus(&self.git_header_busy_focus)
+                .child(div().text_sm().child(message))
+                .into_any_element();
+        }
+        if self.git_page_origin.is_some() {
+            return self
+                .git_view
+                .as_ref()
+                .map(|git| git.clone().into_any_element())
+                .unwrap_or_else(|| div().size_full().into_any_element());
+        }
         if self.relationships_visible {
             return self.relationships.clone().into_any_element();
         }
@@ -2742,6 +3053,9 @@ impl Workspace {
     }
 
     fn navigation_context(&self, cx: &App) -> NavigationContext {
+        if self.git_page_origin.is_some() || self.git_header_busy {
+            return NavigationContext::Git;
+        }
         if self.relationships_visible {
             return NavigationContext::Relationships;
         }
@@ -2757,7 +3071,7 @@ impl Workspace {
     }
 
     fn navigation_resource_state(&self, cx: &App) -> navigation::ResourceState {
-        if self.relationships_visible {
+        if self.git_page_origin.is_some() || self.git_header_busy || self.relationships_visible {
             return navigation::ResourceState::default();
         }
         if self.home_visible {
@@ -2790,6 +3104,16 @@ impl Workspace {
     }
 
     fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
+        if self.git_header_busy && self.git_page_origin.is_none() {
+            return vec![("Git operation", self.git_header_busy_focus.clone())];
+        }
+        if self.git_page_origin.is_some() {
+            return self
+                .git_view
+                .as_ref()
+                .map(|git| vec![("Git", git.focus_handle(cx))])
+                .unwrap_or_default();
+        }
         if self.relationships_visible {
             return vec![(
                 "Relationships",
@@ -2844,7 +3168,9 @@ impl Workspace {
             .rposition(|(_, focus)| focus.contains_focused(window, cx))
             .unwrap_or(0);
         self.navigation_open = true;
-        if !self.home_visible
+        if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
             && self.active_tab == WorkspaceTab::Editor
             && let Some(editor) = &self.native_editor
         {
@@ -2861,7 +3187,9 @@ impl Workspace {
             self.home
                 .update(cx, |view, cx| view.set_navigation_active(true, cx));
             self.session_cursor = None;
-        } else if !self.home_visible
+        } else if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
             && self.active_tab == WorkspaceTab::Agent
             && self.navigation_pane == 0
         {
@@ -2916,7 +3244,11 @@ impl Workspace {
         if let Some((_, focus)) = panes.get(self.navigation_pane) {
             focus.focus(window, cx);
         }
-        if !self.home_visible && self.active_tab == WorkspaceTab::Review {
+        if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
+            && self.active_tab == WorkspaceTab::Review
+        {
             self.review.update(cx, |review, cx| {
                 review.focus_navigation_pane(self.navigation_pane, window, cx)
             });
@@ -2958,7 +3290,7 @@ impl Workspace {
     /// `j`/`k`. Keeps the mode open for repeats; locations without a list
     /// consume the key and stay open. Clamps at the ends like pane movement.
     fn move_navigation_item(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.relationships_visible {
+        if self.git_page_origin.is_some() || self.git_header_busy || self.relationships_visible {
             return;
         }
         if self.home_visible {
@@ -3009,7 +3341,13 @@ impl Workspace {
     /// like before. Folder toggles keep navigation open; other activations
     /// return to normal mode.
     fn accept_navigation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.home_visible
+        if self.git_page_origin.is_some() {
+            self.close_navigation(cx);
+            return;
+        }
+        if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
             && self.active_tab == WorkspaceTab::Agent
             && self.navigation_pane == 0
             && self.session_cursor.is_some()
@@ -3029,7 +3367,9 @@ impl Workspace {
                 return;
             }
         }
-        if !self.home_visible
+        if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
             && !self.relationships_visible
             && self.active_tab == WorkspaceTab::Editor
             && self.editor_instance == Some(EditorChoice::BuiltIn)
@@ -3067,9 +3407,13 @@ impl Workspace {
             NavigationCommand::Resources => {
                 self.select_tab(WorkspaceTab::Resources as usize, window, cx)
             }
-            NavigationCommand::GitChanges => self.open_git_dialog(window, cx),
+            NavigationCommand::GitChanges => self.open_git_page(window, cx),
             NavigationCommand::Home => self.go_home(window, cx),
             NavigationCommand::Back => {
+                if self.git_page_origin.is_some() {
+                    self.back_from_git(window, cx);
+                    return;
+                }
                 if self.relationships_visible {
                     self.back_from_relationships(window, cx);
                     return;
@@ -3136,7 +3480,7 @@ impl Workspace {
     /// Resources sidebar, Review files/diff, or the built-in editor. Other panes consume the keys
     /// and stay open.
     fn navigation_item_available(&self, cx: &App) -> bool {
-        if self.relationships_visible {
+        if self.git_page_origin.is_some() || self.git_header_busy || self.relationships_visible {
             return false;
         }
         if self.home_visible {
@@ -3170,10 +3514,12 @@ impl Workspace {
     /// Artifact and review lists apply their selection live, so `Enter` there
     /// only keeps focus.
     fn navigation_enter_opens(&self, cx: &App) -> bool {
-        if self.relationships_visible {
+        if self.git_page_origin.is_some() || self.git_header_busy || self.relationships_visible {
             return false;
         }
-        if !self.home_visible
+        if self.git_page_origin.is_none()
+            && !self.git_header_busy
+            && !self.home_visible
             && self.active_tab == WorkspaceTab::Agent
             && self.navigation_pane == 0
             && self.session_cursor.is_some()
@@ -3186,7 +3532,8 @@ impl Workspace {
         {
             return self.home.read(cx).navigation_cursor_active();
         }
-        !self.home_visible
+        self.git_page_origin.is_none()
+            && !self.home_visible
             && self.active_tab == WorkspaceTab::Editor
             && self.editor_instance == Some(EditorChoice::BuiltIn)
             && self
@@ -3305,9 +3652,8 @@ impl Workspace {
         // the current key and let that key reach the overlay.
         if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
             self.close_navigation(cx);
-            // The Git dialog lets this trigger reach its terminal pane to
-            // dismiss it. Claim the chord so held repeats cannot reopen the
-            // HUD after the dialog closes; leave ordinary dialog typing alone.
+            // Claim the chord so held repeats cannot open the HUD after
+            // the overlay closes; leave ordinary dialog typing alone.
             if Self::is_trigger(&event.keystroke) {
                 self.navigation_claimed_keys.insert(key, false);
             }
@@ -3556,39 +3902,15 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Branch pill with a commit icon for detached HEADs. Long names truncate
-    /// instead of pushing the command bar aside.
-    fn render_branch_pill(&self, branch: SharedString, detached: bool) -> impl IntoElement {
-        let icon = if detached {
-            gpui_kit::assets::IconName::GitCommitHorizontal
-        } else {
-            gpui_kit::assets::IconName::GitBranch
-        };
-        h_flex()
-            .min_w_0()
-            .gap_1()
-            .items_center()
-            .h(px(22.))
-            .px_2()
-            .rounded_md()
-            .bg(rgb(0x171919))
-            .text_xs()
-            .child(
-                Icon::new(icon)
-                    .size(px(12.))
-                    .flex_none()
-                    .text_color(rgb(0x858989)),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .max_w(px(120.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_color(rgb(0x858989))
-                    .child(branch),
-            )
+    fn render_git_status_trigger(&self, status: &GitStatus, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.git_picker_origin_focus = this.focused_content_handle(window, cx);
+            }))
+            .when_some(self.git_view.as_ref(), |this, git| {
+                this.child(git.update(cx, |git, cx| git.render_branch_picker(status, cx)))
+            })
+            .into_any_element()
     }
 }
 
@@ -3625,8 +3947,12 @@ fn activity_state_color(state: ActivityState) -> u32 {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.home_visible && !self.relationships_visible {
+            self.ensure_git_view(window, cx);
+        }
         self.sync_activity_visibility(window, cx);
         let active_index = self.active_tab as usize;
+        self.sync_git_view(cx);
         let active_content = self.render_active_content(cx);
         // Resources and Artifacts full-pages share the repository workspace
         // chrome: title and back navigation live here, not in a second row.
@@ -3684,7 +4010,7 @@ impl Render for Workspace {
         let center_command = window.viewport_size().width >= px(centered_min_width);
         let command_left = (window.viewport_size().width - px(command_width)) / 2.;
         let git_status =
-            visible_git_status(self.git_dialog_status.as_ref(), self.git_poll.status()).clone();
+            visible_git_status(self.git_page_status.as_ref(), self.git_poll.status()).clone();
 
         v_flex()
             .relative()
@@ -3694,7 +4020,9 @@ impl Render for Workspace {
             // mode.
             .key_context(WORKSPACE_KEY_CONTEXT)
             .when(
-                self.home_visible || self.active_tab == WorkspaceTab::Resources,
+                self.git_page_origin.is_some()
+                    || self.home_visible
+                    || self.active_tab == WorkspaceTab::Resources,
                 |this| this.tab_group(),
             )
             .size_full()
@@ -3869,16 +4197,39 @@ impl Render for Workspace {
                                 .gap_2()
                                 .items_center()
                                 .child(
-                                    Button::new("go-home")
-                                        .ghost()
-                                        .small()
-                                        .size(px(28.))
-                                        .icon(IconName::ChevronLeft)
-                                        .accessibility_label("Home")
-                                        .tooltip("Back to Home")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.go_home(window, cx);
-                                        })),
+                                    Button::new(if self.git_page_origin.is_some() {
+                                        "git-page-back"
+                                    } else {
+                                        "go-home"
+                                    })
+                                    .ghost()
+                                    .small()
+                                    .when(self.git_page_origin.is_none(), |button| {
+                                        button.size(px(28.))
+                                    })
+                                    .when(self.git_page_origin.is_some(), |button| {
+                                        button.label("Back")
+                                    })
+                                    .icon(IconName::ChevronLeft)
+                                    .accessibility_label(if self.git_page_origin.is_some() {
+                                        "Back from Git"
+                                    } else {
+                                        "Home"
+                                    })
+                                    .tooltip(if self.git_page_origin.is_some() {
+                                        "Back to previous view"
+                                    } else {
+                                        "Back to Home"
+                                    })
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            if this.git_page_origin.is_some() {
+                                                this.back_from_git(window, cx);
+                                            } else {
+                                                this.go_home(window, cx);
+                                            }
+                                        },
+                                    )),
                                 )
                                 .child(
                                     div()
@@ -3891,26 +4242,9 @@ impl Render for Workspace {
                                         .font_semibold()
                                         .child(self.project_name.clone()),
                                 )
-                                .when_some(git_status.branch.clone(), |this, branch| {
-                                    this.child(
-                                        self.render_branch_pill(branch.into(), git_status.detached),
-                                    )
-                                })
-                                // Amber dot while staged, unstaged, or untracked
-                                // changes exist; hidden when clean so the steady
-                                // state stays quiet.
-                                .when(git_status.dirty, |this| {
-                                    this.child(div().text_xs().text_color(rgb(0xeab308)).child("●"))
-                                })
-                                .when_some(git_status.ahead_label(), |this, ahead| {
-                                    this.child(
-                                        div().text_xs().text_color(rgb(0x858989)).child(ahead),
-                                    )
-                                })
-                                .when_some(git_status.behind_label(), |this, behind| {
-                                    this.child(
-                                        div().text_xs().text_color(rgb(0x858989)).child(behind),
-                                    )
+                                .child(self.render_git_status_trigger(&git_status, cx))
+                                .when(self.git_page_origin.is_some(), |this| {
+                                    this.child(div().text_sm().font_semibold().child("Git"))
                                 }),
                         )
                     })
@@ -4117,31 +4451,34 @@ impl Render for Workspace {
                                 })),
                         )
                     })
-                    .when(!self.home_visible, |header| {
-                        header.child(
-                            TabBar::new("workspace-tabs")
-                                .pill()
-                                .small()
-                                .flex_none()
-                                .h(px(28.))
-                                .p(px(2.))
-                                .rounded_md()
-                                .bg(rgb(0x171919))
-                                .border_1()
-                                .border_color(rgb(0x222525))
-                                .selected_index(active_index)
-                                .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                    this.select_tab(*index, window, cx);
-                                }))
-                                .children(WorkspaceTab::ALL.into_iter().map(|tab| {
-                                    Tab::new()
-                                        .label(tab.label())
-                                        .when(tab as usize == active_index, |tab| {
-                                            tab.font_semibold()
-                                        })
-                                })),
-                        )
-                    }),
+                    .when(
+                        self.git_page_origin.is_none() && !self.home_visible,
+                        |header| {
+                            header.child(
+                                TabBar::new("workspace-tabs")
+                                    .pill()
+                                    .small()
+                                    .flex_none()
+                                    .h(px(28.))
+                                    .p(px(2.))
+                                    .rounded_md()
+                                    .bg(rgb(0x171919))
+                                    .border_1()
+                                    .border_color(rgb(0x222525))
+                                    .selected_index(active_index)
+                                    .on_click(cx.listener(|this, index: &usize, window, cx| {
+                                        this.select_tab(*index, window, cx);
+                                    }))
+                                    .children(WorkspaceTab::ALL.into_iter().map(|tab| {
+                                        Tab::new()
+                                            .label(tab.label())
+                                            .when(tab as usize == active_index, |tab| {
+                                                tab.font_semibold()
+                                            })
+                                    })),
+                            )
+                        },
+                    ),
             )
             .child(div().flex_1().min_h_0().child(active_content))
             .when(self.command_open, |this| {
@@ -4175,6 +4512,522 @@ mod tests {
     use super::*;
     use gpui_kit::component::Root;
     use std::path::PathBuf;
+
+    #[gpui_kit::test]
+    fn git_page_navigation_retains_checkout_view_without_opening_a_dialog(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let previous_tab = workspace.active_tab;
+                let previous_focus = workspace.home.read(cx).focus_handle.clone();
+                previous_focus.focus(window, cx);
+                workspace.open_git_page(window, cx);
+                assert!(workspace.git_page_origin.is_some());
+                assert_eq!(workspace.active_tab, previous_tab);
+                assert!(workspace.tabs.iter().all(Option::is_none));
+                let git = workspace.git_view.clone().unwrap();
+                assert_eq!(workspace.navigation_panes(cx).len(), 1);
+                assert!(!window.has_active_dialog(cx));
+                assert!(git.focus_handle(cx).contains_focused(window, cx));
+                workspace.open_git_page(window, cx);
+                workspace.run_navigation_command(NavigationCommand::Back, window, cx);
+                assert!(workspace.git_page_origin.is_none());
+                assert!(workspace.home_visible);
+                assert_eq!(workspace.active_tab, previous_tab);
+                assert!(previous_focus.contains_focused(window, cx));
+                workspace.open_git_page(window, cx);
+                workspace.go_home(window, cx);
+                workspace.sync_git_view(cx);
+                workspace.open_git_page(window, cx);
+                assert_eq!(workspace.git_view.as_ref(), Some(&git));
+                assert!(!window.has_active_dialog(cx));
+                let original = workspace.working_directory.clone();
+                let other = original.join("another-checkout");
+                workspace.inactive_repositories.insert(
+                    other.clone(),
+                    RepositoryTabs {
+                        git_view: None,
+                        active_tab: WorkspaceTab::Editor,
+                        tabs: vec![None; WorkspaceTab::ALL.len()],
+                        editor_instance: Some(EditorChoice::BuiltIn),
+                        native_editor: None,
+                        review: Workspace::new_review(&other, cx),
+                        agent: workspace.default_agent,
+                    },
+                );
+                workspace.restore_repository_tabs(&other, cx);
+                assert!(workspace.git_view.is_none());
+                workspace.restore_repository_tabs(&original, cx);
+                assert_eq!(workspace.git_view.as_ref(), Some(&git));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn git_header_entry_and_back_preserve_resource_tab_and_focus(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        let previous_focus = test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.active_tab = WorkspaceTab::Resources;
+                workspace.home_visible = false;
+                workspace
+                    .resources
+                    .update(cx, |view, cx| view.set_active(true, cx));
+                workspace.focus_active_pane(window, cx);
+                window.focused(cx).unwrap()
+            })
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("git-branch-switcher", cx);
+            window.render_frame(cx);
+            window.click("git-picker-open-page", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.git_page_origin.is_some());
+                assert_eq!(workspace.active_tab, WorkspaceTab::Resources);
+                assert_eq!(workspace.navigation_context(cx), NavigationContext::Git);
+                assert!(!workspace.navigation_item_available(cx));
+                assert!(!workspace.sessions_visible());
+                assert!(!window.has_active_dialog(cx));
+            });
+            window.render_frame(cx);
+            window.click("git-page-back", cx);
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.git_page_origin.is_none());
+                assert_eq!(workspace.active_tab, WorkspaceTab::Resources);
+                assert!(!workspace.home_visible);
+                assert!(previous_focus.contains_focused(window, cx));
+                assert!(workspace.tabs.iter().all(Option::is_none));
+                // The palette input takes focus, but must never become the
+                // Git page's Back target after that input is unmounted.
+                workspace.open_command_palette(PaletteMode::Actions, window, cx);
+                assert!(
+                    workspace
+                        .command_state
+                        .read(cx)
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)
+                );
+                workspace.palette_model = vec![PaletteSection {
+                    heading: "Actions",
+                    items: vec![PaletteItem::Command(PaletteCommand::OpenGit)],
+                }];
+                workspace.on_palette_confirm(IndexPath::new(0), window, cx);
+                assert!(!workspace.command_open);
+                assert!(workspace.git_page_origin.is_some());
+                workspace.back_from_git(window, cx);
+                assert!(previous_focus.contains_focused(window, cx));
+                assert_eq!(workspace.active_tab, WorkspaceTab::Resources);
+                // Opening from the global browser must restore that exact
+                // page rather than the dashboard or repository Resources.
+                workspace.browse_artifacts(window, cx);
+                let origin = workspace.artifacts_origin;
+                workspace.open_git_page(window, cx);
+                workspace.back_from_git(window, cx);
+                assert!(workspace.home_visible);
+                assert!(workspace.home.read(cx).is_artifacts_page());
+                assert_eq!(workspace.artifacts_origin, origin);
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn shared_branch_picker_protects_drafts_and_restores_editor_focus(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Git UI Test"]);
+        git(&["config", "user.email", "git-ui@example.invalid"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", ".git/hooks"]);
+        let file = root.join("file.txt");
+        std::fs::write(&file, "main\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "main"]);
+        git(&["switch", "-c", "feature"]);
+        std::fs::write(&file, "feature\n").unwrap();
+        git(&["commit", "-am", "feature"]);
+        git(&["switch", "main"]);
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| {
+                let mut workspace = Workspace::new(window, cx, &root);
+                workspace.home_visible = false;
+                workspace.active_tab = WorkspaceTab::Editor;
+                workspace.editor_instance = Some(EditorChoice::BuiltIn);
+                let editor =
+                    cx.new(|cx| NativeEditor::new(&root, HashMap::new(), None, window, cx));
+                editor.update(cx, |editor, cx| editor.request_open(file.clone(), None, cx));
+                workspace.native_editor = Some(editor);
+                workspace
+            });
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        test_cx.run_until_parked();
+        let editor_focus = workspace.read_with(test_cx, |workspace, cx| {
+            workspace
+                .native_editor
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .editor_focus(cx)
+        });
+        let pick = |test_cx: &mut gpui_kit::VisualTestContext, id: &str| {
+            test_cx.update(|window, cx| {
+                window.render_frame(cx);
+                window.click("git-branch-switcher", cx);
+                window.render_frame(cx);
+                window.click(id.to_owned(), cx);
+            });
+        };
+        test_cx.update(|window, cx| editor_focus.focus(window, cx));
+        pick(test_cx, "git-picker-open-page");
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, _| {
+                assert!(workspace.git_page_origin.is_some());
+                assert_eq!(
+                    workspace.git_page_origin.as_ref().unwrap().focus.as_ref(),
+                    Some(&editor_focus)
+                );
+            });
+            window.render_frame(cx);
+            // The same menu is still available on the Git page.
+            window.click("git-branch-switcher", cx);
+            window.render_frame(cx);
+            window.click("git-picker-open-page", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.back_from_git(window, cx);
+                assert!(editor_focus.contains_focused(window, cx));
+            });
+        });
+        // Editing after the repository snapshot loaded must still protect
+        // the latest draft when the header menu starts a switch.
+        test_cx.simulate_keystrokes("x");
+        test_cx.run_until_parked();
+        assert!(
+            !workspace
+                .read_with(test_cx, |workspace, cx| workspace
+                    .native_editor
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .dirty_paths())
+                .is_empty()
+        );
+        let switch_feature = |test_cx: &mut gpui_kit::VisualTestContext| {
+            test_cx.update(|window, cx| {
+                window.render_frame(cx);
+                window.click("git-branch-switcher", cx);
+                window.render_frame(cx);
+                // The current main branch is pinned first.
+                window.click(("git-branch-switcher-item", 1usize), cx);
+            });
+        };
+        switch_feature(test_cx);
+        test_cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "main\n");
+        workspace.read_with(test_cx, |workspace, cx| {
+            assert!(workspace.git_page_origin.is_none());
+            assert!(!workspace.git_header_busy);
+            assert!(workspace.git_header_notice.is_some());
+            assert!(
+                !workspace
+                    .native_editor
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .dirty_paths()
+                    .is_empty()
+            );
+        });
+        test_cx.update(|window, cx| editor_focus.focus(window, cx));
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        test_cx.run_until_parked();
+        assert!(
+            workspace
+                .read_with(test_cx, |workspace, cx| workspace
+                    .native_editor
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .dirty_paths())
+                .is_empty()
+        );
+        pick(test_cx, "git-branch-switcher-new");
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            assert!(window.has_active_dialog(cx));
+            window.render_frame(cx);
+            window.click("cancel-new-branch", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            workspace.read_with(cx, |workspace, _| {
+                assert!(workspace.git_page_origin.is_none())
+            });
+            editor_focus.focus(window, cx);
+        });
+        switch_feature(test_cx);
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.git_header_busy);
+                assert!(workspace.git_header_busy_focus.contains_focused(window, cx));
+                workspace.go_home(window, cx);
+                assert!(!workspace.home_visible);
+            });
+        });
+        test_cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "feature\n");
+        test_cx.update(|window, cx| {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(workspace.git_page_origin.is_none());
+                assert_eq!(workspace.active_tab, WorkspaceTab::Editor);
+                assert!(!workspace.git_header_busy);
+                assert!(editor_focus.contains_focused(window, cx));
+                assert_eq!(
+                    workspace
+                        .git_page_status
+                        .as_ref()
+                        .unwrap()
+                        .branch
+                        .as_deref(),
+                    Some("feature")
+                );
+            });
+        });
+        test_cx.update(|window, cx| editor_focus.focus(window, cx));
+        pick(test_cx, "git-branch-switcher-new");
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("t o p i c");
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("confirm-new-branch", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(workspace.git_page_origin.is_none());
+                assert!(!workspace.git_header_busy);
+                assert!(editor_focus.contains_focused(window, cx));
+                assert_eq!(
+                    workspace
+                        .git_page_status
+                        .as_ref()
+                        .unwrap()
+                        .branch
+                        .as_deref(),
+                    Some("topic")
+                );
+            });
+        });
+        pick(test_cx, "git-manage-branches");
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(("git-local-branch", 0usize)).is_some());
+            workspace.read_with(cx, |workspace, _| {
+                assert!(workspace.git_page_origin.is_some())
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn header_git_deactivates_on_global_pages_and_ignores_retained_view_notices(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(|window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        let old_git = test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.home_visible = false;
+                workspace.ensure_git_view(window, cx);
+                workspace.sync_git_view(cx);
+                let old_git = workspace.git_view.clone().unwrap();
+                assert!(old_git.read(cx).is_active());
+                workspace.go_home(window, cx);
+                assert!(!old_git.read(cx).is_active());
+                workspace.home_visible = false;
+                workspace.sync_git_view(cx);
+                workspace.browse_artifacts(window, cx);
+                assert!(!old_git.read(cx).is_active());
+                workspace.home_visible = false;
+                workspace.sync_git_view(cx);
+                workspace.open_relationships(window, cx);
+                assert!(!old_git.read(cx).is_active());
+                let other = root.join("other-checkout");
+                // Retain an empty checkout without spawning real PTY threads
+                // into the deterministic GPUI test scheduler.
+                workspace.inactive_repositories.insert(
+                    other.clone(),
+                    RepositoryTabs {
+                        git_view: None,
+                        active_tab: WorkspaceTab::Resources,
+                        tabs: vec![None; WorkspaceTab::ALL.len()],
+                        editor_instance: Some(EditorChoice::BuiltIn),
+                        native_editor: None,
+                        review: Workspace::new_review(&other, cx),
+                        agent: workspace.default_agent,
+                    },
+                );
+                workspace.restore_repository_tabs(&other, cx);
+                workspace.ensure_git_view(window, cx);
+                old_git
+            })
+        });
+        test_cx.run_until_parked();
+        workspace.update(test_cx, |workspace, cx| {
+            workspace.git_header_notice = Some("current checkout notice".into());
+            old_git.update(cx, |_, cx| cx.notify());
+        });
+        test_cx.run_until_parked();
+        workspace.read_with(test_cx, |workspace, _| {
+            assert_eq!(
+                workspace.git_header_notice.as_deref(),
+                Some("current checkout notice")
+            );
+            assert!(!workspace.git_header_busy);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn busy_git_blocks_editor_home_and_artifact_navigation(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let git = |args: &[&str]| {
+            let result = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.name", "Git UI Test"]);
+        git(&["config", "user.email", "git-ui@example.invalid"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["config", "core.hooksPath", ".git/hooks"]);
+        std::fs::write(root.join("file.txt"), "changed\n").unwrap();
+        git(&["add", "file.txt"]);
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| {
+                let mut workspace = Workspace::new(window, cx, &root);
+                workspace.open_git_page(window, cx);
+                workspace
+            });
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.git_view.as_ref().unwrap().update(cx, |git, cx| {
+                    git.restore_commit_message("navigation guard fixture", window, cx);
+                });
+            });
+            window.render_frame(cx);
+            window.click("git-commit", cx);
+            workspace.update(cx, |workspace, cx| {
+                assert!(workspace.git_view.as_ref().unwrap().read(cx).busy());
+                workspace.select_tab(WorkspaceTab::Editor as usize, window, cx);
+                workspace.go_home(window, cx);
+                workspace.browse_artifacts(window, cx);
+                workspace.back_from_git(window, cx);
+                assert!(workspace.git_page_origin.is_some());
+                assert_eq!(workspace.active_tab, WorkspaceTab::Agent);
+                assert!(!workspace.home_visible);
+            });
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                assert!(!workspace.git_view.as_ref().unwrap().read(cx).busy());
+                workspace.browse_artifacts(window, cx);
+                assert!(workspace.home_visible);
+            });
+        });
+    }
 
     #[gpui_kit::test]
     fn built_in_editor_navigation_keeps_mode_open_and_moves_between_visible_panes(
@@ -5066,6 +5919,11 @@ mod tests {
         assert_eq!(WorkspaceTab::Resources.command(), None);
         assert!(!WorkspaceTab::Resources.has_terminal());
         assert_eq!(WorkspaceTab::ALL.len(), 5);
+        assert!(
+            WorkspaceTab::ALL
+                .into_iter()
+                .all(|tab| tab.label() != "Git")
+        );
     }
 
     fn dirty_status() -> GitStatus {
@@ -5077,7 +5935,7 @@ mod tests {
     }
 
     #[test]
-    fn dialog_snapshot_owns_header_status_until_close() {
+    fn visible_git_page_snapshot_owns_header_status() {
         let polled = GitStatus {
             branch: Some("main".to_owned()),
             dirty: false,

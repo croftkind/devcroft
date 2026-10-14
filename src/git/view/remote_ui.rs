@@ -1,15 +1,17 @@
 use super::*;
 use crate::git::remote::{Action, Source};
-use gpui_kit::component::Selectable as _;
+use gpui_kit::component::{
+    Selectable as _,
+    menu::{DropdownMenu as _, PopupMenuItem},
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RemoteForm {
-    Create,
     Track,
     Push,
 }
 
-impl GitDialog {
+impl GitView {
     pub(super) fn request_remote(
         &mut self,
         action: Action,
@@ -104,6 +106,7 @@ impl GitDialog {
                     .small()
                     .ghost()
                     .label("Pull")
+                    .dropdown_caret(true)
                     .tooltip(if busy {
                         "Wait for the active Git operation"
                     } else if snapshot.operation.is_some() {
@@ -111,31 +114,34 @@ impl GitDialog {
                     } else if snapshot.upstream.is_none() {
                         "Configure an upstream branch before pulling"
                     } else {
-                        "Fast-forward only; never creates a merge commit"
+                        "Choose fast-forward pull or pull with rebase"
                     })
                     .disabled(pull_disabled)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.request_remote(Action::Pull { rebase: false }, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("git-pull-rebase")
-                    .small()
-                    .ghost()
-                    .label("Pull with rebase")
-                    .tooltip(if busy {
-                        "Wait for the active Git operation"
-                    } else if snapshot.operation.is_some() {
-                        "Finish the current Git operation before pulling"
-                    } else if snapshot.upstream.is_none() {
-                        "Configure an upstream branch before pulling"
-                    } else {
-                        "Pull and replay local commits onto the upstream branch…"
-                    })
-                    .disabled(pull_disabled)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.request_remote(Action::Pull { rebase: true }, window, cx)
-                    })),
+                    .dropdown_menu({
+                        let git = cx.entity().downgrade();
+                        move |mut menu, _, _| {
+                            for (label, rebase) in [
+                                ("Pull (fast-forward only)", false),
+                                ("Pull with rebase…", true),
+                            ] {
+                                let git = git.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label).disabled(pull_disabled).on_click(
+                                        move |_, window, cx| {
+                                            let _ = git.update(cx, |this, cx| {
+                                                this.request_remote(
+                                                    Action::Pull { rebase },
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu
+                        }
+                    }),
             )
             .child(
                 Button::new("git-push")
@@ -185,10 +191,8 @@ impl GitDialog {
             .border_color(cx.theme().border)
             .child(div().text_sm().font_semibold().child(if push {
                 "Push and set upstream"
-            } else if form == RemoteForm::Track {
-                "Create a local tracking branch"
             } else {
-                "Create and switch branch"
+                "Create a local tracking branch"
             }));
         if push {
             panel = panel
@@ -215,17 +219,6 @@ impl GitDialog {
                 .child(div().text_xs().child(format!(
                     "Start point: {start} · select a branch below to change it"
                 )))
-                .child(
-                    Button::new("git-create-from-head")
-                        .small()
-                        .ghost()
-                        .label("Use HEAD")
-                        .disabled(busy || form == RemoteForm::Track)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.selected_ref = None;
-                            cx.notify();
-                        })),
-                )
                 .child(Input::new(&self.branch_name));
         }
         panel
@@ -538,9 +531,8 @@ impl GitDialog {
                             .icon(IconName::Plus)
                             .label("New branch…")
                             .disabled(busy || snapshot.unborn || snapshot.operation.is_some())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.remote_form = Some(RemoteForm::Create);
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_new_branch_dialog(window, cx);
                             })),
                     )
                     .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(list)),

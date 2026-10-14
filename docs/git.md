@@ -1,10 +1,15 @@
-# Native Git dialog
+# Git workspace page
 
-Git runs inside a near-window-sized native dialog for the current checkout.
-Install `git` on the application's PATH. Open the dialog with `Cmd+J`, then
-`g` on macOS (`Ctrl+J`, then `g` on Linux/Windows), or **Open Git** in the
-actions palette. Git is separate from the workspace tabs; the branch header
-is display-only.
+Git is a full workspace page for the current checkout. Install `git` on
+the application's PATH. Open the branch/status menu in the workspace header and choose **Open Git**, use `Cmd+J`,
+then `g` on macOS (`Ctrl+J`, then `g` on Linux/Windows), or choose **Open Git**
+in the actions palette. Dialogs, including branch creation, open above the
+page. **Back** returns to the previous view and focus without changing the selected workspace tab.
+
+The same header branch picker stays available in workspace views and on the Git page. It searches local branch names and commit summaries,
+switches branches, and offers **New branch**. The current matching branch is
+pinned first. Hover the picker to see the full checkout path and upstream.
+Choose **Manage branches…** for remote tracking, branch details, and rebase.
 
 ## Keyboard and refresh
 
@@ -15,15 +20,18 @@ branch. In the history commit list, **Up / Down**, **Home / End**, and
 line, **Page Up / Page Down** scroll a page, and **Home / End** reach its ends.
 The history changed-file list uses the same selection keys. Commit and merge editors keep their normal typing, clipboard, search, and
 undo/redo shortcuts. Escape first dismisses an editor's search when open;
-otherwise **Escape** or the close button closes the dialog and restores
-workspace focus. Closing waits for an active Git operation to finish. Commit messages survive closing and reopening in the same
-workspace, including checkout switches; quitting the app clears them.
+otherwise **Escape** dismisses the active popover or dialog. Use **Back** (or
+`Cmd/Ctrl+J`, then `b`) to return to the previous view; navigation mode can also
+open another workspace tab or Home. Commit messages and merge Results survive
+leaving and returning, including checkout switches; quitting clears commit
+messages. Wait for an active Git operation to finish before switching pages or checkouts.
 
 Repository changes from agents, the terminal, or other tools refresh
 automatically. **Refresh repository** explicitly reloads status and history.
-The header uses the dialog's snapshot while open. Operations run in the
+The header refreshes from the same repository snapshot as the Git page. Operations run in the
 background, one mutation at a time per checkout; progress and failures appear
-in the dialog. A refresh can reset history selection when refs change.
+on the page. Switching or creating a branch from another workspace view briefly shows
+progress, then returns to that view and focus. Failures also appear as notifications. A refresh can reset history selection when refs change.
 
 ## Changes and commits
 
@@ -54,7 +62,7 @@ from the index, preserving staged content. On macOS, **Trash** removes
 untracked files recoverably; recover them through macOS Trash. Other platforms
 omit untracked removal and rename discard where recoverable trash is unavailable.
 Actions that overwrite a file with an unsaved built-in editor draft are
-blocked. **Open in Editor** closes Git and opens the working-tree file in
+blocked. **Open in Editor** switches to the Editor tab and opens the working-tree file in
 Devcroft's built-in editor.
 
 Binary, oversized, invalid UTF-8, symlink, submodule, missing, and type-changed
@@ -63,15 +71,15 @@ are bounded; truncated content is labeled.
 
 ## Branches and remotes
 
-**Branches** searches local and remote names and commit summaries. Select a
+**Manage branches…** searches local and remote names and commit summaries. Select a
 branch to inspect its commit and upstream. **Switch** checks out a local
 branch; a remote branch can be adopted as a new local tracking branch.
-**Create Branch** validates a name and offers HEAD or a selected start point,
-then creates and switches. Git rejects switches that would overwrite work.
+**New branch** opens a dialog to name a branch starting at the current HEAD,
+then creates and switches. Use History’s **Create branch here** for a specific commit. Git rejects switches that would overwrite work.
 
-The dialog toolbar offers **Fetch**, **Pull**, **Pull with Rebase**, and
-**Push**. Pull always uses `--ff-only`: divergence fails without an implicit
-merge commit. Pull with Rebase and **Rebase onto** explicitly replay commits;
+The page toolbar offers **Fetch**, a **Pull** menu, and **Push**.
+**Pull (fast-forward only)** uses `--ff-only`: divergence fails without an implicit
+merge commit. **Pull with rebase…** and **Rebase onto** explicitly replay commits;
 they require a clean worktree and confirm source and target. No automatic
 stash occurs. Push never forces; without an upstream, choose a remote and
 remote branch to set one on the first push.

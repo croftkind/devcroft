@@ -8,6 +8,7 @@
 pub(crate) enum Context {
     Home,
     Workspace,
+    Git,
     Artifacts,
     Relationships,
 }
@@ -231,6 +232,7 @@ pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
     let mut result = match context {
         Context::Home => HOME.to_vec(),
         Context::Workspace => WORKSPACE.to_vec(),
+        Context::Git => WORKSPACE.into_iter().chain([ARTIFACTS[1]]).collect(),
         Context::Artifacts => ARTIFACTS.to_vec(),
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
@@ -415,6 +417,7 @@ mod tests {
         for context in [
             Context::Home,
             Context::Workspace,
+            Context::Git,
             Context::Artifacts,
             Context::Relationships,
         ] {
@@ -462,6 +465,7 @@ mod tests {
             for context in [
                 Context::Home,
                 Context::Workspace,
+                Context::Git,
                 Context::Artifacts,
                 Context::Relationships,
             ] {
@@ -518,7 +522,10 @@ mod tests {
                         resolve(context, state, 'b'),
                         if editor {
                             Some(Command::SwitchBuffer)
-                        } else if matches!(context, Context::Artifacts | Context::Relationships) {
+                        } else if matches!(
+                            context,
+                            Context::Git | Context::Artifacts | Context::Relationships
+                        ) {
                             Some(Command::Back)
                         } else {
                             None
@@ -578,6 +585,7 @@ mod tests {
         for context in [
             Context::Home,
             Context::Workspace,
+            Context::Git,
             Context::Artifacts,
             Context::Relationships,
         ] {
@@ -595,6 +603,7 @@ mod tests {
         for context in [
             Context::Home,
             Context::Workspace,
+            Context::Git,
             Context::Artifacts,
             Context::Relationships,
         ] {
@@ -626,6 +635,7 @@ mod tests {
         for context in [
             Context::Home,
             Context::Workspace,
+            Context::Git,
             Context::Artifacts,
             Context::Relationships,
         ] {
