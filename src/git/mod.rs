@@ -11,6 +11,6 @@ mod view;
 mod watch;
 
 pub(crate) use view::{
-    BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitView, OpenGitFile,
+    BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitMode, GitView, OpenGitFile,
     SnapshotChanged,
 };

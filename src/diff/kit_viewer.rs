@@ -1,7 +1,7 @@
 //! Retained GPUI Kit Diff viewer for single-file Git comparisons.
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     diff::{Diff, DiffFile, DiffMode, DiffState},
     h_flex, v_flex,
@@ -51,6 +51,7 @@ pub(crate) struct KitDiffViewer {
     diff: Entity<DiffState>,
     state: ViewerState,
     wrap: bool,
+    external_header: bool,
 }
 
 impl KitDiffViewer {
@@ -64,7 +65,105 @@ impl KitDiffViewer {
             diff: cx.new(|cx| DiffState::new([], cx).with_context_lines(None)),
             state: ViewerState::Empty,
             wrap: false,
+            external_header: false,
         }
+    }
+
+    /// Let the Changes pane provide one header above the retained code body.
+    pub(crate) fn with_external_header(mut self) -> Self {
+        self.external_header = true;
+        self
+    }
+
+    pub(crate) fn render_header_controls(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let ViewerState::Loaded(file) = &self.state else {
+            return div().into_any_element();
+        };
+        h_flex()
+            .flex_none()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().success)
+                    .child(format!("+{}", file.additions)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(format!("−{}", file.deletions)),
+            )
+            .when(matches!(file.content, FileContent::Text { .. }), |header| {
+                header.child(self.render_controls(true, cx))
+            })
+            .into_any_element()
+    }
+
+    fn render_controls(&self, compact: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let mode = self.diff.read(cx).mode();
+        let has_hunks = matches!(&self.state, ViewerState::Loaded(ChangedFile {
+            content: FileContent::Text { hunks, .. }, ..
+        }) if !hunks.is_empty());
+        h_flex()
+            .when(compact, |controls| controls.flex_none())
+            .when(!compact, |controls| controls.flex_wrap())
+            .gap_1()
+            .child(
+                Button::new("git-diff-unified")
+                    .small()
+                    .ghost()
+                    .label("Unified")
+                    .selected(mode == DiffMode::Unified)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_mode(DiffMode::Unified, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("git-diff-split")
+                    .small()
+                    .ghost()
+                    .label("Split")
+                    .selected(mode == DiffMode::Split)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.set_mode(DiffMode::Split, window, cx)
+                    })),
+            )
+            .child(
+                Button::new("git-diff-wrap")
+                    .small()
+                    .ghost()
+                    .label("Wrap")
+                    .selected(self.wrap)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.wrap = !this.wrap;
+                        this.focus_handle(cx).focus(window, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("git-diff-previous")
+                    .small()
+                    .ghost()
+                    .when(compact, |button| button.icon(IconName::ChevronUp))
+                    .when(!compact, |button| button.label("Previous change"))
+                    .tooltip("Previous change")
+                    .accessibility_label("Previous change")
+                    .disabled(!has_hunks)
+                    .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
+            )
+            .child(
+                Button::new("git-diff-next")
+                    .small()
+                    .ghost()
+                    .when(compact, |button| button.icon(IconName::ChevronDown))
+                    .when(!compact, |button| button.label("Next change"))
+                    .tooltip("Next change")
+                    .accessibility_label("Next change")
+                    .disabled(!has_hunks)
+                    .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
+            )
+            .into_any_element()
     }
 
     fn reset(&mut self, state: ViewerState, cx: &mut Context<Self>) {
@@ -148,16 +247,17 @@ impl Render for KitDiffViewer {
                 ))
             }
             ViewerState::Loaded(file) => {
-                content = content.child(div().px_3().py_1().text_xs().child(format!(
-                    "{} · +{} / −{}",
-                    file.status.label(),
-                    file.additions,
-                    file.deletions
-                )));
+                if !self.external_header {
+                    content = content.child(div().px_3().py_1().text_xs().child(format!(
+                        "{} · +{} / −{}",
+                        file.status.label(),
+                        file.additions,
+                        file.deletions
+                    )));
+                }
                 if let FileContent::Unavailable(reason) = file.content {
                     content = content.child(Self::message(reason.label(), file.path.clone()));
                 } else {
-                    let mode = self.diff.read(cx).mode();
                     let has_hunks = matches!(&file.content, FileContent::Text { hunks, .. } if !hunks.is_empty());
                     let no_retained_hunks = !has_hunks
                         && matches!(
@@ -169,65 +269,9 @@ impl Render for KitDiffViewer {
                         );
                     content =
                         content
-                            .child(
-                                h_flex()
-                                    .flex_wrap()
-                                    .gap_1()
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        Button::new("git-diff-unified")
-                                            .small()
-                                            .ghost()
-                                            .label("Unified")
-                                            .selected(mode == DiffMode::Unified)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_mode(DiffMode::Unified, window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("git-diff-split")
-                                            .small()
-                                            .ghost()
-                                            .label("Split")
-                                            .selected(mode == DiffMode::Split)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.set_mode(DiffMode::Split, window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("git-diff-wrap")
-                                            .small()
-                                            .ghost()
-                                            .label("Wrap")
-                                            .selected(self.wrap)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.wrap = !this.wrap;
-                                                this.focus_handle(cx).focus(window, cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("git-diff-previous")
-                                            .small()
-                                            .ghost()
-                                            .label("Previous change")
-                                            .disabled(!has_hunks)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.navigate(false, window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("git-diff-next")
-                                            .small()
-                                            .ghost()
-                                            .label("Next change")
-                                            .disabled(!has_hunks)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.navigate(true, window, cx)
-                                            })),
-                                    ),
-                            )
+                            .child(div().when(!self.external_header, |header| {
+                                header.px_2().py_1().child(self.render_controls(false, cx))
+                            }))
                             .child(div().flex_1().min_h_0().min_w_0().child(
                                 if no_retained_hunks {
                                     Self::message(
@@ -236,6 +280,7 @@ impl Render for KitDiffViewer {
                                     )
                                 } else {
                                     Diff::new(&self.diff)
+                                        .header_visible(!self.external_header)
                                         .soft_wrap(self.wrap)
                                         .font_family(TERMINAL_FONT_FAMILY)
                                         .text_size(px(review_font_size()))

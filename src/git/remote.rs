@@ -47,10 +47,6 @@ pub(super) enum Action {
         branch: String,
         set_upstream: bool,
     },
-    Rebase {
-        target: String,
-        target_oid: String,
-    },
 }
 impl Action {
     pub fn label(&self) -> &'static str {
@@ -64,7 +60,6 @@ impl Action {
             Self::Pull { rebase: false } => "Pull (fast-forward only)",
             Self::Pull { rebase: true } => "Pull with Rebase",
             Self::Push { .. } => "Push",
-            Self::Rebase { .. } => "Rebase",
         }
     }
     pub fn changes_worktree(&self) -> bool {
@@ -93,11 +88,7 @@ pub(super) fn execute(root: &Path, source: &Source, action: &Action) -> Result<S
             "Finish or abort the current Git operation before changing branches or pulling.".into(),
         );
     }
-    if matches!(
-        action,
-        Action::Rebase { .. } | Action::Pull { rebase: true }
-    ) && snapshot.is_dirty()
-    {
+    if matches!(action, Action::Pull { rebase: true }) && snapshot.is_dirty() {
         return Err("Save and commit or stash working-tree changes before rebasing. Devcroft does not auto-stash.".into());
     }
     let mut args: Vec<OsString> = Vec::new();
@@ -287,21 +278,6 @@ pub(super) fn execute(root: &Path, source: &Source, action: &Action) -> Result<S
                 remote.into(),
                 format!("refs/heads/{current}:refs/heads/{branch}").into(),
             ]);
-        }
-        Action::Rebase { target, target_oid } => {
-            require_branch(&snapshot)?;
-            if !snapshot
-                .branches
-                .iter()
-                .any(|b| &b.reference == target && &b.oid == target_oid)
-            {
-                return Err(
-                    "The selected target branch changed. Refresh and confirm the rebase again."
-                        .into(),
-                );
-            }
-            protect_ignored(root, target_oid, true)?;
-            args.extend(["rebase", "--no-autostash", "--", target_oid].map(Into::into));
         }
     }
     run_command(root, args)?;
@@ -830,8 +806,78 @@ mod tests {
         assert!(root.join("local").exists() && root.join("peer").exists());
     }
     #[test]
+    fn pull_with_rebase_refuses_dirty_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        init(root);
+        commit(root, "file", "base\n");
+        fs::write(root.join("file"), "uncommitted edit\n").unwrap();
+        let error = run(root, Action::Pull { rebase: true }).unwrap_err();
+        assert!(error.contains("auto-stash"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("file")).unwrap(),
+            "uncommitted edit\n"
+        );
+    }
+    #[test]
+    fn pull_with_rebase_preserves_ignored_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("work");
+        init(&root);
+        let remote = temp.path().join("remote.git");
+        git(
+            temp.path(),
+            &["init", "--bare", "-b", "main", remote.to_str().unwrap()],
+        );
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        commit(&root, ".gitignore", "secret\n");
+        commit(&root, "base", "base");
+        run(&root, push()).unwrap();
+        // A peer tracks a file the local checkout ignores.
+        let peer = temp.path().join("peer");
+        init(&peer);
+        git(
+            &peer,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run(&peer, Action::Fetch).unwrap();
+        run(
+            &peer,
+            Action::Create {
+                name: "tracked".into(),
+                start: "refs/remotes/origin/main".into(),
+                start_oid: git(&peer, &["rev-parse", "refs/remotes/origin/main"]),
+                track: true,
+            },
+        )
+        .unwrap();
+        fs::write(peer.join("secret"), "incoming\n").unwrap();
+        git(&peer, &["add", "-f", "secret"]);
+        git(&peer, &["commit", "-m", "peer secret"]);
+        run(
+            &peer,
+            Action::Push {
+                remote: "origin".into(),
+                branch: "main".into(),
+                set_upstream: false,
+            },
+        )
+        .unwrap();
+        fs::write(root.join("secret"), "local ignored work").unwrap();
+        let error = run(&root, Action::Pull { rebase: true }).unwrap_err();
+        assert!(error.contains("would be overwritten"), "{error}");
+        assert_eq!(
+            fs::read_to_string(root.join("secret")).unwrap(),
+            "local ignored work"
+        );
+        assert_eq!(git(&root, &["branch", "--show-current"]), "main");
+    }
+    #[test]
     fn worktree_operations_preserve_ignored_files() {
-        for operation in 0..4 {
+        for operation in 0..3 {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path();
             init(root);
@@ -855,11 +901,7 @@ mod tests {
                     start_oid: target_oid.clone(),
                     track: false,
                 },
-                2 => Action::Pull { rebase: false },
-                _ => Action::Rebase {
-                    target: "refs/heads/main".into(),
-                    target_oid,
-                },
+                _ => Action::Pull { rebase: false },
             };
             assert!(
                 run(root, action).is_err(),
@@ -897,99 +939,6 @@ mod tests {
             run(&root, push())
                 .unwrap_err()
                 .contains("hook-says-run-checks")
-        );
-    }
-
-    #[test]
-    fn rebase_rejects_a_target_moved_after_confirmation() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        init(root);
-        commit(root, "file", "base");
-        git(root, &["branch", "target"]);
-        let target_oid = git(root, &["rev-parse", "target"]);
-        commit(root, "other", "newer");
-        let source = Source::new(&load_snapshot(root).unwrap());
-        git(root, &["branch", "-f", "target", "HEAD"]);
-        let error = execute(
-            root,
-            &source,
-            &Action::Rebase {
-                target: "refs/heads/target".into(),
-                target_oid,
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("target branch changed"), "{error}");
-        assert!(load_snapshot(root).unwrap().operation.is_none());
-    }
-
-    #[test]
-    fn rebase_blocks_dirty_state_and_preserves_conflicts() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        init(root);
-        commit(root, "file", "base\n");
-        run(
-            root,
-            Action::Create {
-                name: "feature".into(),
-                start: "HEAD".into(),
-                start_oid: git(root, &["rev-parse", "HEAD"]),
-                track: false,
-            },
-        )
-        .unwrap();
-        commit(root, "file", "feature\n");
-        run(
-            root,
-            Action::Switch {
-                reference: "refs/heads/main".into(),
-            },
-        )
-        .unwrap();
-        commit(root, "file", "main\n");
-        run(
-            root,
-            Action::Switch {
-                reference: "refs/heads/feature".into(),
-            },
-        )
-        .unwrap();
-        fs::write(root.join("extra"), "untracked").unwrap();
-        git(root, &["config", "rebase.autoStash", "true"]);
-        assert!(
-            run(
-                root,
-                Action::Rebase {
-                    target: "refs/heads/main".into(),
-                    target_oid: git(root, &["rev-parse", "main"]),
-                }
-            )
-            .unwrap_err()
-            .contains("auto-stash")
-        );
-        fs::remove_file(root.join("extra")).unwrap();
-        assert!(
-            run(
-                root,
-                Action::Rebase {
-                    target: "refs/heads/main".into(),
-                    target_oid: git(root, &["rev-parse", "main"]),
-                }
-            )
-            .is_err()
-        );
-        let state = load_snapshot(root).unwrap();
-        assert_eq!(
-            state.operation,
-            Some(super::super::model::OperationState::Rebase)
-        );
-        assert_eq!(state.conflicts.len(), 1);
-        assert!(
-            fs::read_to_string(root.join("file"))
-                .unwrap()
-                .contains("<<<<<<<")
         );
     }
 }

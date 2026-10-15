@@ -52,7 +52,7 @@ use crate::data::{
 };
 use crate::editor::{EditorChoice, ExternalEditorKind, native::NativeEditor};
 use crate::git::{
-    BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitView, OpenGitFile,
+    BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitMode, GitView, OpenGitFile,
     SnapshotChanged,
 };
 use crate::git_status::{GitStatus, load_git_status};
@@ -264,6 +264,7 @@ pub(crate) struct Workspace {
     git_page_origin: Option<GitPageOrigin>,
     git_header_busy: bool,
     git_header_busy_focus: FocusHandle,
+    git_tab_focus: [FocusHandle; 2],
     git_header_return_focus: Option<FocusHandle>,
     git_picker_origin_focus: Option<FocusHandle>,
     git_header_notice: Option<String>,
@@ -842,6 +843,7 @@ impl Workspace {
             git_page_origin: None,
             git_header_busy: false,
             git_header_busy_focus: cx.focus_handle(),
+            git_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             git_header_return_focus: None,
             git_picker_origin_focus: None,
             git_header_notice: None,
@@ -1362,11 +1364,6 @@ impl Workspace {
                         this.command_origin_focus = this.git_picker_origin_focus.take();
                         this.open_git_page(window, cx);
                     }
-                    BranchPickerAction::ManageBranches => {
-                        this.command_origin_focus = this.git_picker_origin_focus.take();
-                        git.update(cx, |git, cx| git.show_branches(cx));
-                        this.open_git_page(window, cx);
-                    }
                     BranchPickerAction::Switch(reference) => {
                         this.git_header_return_focus = this.git_picker_origin_focus.take();
                         git.update(cx, |git, cx| {
@@ -1413,9 +1410,7 @@ impl Workspace {
                 != notice.as_ref().map(|(message, _)| message.as_str())
             {
                 this.git_header_notice = notice.as_ref().map(|(message, _)| message.clone());
-                if this.git_page_origin.is_none()
-                    && let Some((message, true)) = notice
-                {
+                if let Some((message, true)) = notice {
                     window.push_notification(message, cx);
                 }
             }
@@ -1424,6 +1419,16 @@ impl Workspace {
         })
         .detach();
         self.git_view = Some(git);
+    }
+
+    fn select_git_mode(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git_page_origin.is_some()
+            && let Some(mode) = GitMode::ALL.get(index).copied()
+            && let Some(git) = &self.git_view
+        {
+            self.git_tab_focus[index].focus(window, cx);
+            git.update(cx, |git, cx| git.select_mode(mode, cx));
+        }
     }
 
     fn open_git_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3953,6 +3958,19 @@ impl Render for Workspace {
         self.sync_activity_visibility(window, cx);
         let active_index = self.active_tab as usize;
         self.sync_git_view(cx);
+        let git_mode = self
+            .git_page_origin
+            .as_ref()
+            .and_then(|_| self.git_view.as_ref().map(|git| git.read(cx).mode()));
+        let header_tab_index = git_mode.map_or(active_index, |mode| mode as usize);
+        let header_tabs: Vec<_> = if git_mode.is_some() {
+            GitMode::ALL.into_iter().map(GitMode::label).collect()
+        } else {
+            WorkspaceTab::ALL
+                .into_iter()
+                .map(WorkspaceTab::label)
+                .collect()
+        };
         let active_content = self.render_active_content(cx);
         // Resources and Artifacts full-pages share the repository workspace
         // chrome: title and back navigation live here, not in a second row.
@@ -4204,12 +4222,7 @@ impl Render for Workspace {
                                     })
                                     .ghost()
                                     .small()
-                                    .when(self.git_page_origin.is_none(), |button| {
-                                        button.size(px(28.))
-                                    })
-                                    .when(self.git_page_origin.is_some(), |button| {
-                                        button.label("Back")
-                                    })
+                                    .size(px(28.))
                                     .icon(IconName::ChevronLeft)
                                     .accessibility_label(if self.git_page_origin.is_some() {
                                         "Back from Git"
@@ -4242,10 +4255,7 @@ impl Render for Workspace {
                                         .font_semibold()
                                         .child(self.project_name.clone()),
                                 )
-                                .child(self.render_git_status_trigger(&git_status, cx))
-                                .when(self.git_page_origin.is_some(), |this| {
-                                    this.child(div().text_sm().font_semibold().child("Git"))
-                                }),
+                                .child(self.render_git_status_trigger(&git_status, cx)),
                         )
                     })
                     .when(center_command, |header| header.child(div().flex_1()))
@@ -4451,34 +4461,60 @@ impl Render for Workspace {
                                 })),
                         )
                     })
-                    .when(
-                        self.git_page_origin.is_none() && !self.home_visible,
-                        |header| {
-                            header.child(
-                                TabBar::new("workspace-tabs")
-                                    .pill()
-                                    .small()
-                                    .flex_none()
-                                    .h(px(28.))
-                                    .p(px(2.))
-                                    .rounded_md()
-                                    .bg(rgb(0x171919))
-                                    .border_1()
-                                    .border_color(rgb(0x222525))
-                                    .selected_index(active_index)
-                                    .on_click(cx.listener(|this, index: &usize, window, cx| {
-                                        this.select_tab(*index, window, cx);
-                                    }))
-                                    .children(WorkspaceTab::ALL.into_iter().map(|tab| {
-                                        Tab::new()
-                                            .label(tab.label())
-                                            .when(tab as usize == active_index, |tab| {
-                                                tab.font_semibold()
-                                            })
-                                    })),
-                            )
-                        },
-                    ),
+                    .when(!self.home_visible, |header| {
+                        header.child(
+                            TabBar::new(if git_mode.is_some() {
+                                "git-tabs"
+                            } else {
+                                "workspace-tabs"
+                            })
+                            .pill()
+                            .small()
+                            .flex_none()
+                            .h(px(28.))
+                            .p(px(2.))
+                            .rounded_md()
+                            .bg(rgb(0x171919))
+                            .border_1()
+                            .border_color(rgb(0x222525))
+                            .selected_index(header_tab_index)
+                            .on_click(cx.listener(|this, index: &usize, window, cx| {
+                                if this.git_page_origin.is_some() {
+                                    this.select_git_mode(*index, window, cx);
+                                } else {
+                                    this.select_tab(*index, window, cx);
+                                }
+                            }))
+                            .children(
+                                header_tabs.into_iter().enumerate().map(|(index, label)| {
+                                    Tab::new()
+                                        .label(label)
+                                        .when(index == header_tab_index, |tab| tab.font_semibold())
+                                        .when(git_mode.is_some(), |tab| {
+                                            tab.track_focus(&self.git_tab_focus[index])
+                                            .on_key_down(cx.listener(
+                                            move |this,
+                                                  event: &gpui_kit::KeyDownEvent,
+                                                  window,
+                                                  cx| {
+                                                if event.keystroke.key == "enter"
+                                                    || event.keystroke.key == "space"
+                                                {
+                                                    this.select_git_mode(index, window, cx);
+                                                    cx.stop_propagation();
+                                                }
+                                            },
+                                        ))
+                                        })
+                                }),
+                            ),
+                        )
+                    })
+                    .when(git_mode.is_some(), |header| {
+                        header.when_some(self.git_view.as_ref(), |header, git| {
+                            header.child(git.update(cx, |git, cx| git.render_header_actions(cx)))
+                        })
+                    }),
             )
             .child(div().flex_1().min_h_0().child(active_content))
             .when(self.command_open, |this| {
@@ -4512,6 +4548,92 @@ mod tests {
     use super::*;
     use gpui_kit::component::Root;
     use std::path::PathBuf;
+
+    #[gpui_kit::test]
+    fn git_header_tabs_switch_modes_and_preserve_workspace_tab(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let directory = tempfile::tempdir().unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Initial",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(directory.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            workspace.update(cx, |workspace, cx| {
+                workspace.home_visible = false;
+                workspace.active_tab = WorkspaceTab::Resources;
+                workspace.open_git_page(window, cx);
+            });
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(1usize).is_some());
+            assert!(window.try_find(4usize).is_none());
+            assert!(window.try_find(("git-dialog-mode", 0usize)).is_none());
+            window.click(1usize, cx);
+        });
+        test_cx.run_until_parked();
+        workspace.read_with(test_cx, |workspace, cx| {
+            assert_eq!(
+                workspace.git_view.as_ref().unwrap().read(cx).mode(),
+                GitMode::History
+            );
+            assert_eq!(workspace.active_tab, WorkspaceTab::Resources);
+        });
+        // The header tabs retain keyboard activation in their new location.
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.focus_prev(cx);
+            assert!(workspace.read(cx).git_tab_focus[0].is_focused(window));
+        });
+        test_cx.simulate_keystrokes("space");
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("space").unwrap(),
+        });
+        workspace.read_with(test_cx, |workspace, cx| {
+            assert_eq!(
+                workspace.git_view.as_ref().unwrap().read(cx).mode(),
+                GitMode::Changes
+            );
+        });
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.back_from_git(window, cx));
+            window.render_frame(cx);
+            assert!(window.try_find(4usize).is_some());
+        });
+    }
 
     #[gpui_kit::test]
     fn git_page_navigation_retains_checkout_view_without_opening_a_dialog(
@@ -4881,11 +5003,10 @@ mod tests {
                 );
             });
         });
-        pick(test_cx, "git-manage-branches");
+        pick(test_cx, "git-picker-open-page");
         test_cx.run_until_parked();
         test_cx.update(|window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find(("git-local-branch", 0usize)).is_some());
             workspace.read_with(cx, |workspace, _| {
                 assert!(workspace.git_page_origin.is_some())
             });
@@ -5006,6 +5127,8 @@ mod tests {
                     git.restore_commit_message("navigation guard fixture", window, cx);
                 });
             });
+            window.render_frame(cx);
+            window.click("git-open-commit", cx);
             window.render_frame(cx);
             window.click("git-commit", cx);
             workspace.update(cx, |workspace, cx| {

@@ -1,3 +1,4 @@
+mod commit_ui;
 mod conflict_ui;
 mod history_ui;
 mod remote_ui;
@@ -5,7 +6,7 @@ mod remote_ui;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use gpui_kit::component::{
@@ -14,16 +15,17 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     dialog::{Confirm, DialogFooter},
     h_flex,
-    input::{Input, InputState, Textarea, TextareaState},
+    input::{Input, InputState, TextareaState},
     popover::Popover,
     scroll::ScrollableElement as _,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Window, div, px,
-    relative, rgb,
+    InteractiveElement, IntoElement, ParentElement, Render, StatefulInteractiveElement as _,
+    Styled, Subscription, TestSupportExt as _, Window, div, px, relative, rgb,
 };
 
 use crate::{
@@ -48,10 +50,20 @@ const MAX_VISIBLE_CHANGES: usize = 250;
 const MAX_SWITCHER_BRANCHES: usize = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GitMode {
+pub(crate) enum GitMode {
     Changes,
-    Branches,
     History,
+}
+
+impl GitMode {
+    pub(crate) const ALL: [Self; 2] = [Self::Changes, Self::History];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Changes => "Changes",
+            Self::History => "History",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,7 +90,6 @@ pub(crate) struct OpenGitFile {
 #[derive(Clone, Debug)]
 pub(crate) enum BranchPickerAction {
     OpenGit,
-    ManageBranches,
     Switch(String),
     NewBranch,
 }
@@ -133,6 +144,8 @@ pub(crate) struct GitView {
     diff_generation: u64,
     diff_viewer: Entity<KitDiffViewer>,
     commit_message: Entity<TextareaState>,
+    commit_dialog_open: bool,
+    commit_error: Option<String>,
     mutation_queue: VecDeque<Mutation>,
     active_mutation: Option<Mutation>,
     mutation_generation: u64,
@@ -141,16 +154,13 @@ pub(crate) struct GitView {
     dirty_editor_paths: HashSet<PathBuf>,
     branch_query: Entity<InputState>,
     branch_switcher_query: Entity<InputState>,
-    branch_name: Entity<InputState>,
     new_branch_name: Entity<InputState>,
     push_branch: Entity<InputState>,
-    selected_ref: Option<String>,
     selected_remote: Option<String>,
-    remote_form: Option<remote_ui::RemoteForm>,
+    push_form_open: bool,
     branch_switcher_open: bool,
     active: bool,
     page_visible: bool,
-    active_started: Option<Instant>,
     check_conflicts: bool,
     continuation_loading: bool,
     recovery_paths: HashSet<PathBuf>,
@@ -177,7 +187,7 @@ impl GitView {
     ) -> Self {
         let commit_message = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(3, 5)
+                .auto_grow(8, 12)
                 .placeholder("Describe your changes…")
         });
         cx.subscribe(
@@ -193,8 +203,6 @@ impl GitView {
         let branch_query = cx.new(|cx| InputState::new(window, cx).placeholder("Search branches…"));
         let branch_switcher_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search branches…"));
-        let branch_name =
-            cx.new(|cx| InputState::new(window, cx).placeholder("New local branch name"));
         let new_branch_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("New local branch name"));
         let push_branch =
@@ -202,7 +210,6 @@ impl GitView {
         for input in [
             &branch_query,
             &branch_switcher_query,
-            &branch_name,
             &new_branch_name,
             &push_branch,
         ] {
@@ -261,8 +268,10 @@ impl GitView {
             selection: None,
             visible_changes: [MAX_VISIBLE_CHANGES; 4],
             diff_generation: 0,
-            diff_viewer: cx.new(KitDiffViewer::new),
+            diff_viewer: cx.new(|cx| KitDiffViewer::new(cx).with_external_header()),
             commit_message,
+            commit_dialog_open: false,
+            commit_error: None,
             mutation_queue: VecDeque::new(),
             active_mutation: None,
             mutation_generation: 0,
@@ -271,16 +280,13 @@ impl GitView {
             dirty_editor_paths,
             branch_query,
             branch_switcher_query,
-            branch_name,
             new_branch_name,
             push_branch,
-            selected_ref: None,
             selected_remote: None,
-            remote_form: None,
+            push_form_open: false,
             branch_switcher_open: false,
             active: true,
             page_visible: true,
-            active_started: None,
             check_conflicts: false,
             continuation_loading: false,
             recovery_paths: HashSet::new(),
@@ -290,6 +296,8 @@ impl GitView {
             data_root,
             external_editors,
         };
+        cx.observe(&dialog.diff_viewer, |_, _, cx| cx.notify())
+            .detach();
         dialog.discover_conflict_drafts(cx);
         dialog.reload(false, cx);
         dialog.start_refresh_loop(cx);
@@ -329,15 +337,22 @@ impl GitView {
         self.page_visible = visible;
     }
 
+    pub(crate) fn mode(&self) -> GitMode {
+        self.mode
+    }
+
+    pub(crate) fn select_mode(&mut self, mode: GitMode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        if mode == GitMode::History && self.history.commits.is_empty() {
+            self.load_history_page(cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn operation_notice(&self) -> Option<(&str, bool)> {
         self.notice
             .as_ref()
             .map(|notice| (notice.message.as_str(), notice.error))
-    }
-
-    pub(crate) fn show_branches(&mut self, cx: &mut Context<Self>) {
-        self.mode = GitMode::Branches;
-        cx.notify();
     }
 
     pub(crate) fn set_external_editors(
@@ -354,11 +369,16 @@ impl GitView {
     }
 
     fn commit_completed(&mut self, submitted: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_error = None;
         if self.commit_message.read(cx).value().as_ref() == submitted {
             self.commit_message
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
         self.publish_commit_draft(cx);
+        if self.commit_dialog_open {
+            self.commit_dialog_open = false;
+            window.close_dialog(cx);
+        }
     }
 
     fn publish_commit_draft(&self, cx: &mut Context<Self>) {
@@ -435,9 +455,6 @@ impl GitView {
                                 this.mode = GitMode::Changes;
                                 this.selection = None;
                             }
-                        }
-                        if this.selected_ref.as_ref().is_some_and(|reference| !snapshot.branches.iter().any(|branch| &branch.reference == reference)) {
-                            this.selected_ref = None;
                         }
                         let history_changed = !matches!(&this.state, LoadState::Loaded(current) if current.oid == snapshot.oid && current.branches == snapshot.branches && current.tag_state == snapshot.tag_state);
                         let selection = this.selection.take();
@@ -594,7 +611,6 @@ impl GitView {
             error: false,
         });
         self.active_mutation = Some(mutation.clone());
-        self.active_started = Some(Instant::now());
         let checkout = self.checkout.clone();
         cx.spawn_in(window, async move |this, cx| {
             let task_mutation = mutation.clone();
@@ -607,7 +623,6 @@ impl GitView {
                         return;
                     }
                     this.active_mutation = None;
-                    this.active_started = None;
                     this.check_conflicts = matches!(
                         mutation,
                         Mutation::Remote { .. } | Mutation::Continue { .. }
@@ -628,9 +643,12 @@ impl GitView {
                                 message,
                                 error: false,
                             });
-                            this.remote_form = None;
+                            this.push_form_open = false;
                         }
                         Err(message) => {
+                            if matches!(mutation, Mutation::Commit { .. }) {
+                                this.commit_error = Some(message.clone());
+                            }
                             this.notice = Some(OperationNotice {
                                 message,
                                 error: true,
@@ -948,7 +966,6 @@ impl GitView {
         status: &GitStatus,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let loaded = matches!(self.state, LoadState::Loaded(_));
         let query = self.branch_switcher_query.read(cx).value().to_lowercase();
         let busy = self.busy();
         let (switchable, can_create) = match &self.state {
@@ -1014,7 +1031,6 @@ impl GitView {
                             let git_open = git.clone();
                             let git_list = git.clone();
                             let git_new = git.clone();
-                            let git_manage = git.clone();
                             let search_input = search_input.clone();
                             v_flex()
                                 .min_w(px(300.))
@@ -1137,127 +1153,25 @@ impl GitView {
                                             });
                                         }),
                                 )
-                                .child(
-                                    Button::new("git-manage-branches")
-                                        .small().ghost().w_full()
-                                        .label("Manage branches…").disabled(!loaded)
-                                        .on_click(move |_, window, cx| {
-                                            let _ = git_manage.update(cx, |this, cx| {
-                                                this.request_picker_action(BranchPickerAction::ManageBranches, window, cx);
-                                            });
-                                        }),
-                                )
                         }),        ).into_any_element()
-    }
-
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .min_h(px(48.))
-            .flex_none()
-            .px_4()
-            .py_2()
-            .gap_3()
-            .flex_wrap()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex().gap_1().children(
-                    [
-                        (
-                            GitMode::Changes,
-                            "Changes",
-                            gpui_kit::assets::IconName::Diff,
-                        ),
-                        (
-                            GitMode::History,
-                            "History",
-                            gpui_kit::assets::IconName::GitCommitHorizontal,
-                        ),
-                    ]
-                    .into_iter()
-                    .map(|(mode, label, icon)| {
-                        Button::new(("git-dialog-mode", mode as usize))
-                            .small()
-                            .ghost()
-                            .h(px(30.))
-                            .px_3()
-                            .icon(icon)
-                            .label(label)
-                            .selected(self.mode == mode)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mode = mode;
-                                if mode == GitMode::History && this.history.commits.is_empty() {
-                                    this.load_history_page(cx);
-                                }
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
-            .when(self.mode == GitMode::Branches, |view| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Manage branches"),
-                )
-            })
-            .child(div().flex_1())
-            .child(self.render_remote_toolbar(cx))
-            .child(
-                Button::new("git-dialog-refresh")
-                    .small()
-                    .ghost()
-                    .icon(IconName::RotateCw)
-                    .tooltip("Refresh repository")
-                    .accessibility_label("Refresh repository")
-                    .disabled(self.active_mutation.is_some())
-                    .loading(self.load_in_flight)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.file_changes.mark_changed();
-                        this.reload(true, cx);
-                        this.reset_history(cx);
-                    })),
-            )
     }
 
     fn render_loaded(&self, snapshot: &RepositorySnapshot, cx: &mut Context<Self>) -> AnyElement {
         match self.mode {
             GitMode::Changes => self.render_changes(snapshot, cx),
-            GitMode::Branches => self.render_branches(snapshot, cx),
             GitMode::History => self.render_history(snapshot, cx),
         }
     }
 
     fn render_changes(&self, snapshot: &RepositorySnapshot, cx: &mut Context<Self>) -> AnyElement {
         let busy = self.active_mutation.is_some();
-        let has_conflicts = !snapshot.conflicts.is_empty();
         h_flex().size_full().min_h_0().min_w_0()
             .child(
                 v_flex().w(px(340.)).max_w(relative(0.4)).h_full().min_h_0().flex_none()
                     .bg(cx.theme().sidebar).border_r_1().border_color(cx.theme().border)
                     .child(
-                        h_flex().h(px(56.)).flex_none().gap_2().px_4()
-                            .child(div().flex_1().text_sm().font_semibold().child("Working changes"))
-                            .child(self.render_count(snapshot.change_count(), cx))
-                    )
-                    .child(
-                        h_flex().px_4().pb_3().gap_2().flex_none()
-                            .child(Button::new("git-stage-all").small().ghost().icon(IconName::Plus).label("Stage all")
-                                .disabled(busy || has_conflicts || (snapshot.unstaged.is_empty() && snapshot.untracked.is_empty()))
-                                .tooltip(if has_conflicts { "Resolve merge changes before staging all files" } else { "Stage every changed file" })
-                                .on_click(cx.listener(|this, _, window, cx| this.enqueue_mutation(Mutation::StageAll, window, cx))))
-                            .child(Button::new("git-unstage-all").small().ghost().icon(IconName::Minus).label("Unstage all")
-                                .disabled(busy || has_conflicts || snapshot.staged.is_empty())
-                                .tooltip(if has_conflicts { "Resolve merge changes before unstaging all files" } else { "Unstage every staged file" })
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    let unborn = matches!(&this.state, LoadState::Loaded(snapshot) if snapshot.unborn);
-                                    this.enqueue_mutation(Mutation::UnstageAll { unborn }, window, cx)
-                                })))
-                    )
-                    .child(
                         div().flex_1().min_h_0().overflow_y_scrollbar().child(
-                            v_flex().w_full().px_2().pb_3().gap_3()
+                            v_flex().w_full().px_2().pt_3().pb_3().gap_3()
                                 .when(!snapshot.conflicts.is_empty(), |view| view.child(self.render_change_section("Merge changes", ChangeArea::Conflict, &snapshot.conflicts, busy, cx)))
                                 .child(self.render_orphaned_results(snapshot, cx))
                                 .child(self.render_change_section("Staged", ChangeArea::Staged, &snapshot.staged, busy, cx))
@@ -1265,7 +1179,6 @@ impl GitView {
                                 .when(!snapshot.untracked.is_empty(), |view| view.child(self.render_change_section("Untracked", ChangeArea::Untracked, &snapshot.untracked, busy, cx)))
                         )
                     )
-                    .child(self.render_commit_panel(snapshot, cx))
             )
             .child(
                 v_flex().flex_1().min_w_0().h_full().min_h_0()
@@ -1301,6 +1214,13 @@ impl GitView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let visible = changes.len().min(self.visible_changes[area as usize]);
+        let (has_conflicts, has_untracked) = match &self.state {
+            LoadState::Loaded(snapshot) => (
+                !snapshot.conflicts.is_empty(),
+                !snapshot.untracked.is_empty(),
+            ),
+            _ => (false, false),
+        };
         let color = match area {
             ChangeArea::Conflict => cx.theme().danger,
             ChangeArea::Staged => cx.theme().success,
@@ -1321,6 +1241,29 @@ impl GitView {
                     .text_color(cx.theme().muted_foreground)
                     .child(div().size(px(6.)).rounded_full().bg(color))
                     .child(div().flex_1().child(title.to_owned()))
+                    .when(area == ChangeArea::Staged, |header| {
+                        header.child(
+                            Button::new("git-unstage-all")
+                                .xsmall().ghost().h(px(24.)).px_1()
+                                .label("Unstage all")
+                                .disabled(busy || has_conflicts || changes.is_empty())
+                                .tooltip(if has_conflicts { "Resolve merge changes before unstaging all files" } else { "Unstage every staged file" })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let unborn = matches!(&this.state, LoadState::Loaded(snapshot) if snapshot.unborn);
+                                    this.enqueue_mutation(Mutation::UnstageAll { unborn }, window, cx)
+                                }))
+                        )
+                    })
+                    .when(area == ChangeArea::Unstaged, |header| {
+                        header.child(
+                            Button::new("git-stage-all")
+                                .xsmall().ghost().h(px(24.)).px_1()
+                                .label("Stage all")
+                                .disabled(busy || has_conflicts || (changes.is_empty() && !has_untracked))
+                                .tooltip(if has_conflicts { "Resolve merge changes before staging all files" } else { "Stage all unstaged and untracked files" })
+                                .on_click(cx.listener(|this, _, window, cx| this.enqueue_mutation(Mutation::StageAll, window, cx)))
+                        )
+                    })
                     .child(self.render_count(changes.len(), cx)),
             )
             .children(
@@ -1539,70 +1482,6 @@ impl GitView {
             .into_any_element()
     }
 
-    fn render_commit_panel(
-        &self,
-        snapshot: &RepositorySnapshot,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let message = self.commit_message.read(cx).value().to_string();
-        let blank = message.trim().is_empty();
-        let no_staged = snapshot.staged.is_empty();
-        let conflicts = !snapshot.conflicts.is_empty();
-        let disabled = self.active_mutation.is_some() || blank || no_staged || conflicts;
-        let reason = if conflicts {
-            "Resolve merge changes before committing"
-        } else if no_staged {
-            "Stage at least one file before committing"
-        } else if blank {
-            "Enter a commit message"
-        } else {
-            "Create commit"
-        };
-        v_flex()
-            .flex_none()
-            .gap_2()
-            .p_4()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(Icon::new(gpui_kit::assets::IconName::GitCommitHorizontal).size(px(16.)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .font_semibold()
-                            .child("Create a commit"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} staged", snapshot.staged.len())),
-                    ),
-            )
-            .child(Textarea::new(&self.commit_message))
-            .child(
-                Button::new("git-commit")
-                    .w_full()
-                    .primary()
-                    .icon(IconName::Check)
-                    .label(if self.active_mutation.is_some() {
-                        "Working…"
-                    } else {
-                        "Commit changes"
-                    })
-                    .tooltip(reason)
-                    .disabled(disabled)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let message = this.commit_message.read(cx).value().to_string();
-                        this.enqueue_mutation(Mutation::Commit { message }, window, cx)
-                    })),
-            )
-            .into_any_element()
-    }
-
     fn render_confirmation(
         &self,
         confirmation: &Confirmation,
@@ -1678,46 +1557,54 @@ impl GitView {
             return div().into_any_element();
         };
         let path = target.change.path.clone();
-        let label = path.to_string_lossy().into_owned();
-        let busy = self.busy();
-        let can_open = self.checkout.join(&path).is_file();
+        let label = match &target.change.original_path {
+            Some(original) if original != &path => {
+                format!("{} → {}", original.display(), path.display())
+            }
+            _ => path.to_string_lossy().into_owned(),
+        };
         let comparison = match target.area {
             ChangeArea::Staged => "Staged · HEAD → index",
             ChangeArea::Unstaged => "Unstaged · index → working tree",
             ChangeArea::Untracked => "Untracked · new file",
             ChangeArea::Conflict => "Merge conflict",
         };
+        let detail = format!("{label}\n{comparison}");
+        let busy = self.busy();
+        let can_open = self.checkout.join(&path).is_file();
         h_flex()
-            .min_h(px(62.))
+            .id("git-file-header")
+            .test_support()
+            .h(px(40.))
+            .min_w_0()
             .flex_none()
-            .gap_3()
-            .px_5()
-            .py_2()
+            .gap_2()
+            .px_3()
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                Icon::new(IconName::FileText)
-                    .size(px(16.))
-                    .text_color(cx.theme().muted_foreground),
-            )
-            .child(
-                v_flex()
+                div()
+                    .id("git-diff-path")
                     .flex_1()
                     .min_w_0()
-                    .gap_1()
-                    .child(div().truncate().text_sm().font_semibold().child(label))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(comparison),
-                    ),
+                    .truncate()
+                    .text_sm()
+                    .font_semibold()
+                    .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
+                    .child(label),
             )
+            .when(target.area != ChangeArea::Conflict, |header| {
+                header.child(
+                    self.diff_viewer
+                        .update(cx, |viewer, cx| viewer.render_header_controls(cx)),
+                )
+            })
             .child(
                 Button::new("git-open-selected-file")
                     .small()
                     .ghost()
-                    .label("Open in editor")
+                    .icon(IconName::ExternalLink)
+                    .accessibility_label("Open in editor")
                     .disabled(busy || !can_open)
                     .tooltip(if busy {
                         "Wait for the active Git operation"
@@ -1820,31 +1707,11 @@ impl Render for GitView {
             .track_focus(&self.focus_handle)
             .tab_group()
             .bg(cx.theme().background)
-            .child(self.render_toolbar(cx))
             .when(matches!(&self.state, LoadState::Loaded(snapshot) if snapshot.operation_details.is_some()), |view| view.child(self.render_operation_banner(cx)))
             .when_some(self.confirmation.as_ref(), |view, confirmation| {
                 view.child(self.render_confirmation(confirmation, cx))
             })
-            .when_some(self.notice.as_ref(), |view, notice| {
-                let elapsed = self
-                    .active_started
-                    .map(|started| format!(" · {}s", started.elapsed().as_secs()))
-                    .unwrap_or_default();
-                view.child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(if notice.error {
-                            rgb(0xf87171).into()
-                        } else {
-                            cx.theme().muted_foreground
-                        })
-                        .child(format!("{}{elapsed}", notice.message)),
-                )
-            })
-            .when(self.remote_form.is_some(), |view| {
+            .when(self.push_form_open, |view| {
                 view.child(self.render_remote_form(cx))
             })
             .child(div().flex_1().min_h_0().w_full().child(body))
@@ -2061,7 +1928,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn branch_modal_cancel_preserves_tracking_draft_and_page(cx: &mut gpui_kit::TestAppContext) {
+    fn branch_modal_cancel_preserves_push_draft_and_page(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::test::TestWindowExt as _;
         use std::{cell::RefCell, rc::Rc};
         cx.update(gpui_kit::init);
@@ -2078,11 +1945,10 @@ mod tests {
                 view.generation += 1;
                 view.load_in_flight = false;
                 view.state = LoadState::Loaded(Box::new(snapshot));
-                view.mode = GitMode::Branches;
-                view.remote_form = Some(remote_ui::RemoteForm::Track);
-                view.branch_name.update(cx, |input, cx| {
-                    input.set_value("tracking-draft", window, cx)
-                });
+                view.mode = GitMode::History;
+                view.push_form_open = true;
+                view.push_branch
+                    .update(cx, |input, cx| input.set_value("push-draft", window, cx));
             });
             *slot.borrow_mut() = Some(view.clone());
             gpui_kit::component::Root::new(view, window, cx)
@@ -2099,9 +1965,9 @@ mod tests {
             assert!(view.focus_handle(cx).contains_focused(window, cx));
         });
         view.read_with(test_cx, |view, cx| {
-            assert_eq!(view.branch_name.read(cx).value().as_ref(), "tracking-draft");
-            assert!(view.remote_form == Some(remote_ui::RemoteForm::Track));
-            assert_eq!(view.mode, GitMode::Branches);
+            assert_eq!(view.push_branch.read(cx).value().as_ref(), "push-draft");
+            assert!(view.push_form_open);
+            assert_eq!(view.mode, GitMode::History);
         });
     }
 
@@ -2181,6 +2047,31 @@ mod tests {
                 cx,
             );
         });
+        test_cx.simulate_resize(gpui_kit::size(px(700.), px(600.)));
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            let header = window.find("git-file-header").bounds();
+            assert_eq!(header.size.height, px(40.));
+            for control in [
+                "git-diff-unified",
+                "git-diff-split",
+                "git-diff-wrap",
+                "git-diff-previous",
+                "git-diff-next",
+                "git-open-selected-file",
+            ] {
+                let bounds = window.find(control).bounds();
+                assert!(
+                    bounds.left() >= header.left() && bounds.right() <= header.right(),
+                    "{control} must stay inside the compact header"
+                );
+                assert!(
+                    bounds.top() >= header.top() && bounds.bottom() <= header.bottom(),
+                    "{control} must stay on the single header row"
+                );
+            }
+        });
+        test_cx.simulate_resize(gpui_kit::size(px(1024.), px(768.)));
         test_cx.update(|window, cx| {
             window.render_frame(cx);
             assert!(
@@ -2297,49 +2188,6 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("diff-body").is_none());
         });
-    }
-
-    #[gpui_kit::test]
-    fn primary_modes_activate_through_page_tab_traversal(cx: &mut gpui_kit::TestAppContext) {
-        use std::{cell::RefCell, rc::Rc};
-        cx.update(gpui_kit::init);
-        cx.update(crate::bind_app_keys);
-        let directory = tempfile::tempdir().unwrap();
-        let checkout = directory.path().to_owned();
-        let holder = Rc::new(RefCell::new(None));
-        let slot = holder.clone();
-        let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let dialog =
-                cx.new(|cx| GitView::new(checkout, HashSet::new(), None, Vec::new(), window, cx));
-            dialog.update(cx, |dialog, cx| {
-                dialog.generation += 1;
-                dialog.load_in_flight = false;
-                dialog.state = LoadState::Loaded(Box::default());
-                dialog.focus_handle.focus(window, cx);
-            });
-            *slot.borrow_mut() = Some(dialog.clone());
-            gpui_kit::component::Root::new(dialog, window, cx)
-        });
-        let dialog = holder.borrow().clone().unwrap();
-        // The shared branch picker lives in the workspace header. The page
-        // starts with Changes and History.
-        test_cx.simulate_keystrokes("tab tab enter");
-        test_cx.simulate_event(gpui_kit::KeyUpEvent {
-            keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
-        });
-        assert_eq!(
-            dialog.read_with(test_cx, |dialog, _| dialog.mode),
-            GitMode::History
-        );
-        test_cx.update(|window, cx| dialog.focus_handle(cx).focus(window, cx));
-        test_cx.simulate_keystrokes("tab space");
-        test_cx.simulate_event(gpui_kit::KeyUpEvent {
-            keystroke: gpui_kit::Keystroke::parse("space").unwrap(),
-        });
-        assert_eq!(
-            dialog.read_with(test_cx, |dialog, _| dialog.mode),
-            GitMode::Changes
-        );
     }
 
     #[gpui_kit::test]

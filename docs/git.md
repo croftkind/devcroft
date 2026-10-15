@@ -4,12 +4,15 @@ Git is a full workspace page for the current checkout. Install `git` on
 the application's PATH. Open the branch/status menu in the workspace header and choose **Open Git**, use `Cmd+J`,
 then `g` on macOS (`Ctrl+J`, then `g` on Linux/Windows), or choose **Open Git**
 in the actions palette. Dialogs, including branch creation, open above the
-page. **Back** returns to the previous view and focus without changing the selected workspace tab.
+page. The **back arrow** returns to the previous view and focus without changing the selected workspace tab.
+
+**Changes** and **History** use the regular tab bar on the right side of the
+workspace header. A split button after the tabs runs **Fetch**; its dropdown
+offers pull, push, and refresh actions.
 
 The same header branch picker stays available in workspace views and on the Git page. It searches local branch names and commit summaries,
 switches branches, and offers **New branch**. The current matching branch is
 pinned first. Hover the picker to see the full checkout path and upstream.
-Choose **Manage branches…** for remote tracking, branch details, and rebase.
 
 ## Keyboard and refresh
 
@@ -44,7 +47,10 @@ both paths. **Show more** exposes further files in large sections.
 
 Non-conflict Changes and History diffs support **Unified** and **Split**
 layouts, **Wrap** for long lines, and **Previous change / Next change**. These
-display choices remain through refreshes and when selecting another file. Drag over source text or select lines from the gutter,
+controls share a single compact file header in Changes, alongside the path,
+line counts, and editor button. Hover the path for the full comparison details.
+The up/down arrows jump between changes.
+Display choices remain through refreshes and when selecting another file. Drag over source text or select lines from the gutter,
 then use `Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff
 markers or line numbers. `Shift+Up` / `Shift+Down` extends a line selection.
 Only supplied patch context is available. Files beyond the existing 4 MiB
@@ -52,8 +58,11 @@ read limit show an explanation; diffs beyond the 4,000 retained hunk-line limit
 show a persistent truncation notice. Omitted source cannot be expanded or copied.
 
 **Stage / Unstage** affect one file; **Stage All / Unstage All** affect all
-eligible changes. Bulk staging is blocked while conflicts remain. Enter a
-commit message and choose **Commit** after staging. Blank messages, an empty
+eligible changes from the **Unstaged / Staged** section headers. **Stage all**
+also includes untracked files. Bulk staging is blocked while conflicts remain. Enter a
+message in the **Commit** dialog, opened from the header action group, and choose
+**Commit changes** after staging. The dialog shows the branch and staged files;
+canceling or a failed commit preserves the message. Blank messages, an empty
 index, and unresolved conflicts disable commit. Git runs configured hooks
 and signing; a failure keeps the message, and success clears it.
 
@@ -71,16 +80,13 @@ are bounded; truncated content is labeled.
 
 ## Branches and remotes
 
-**Manage branches…** searches local and remote names and commit summaries. Select a
-branch to inspect its commit and upstream. **Switch** checks out a local
-branch; a remote branch can be adopted as a new local tracking branch.
-**New branch** opens a dialog to name a branch starting at the current HEAD,
-then creates and switches. Use History’s **Create branch here** for a specific commit. Git rejects switches that would overwrite work.
+The header branch picker searches local branch names and commit summaries.
+Select a branch to switch. **New branch** opens a dialog to name a branch starting at the current HEAD,
+then creates and switches. Use History's **Create branch here** for a specific commit. Git rejects switches that would overwrite work.
 
-The page toolbar offers **Fetch**, a **Pull** menu, and **Push**.
+The header's **Fetch** button and **Git actions** dropdown offer remote operations.
 **Pull (fast-forward only)** uses `--ff-only`: divergence fails without an implicit
-merge commit. **Pull with rebase…** and **Rebase onto** explicitly replay commits;
-they require a clean worktree and confirm source and target. No automatic
+merge commit. **Pull with rebase…** explicitly replays commits; it requires a clean worktree and confirms source and target. No automatic
 stash occurs. Push never forces; without an upstream, choose a remote and
 remote branch to set one on the first push.
 
