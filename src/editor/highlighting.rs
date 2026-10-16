@@ -1,19 +1,21 @@
 //! Highlight queries for grammars whose bundled config ships without one.
 //!
-//! `gpui-component` links the protobuf grammar behind its `tree-sitter-proto`
-//! feature but registers the language with an empty highlight query (as of
-//! 0.7.1), so the registry parses a `.proto` buffer and paints nothing. The
-//! grammar crate does not export its query, so a copy lives under
-//! `assets/tree-sitter-proto/` and is installed over the bundled config here.
-//! A query the bundle already has is left untouched, so a future upstream fix
-//! retires this registration instead of being masked by it.
+//! `gpui-component` links the protobuf and Swift grammars behind its
+//! `tree-sitter-proto` / `tree-sitter-swift` features but registers those
+//! languages with an empty highlight query (as of 0.7.1/0.7.3), so the
+//! registry parses a `.proto` / `.swift` buffer and paints nothing. Neither
+//! grammar crate's query is picked up by the bundle, so verbatim copies live
+//! under `assets/tree-sitter-proto/` and `assets/tree-sitter-swift/` and are
+//! installed over the bundled configs here. A query the bundle already has is
+//! left untouched, so a future upstream fix retires the registration instead
+//! of being masked by it.
 //!
 //! Installation is a one-time process-wide side effect on the language
 //! registry, so it hangs off the editor's grammar resolution
 //! (`native::language_for`) rather than app startup: a highlighter cannot be
 //! created before the query it needs is installed, and the tests below resolve
-//! a `.proto` path through the same function the editor uses. A future surface
-//! that assigns a proto highlighter without resolving a path through
+//! a path through the same function the editor uses. A future surface that
+//! assigns a proto or Swift highlighter without resolving a path through
 //! `native::language_for` must call [`ensure_for`] itself.
 
 use std::sync::Once;
@@ -25,7 +27,14 @@ use std::sync::Once;
 /// the highlight output rather than the query text.
 const PROTOBUF_HIGHLIGHTS: &str = include_str!("../../assets/tree-sitter-proto/highlights.scm");
 
+/// Verbatim copy of `tree-sitter-swift` 0.7.4's `queries/highlights.scm`.
+///
+/// Same compile-or-silently-plain-text contract as above: the tests below pin
+/// the highlight output rather than the query text.
+const SWIFT_HIGHLIGHTS: &str = include_str!("../../assets/tree-sitter-swift/highlights.scm");
+
 static PROTOBUF: Once = Once::new();
+static SWIFT: Once = Once::new();
 
 /// Install the vendored query for `grammar` when the bundled config has none.
 ///
@@ -35,19 +44,29 @@ static PROTOBUF: Once = Once::new();
 pub(crate) fn ensure_for(grammar: &str) {
     if grammar == "proto" {
         PROTOBUF.call_once(install_protobuf);
+    } else if grammar == "swift" {
+        SWIFT.call_once(install_swift);
     }
 }
 
 fn install_protobuf() {
+    install_query("proto", PROTOBUF_HIGHLIGHTS);
+}
+
+fn install_swift() {
+    install_query("swift", SWIFT_HIGHLIGHTS);
+}
+
+fn install_query(grammar: &str, highlights: &str) {
     let registry = gpui_kit::component::highlighter::LanguageRegistry::singleton();
-    let Some(mut config) = registry.language("proto") else {
+    let Some(mut config) = registry.language(grammar) else {
         return;
     };
     if !config.highlights.is_empty() {
         return;
     }
-    config.highlights = PROTOBUF_HIGHLIGHTS.into();
-    registry.register("proto", &config);
+    config.highlights = highlights.into();
+    registry.register(grammar, &config);
 }
 
 #[cfg(test)]
@@ -83,6 +102,11 @@ service FleetService {
     /// than being masked by a test-only call.
     fn resolve_proto() {
         assert_eq!(language_for(Path::new("proto/fleet.proto")), "proto");
+    }
+
+    /// Resolve a Swift path exactly as the editor does (see above).
+    fn resolve_swift() {
+        assert_eq!(language_for(Path::new("Sources/ContentView.swift")), "swift");
     }
 
     #[test]
@@ -142,6 +166,76 @@ service FleetService {
         assert!(
             colored(package, package + "package".len()),
             "the `package` keyword must carry a syntax color, got {styles:?}"
+        );
+    }
+
+    const SWIFT_SOURCE: &str = r#"// The fleet's vehicles.
+import Foundation
+
+struct Vehicle {
+  let vin: String
+  var wheelCount: Int = 4
+
+  func describe() -> String {
+    return "VIN \(vin)"
+  }
+}
+"#;
+
+    #[test]
+    fn resolving_a_swift_path_installs_the_grammar_query() {
+        resolve_swift();
+        let config = LanguageRegistry::singleton()
+            .language("swift")
+            .expect("the tree-sitter-swift feature must register the language");
+        assert!(config.has_grammar(), "the Swift grammar must be linked in");
+        assert!(
+            !config.highlights.is_empty(),
+            "the registered Swift config must carry a highlight query"
+        );
+    }
+
+    #[test]
+    fn swift_documents_highlight_keywords_comments_and_types() {
+        resolve_swift();
+        let mut highlighter = SyntaxHighlighter::new("swift");
+        let text = Rope::from_str(SWIFT_SOURCE);
+        assert!(
+            highlighter.update(None, &text, None),
+            "the Swift highlighter must parse the document"
+        );
+        // A query the grammar rejects makes `new` fall back to the inert
+        // "text" highlighter, which paints nothing.
+        assert_eq!(
+            highlighter.language().as_ref(),
+            "swift",
+            "the highlighter must not fall back to plain text"
+        );
+        let theme = HighlightTheme::default_dark();
+        let styles = highlighter.styles(&(0..text.len()), &*theme);
+        assert!(
+            styles.len() > 1,
+            "Swift must produce distinct styled spans, got {styles:?}"
+        );
+        let colored = |from: usize, through: usize| {
+            styles.iter().any(|(range, style)| {
+                range.start <= from && range.end >= through && style.color.is_some()
+            })
+        };
+        let struct_at = SWIFT_SOURCE.find("struct").unwrap();
+        assert!(
+            colored(struct_at, struct_at + "struct".len()),
+            "the `struct` keyword must carry a syntax color, got {styles:?}"
+        );
+        let comment_end = SWIFT_SOURCE.find('\n').unwrap();
+        assert!(
+            colored(0, comment_end),
+            "the line comment must carry a syntax color, got {styles:?}"
+        );
+        let import_at = SWIFT_SOURCE.find("import").unwrap();
+        assert!(
+            colored(import_at, import_at + "import".len()),
+            "the `import` keyword must carry a syntax color, got {styles:?}"
         );
     }
 }

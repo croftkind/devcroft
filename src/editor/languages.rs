@@ -34,6 +34,7 @@ pub(crate) fn detect(path: &Path) -> Language {
             "c" | "h" => ("c", "c", None),
             "cc" | "cpp" | "hpp" => ("cpp", "cpp", None),
             "java" => ("java", "java", None),
+            "swift" | "swiftinterface" => ("swift", "swift", None),
             // No protobuf language server is wired, so the id is not sent
             // anywhere yet.
             "proto" => ("proto", "protobuf", None),
@@ -71,5 +72,15 @@ mod tests {
         assert_eq!(language.grammar, "proto");
         assert_eq!(language.id, "protobuf");
         assert!(language.server.is_none());
+    }
+
+    #[test]
+    fn swift_files_use_the_bundled_grammar() {
+        let language = detect(Path::new("Sources/ContentView.swift"));
+        assert_eq!(language.grammar, "swift");
+        assert_eq!(language.id, "swift");
+        assert!(language.server.is_none());
+        let interface = detect(Path::new("Module.swiftinterface"));
+        assert_eq!(interface.grammar, "swift");
     }
 }

@@ -19,11 +19,23 @@ use syntect::highlighting::{FontStyle, Style, Theme, ThemeSet};
 /// Re-exported so callers that detect a language without a file path (the
 /// text diff tool) can name what they get back.
 pub(crate) use syntect::parsing::SyntaxReference;
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxDefinition, SyntaxSet};
 
 use super::model::{FileContent, Hunk, LineTag, ReviewDiff};
 
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+/// Verbatim copy of Swift-Next's `Swift.sublime-syntax` (see
+/// `assets/syntaxes/README.md`). `syntect`'s default set does not bundle
+/// Swift, so without this `.swift` files resolve to nothing and the Review
+/// tab paints them plain.
+const SWIFT_SYNTAX: &str = include_str!("../../assets/syntaxes/Swift.sublime-syntax");
+
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
+    let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+    let swift = SyntaxDefinition::load_from_str(SWIFT_SYNTAX, true, None)
+        .expect("the vendored Swift syntax must parse");
+    builder.add(swift);
+    builder.build()
+});
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 const DARK_THEME: &str = "base16-ocean.dark";
@@ -378,6 +390,68 @@ mod tests {
                         .iter()
                         .any(|span| span.range.start == 0 && span.range.end >= 3),
                     "Python's `def` keyword should be highlighted"
+                );
+            }
+        }
+        assert_ne!(
+            highlights.line(false, 0, 0, 1)[0].rgba,
+            highlights.line(true, 0, 0, 1)[0].rgba,
+        );
+    }
+
+    fn swift_diff() -> ReviewDiff {
+        ReviewDiff {
+            files: vec![ChangedFile {
+                path: "Sources/ContentView.swift".into(),
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 1,
+                deletions: 1,
+                content: FileContent::Text {
+                    hunks: vec![Hunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        collapsed_before: 0,
+                        lines: vec![
+                            HunkLine {
+                                tag: LineTag::Deletion,
+                                old_no: Some(1),
+                                new_no: None,
+                                text: "func old() {}".into(),
+                            },
+                            HunkLine {
+                                tag: LineTag::Addition,
+                                old_no: None,
+                                new_no: Some(1),
+                                text: "func new() {}".into(),
+                            },
+                        ],
+                    }],
+                    truncated: false,
+                },
+            }],
+            file_versions: Default::default(),
+            base_commit: String::new(),
+            head_commit: String::new(),
+            base_ref: None,
+            head_branch: None,
+        }
+    }
+
+    #[test]
+    fn swift_files_highlight_in_both_appearance_variants() {
+        assert_eq!(syntax_for_path("Sources/ContentView.swift").unwrap().name, "Swift");
+        let highlights = highlight(&swift_diff());
+        for dark in [false, true] {
+            for line in [0, 1] {
+                let spans = highlights.line(dark, 0, 0, line);
+                assert!(
+                    spans
+                        .iter()
+                        .any(|span| span.range.start == 0 && span.range.end >= 4),
+                    "Swift's `func` keyword should be highlighted"
                 );
             }
         }

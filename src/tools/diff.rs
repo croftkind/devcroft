@@ -157,6 +157,7 @@ pub(crate) const EDITOR_LANGUAGES: &[(&str, &str)] = &[
     ("Rust", "rust"),
     ("Scala", "scala"),
     ("Shell-Unix-Generic", "bash"),
+    ("Swift", "swift"),
     ("YAML", "yaml"),
 ];
 
@@ -414,6 +415,7 @@ mod tests {
             assert_eq!(*id, id.to_lowercase(), "{id} is not a language id");
         }
         assert_eq!(editor_language("Rust"), "rust");
+        assert_eq!(editor_language("Swift"), "swift");
         assert_eq!(editor_language("Plain Text"), PLAIN_EDITOR_LANGUAGE);
         // A language the grammars cannot color falls back to plain text
         // rather than to a highlighter that would paint nothing.
