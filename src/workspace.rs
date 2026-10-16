@@ -1622,7 +1622,9 @@ impl Workspace {
 
     /// Open the Add Repository dialog with a fresh form: re-harvesting on
     /// every opening beats reasoning about stale prefill. The dialog owns
-    /// open/close; the view is dropped with it.
+    /// open/close; the view is dropped with it. A successful add switches
+    /// straight into the new checkout so the dialog does not finish
+    /// silently.
     fn open_add_repository(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.git_header_busy && !self.can_leave_git(window, cx) {
             return;
@@ -1631,12 +1633,14 @@ impl Workspace {
         let spaces = self.spaces.names();
         let active_space = self.active_space.creation_space(&spaces);
         let view = cx.new(|cx| AddRepositoryView::new(window, cx, data_root, spaces, active_space));
-        cx.subscribe(
+        cx.subscribe_in(
             &view,
-            |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
+            window,
+            |this, _, event: &crate::add_repository::RepositoryAdded, window, cx| {
                 this.home.update(cx, |view, cx| view.reload(cx));
                 this.relationships.update(cx, |view, cx| view.refresh(cx));
                 this.reload_recent_repositories();
+                this.switch_repository(&event.0, &event.0, window, cx);
             },
         )
         .detach();
@@ -1651,7 +1655,8 @@ impl Workspace {
 
     /// Open the Link dialog for an existing portable record: checkout picker
     /// only, key fixed. Used from the Projects page for records synced from
-    /// another device (or left unbound by an interrupted create).
+    /// another device (or left unbound by an interrupted create). A
+    /// successful link switches into the checkout, matching Add.
     fn open_link_repository(&self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let data_root = self.data_root.clone();
         let key = key.to_owned();
@@ -1660,12 +1665,14 @@ impl Workspace {
         let view = cx.new(|cx| {
             AddRepositoryView::for_link(window, cx, data_root, key.clone(), spaces, active_space)
         });
-        cx.subscribe(
+        cx.subscribe_in(
             &view,
-            |this, _, _: &crate::add_repository::RepositoryAdded, cx| {
+            window,
+            |this, _, event: &crate::add_repository::RepositoryAdded, window, cx| {
                 this.home.update(cx, |view, cx| view.reload(cx));
                 this.relationships.update(cx, |view, cx| view.refresh(cx));
                 this.reload_recent_repositories();
+                this.switch_repository(&event.0, &event.0, window, cx);
             },
         )
         .detach();
