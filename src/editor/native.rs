@@ -33,7 +33,7 @@ use gpui_kit::component::{
     h_flex,
     input::{
         Editor, EditorState, Input, InputEvent, InputState, MoveDown, MoveUp, Position,
-        ShowCompletions,
+        ShowCompletions, highlight_characters,
     },
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
@@ -1819,6 +1819,7 @@ impl NativeEditor {
         let target_view = cx.entity().downgrade();
         self.editor.update(cx, |editor, _| {
             let lsp = editor.lsp_mut();
+            lsp.set_completion_highlighter(Rc::new(highlight_characters));
             lsp.hover_provider = client
                 .supports("textDocument/hover")
                 .then(|| providers.clone() as Rc<dyn gpui_kit::component::input::HoverProvider>);
@@ -4424,6 +4425,16 @@ mod tests {
                 view.open(&first, None, window, cx).unwrap();
                 view.open(&second, None, window, cx).unwrap();
                 assert!(Arc::ptr_eq(&view.lsp.as_ref().unwrap().client, &client));
+                let completion = lsp_types::CompletionItem {
+                    label: "file_loader".into(),
+                    ..Default::default()
+                };
+                let lsp = view.editor.read(cx).lsp();
+                assert_eq!(
+                    (lsp.completion_highlighter())("fl", &completion),
+                    vec![0..1, 2..3],
+                    "attached sessions highlight non-contiguous label matches"
+                );
                 assert!(client.doc_version(first_uri.as_str()) > 0);
                 let version = client.doc_version(first_uri.as_str());
                 view.open(&first, None, window, cx).unwrap();

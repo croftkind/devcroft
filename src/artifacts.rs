@@ -308,11 +308,17 @@ impl ArtifactBrowser {
         }
     }
 
-    /// Forward the workspace palette state: the palette is GPUI content, so a
-    /// visible tutorial webview would paint over its list.
-    pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
+    /// Forward overlay and page-replacement visibility to the native host.
+    pub(crate) fn set_workspace_visibility(
+        &mut self,
+        palette_open: bool,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(tutorial) = self.tutorial.clone() {
-            tutorial.update(cx, |view, cx| view.set_palette_open(open, cx));
+            tutorial.update(cx, |view, cx| {
+                view.set_workspace_visibility(palette_open, hidden, cx)
+            });
         }
     }
 

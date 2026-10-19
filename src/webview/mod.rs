@@ -27,6 +27,25 @@ use anyhow::Result;
 #[cfg(target_os = "macos")]
 use gpui_kit::{App, AppContext as _, Entity, Window};
 
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+pub(crate) struct HostedWebView {
+    pub view: Entity<gpui_webview::WebView>,
+    pub overlays_supported: bool,
+}
+
+#[cfg(all(target_os = "macos", feature = "gpui-fast"))]
+fn native_surfaces(window: &Window) -> Result<Vec<gpui_kit::CompositionSurfaceId>> {
+    let composition = window.enable_window_composition()?;
+    Ok(composition
+        .children(None)?
+        .into_iter()
+        .filter(|id| {
+            composition.surface_kind(*id).ok() == Some(gpui_kit::CompositionSurfaceKind::Native)
+        })
+        .collect())
+}
+
 /// Build a hardened child webview inside `window`.
 ///
 /// `configure` supplies the document and, only when the caller needs it, an
@@ -37,7 +56,7 @@ pub(crate) fn create(
     window: &mut Window,
     cx: &mut App,
     configure: impl FnOnce(wry::WebViewBuilder) -> wry::WebViewBuilder,
-) -> Result<Entity<gpui_wry::WebView>> {
+) -> Result<HostedWebView> {
     let builder = wry::WebViewBuilder::new()
         .with_incognito(true)
         .with_navigation_handler(|url| url == "about:blank" || url == "about:srcdoc")
@@ -45,7 +64,22 @@ pub(crate) fn create(
         .with_download_started_handler(|_, _| false);
     let handle = raw_window_handle::HasWindowHandle::window_handle(window)?;
     let native = configure(builder).build_as_child(&handle)?;
-    Ok(cx.new(|cx| gpui_wry::WebView::new(native, window, cx)))
+    // WebView falls back to a direct native child if composition fails. Its
+    // API does not expose that result, so observe the native surface it
+    // registers synchronously instead of assuming a Fast build succeeded.
+    #[cfg(feature = "gpui-fast")]
+    let before = native_surfaces(window).ok();
+    let view = cx.new(|cx| gpui_webview::WebView::new(native, window, cx));
+    #[cfg(feature = "gpui-fast")]
+    let overlays_supported = before
+        .zip(native_surfaces(window).ok())
+        .is_some_and(|(before, after)| after.iter().any(|id| !before.contains(id)));
+    #[cfg(not(feature = "gpui-fast"))]
+    let overlays_supported = false;
+    Ok(HostedWebView {
+        view,
+        overlays_supported,
+    })
 }
 
 /// Build the host document that presents one authored HTML body inside a

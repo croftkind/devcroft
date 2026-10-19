@@ -9,8 +9,6 @@ use anyhow::{Context as _, Result};
 #[cfg(not(target_os = "macos"))]
 use gpui_kit::AnyElement;
 #[cfg(target_os = "macos")]
-use gpui_kit::Entity;
-#[cfg(target_os = "macos")]
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::{
@@ -30,8 +28,9 @@ pub(crate) struct TutorialView {
     menu_open: bool,
     palette_open: bool,
     navigation_open: bool,
+    workspace_hidden: bool,
     #[cfg(target_os = "macos")]
-    webview: Option<Entity<gpui_wry::WebView>>,
+    webview: Option<crate::webview::HostedWebView>,
     #[cfg(target_os = "macos")]
     appearance: Option<String>,
 }
@@ -48,6 +47,7 @@ impl TutorialView {
             menu_open: false,
             palette_open: false,
             navigation_open: false,
+            workspace_hidden: false,
             #[cfg(target_os = "macos")]
             webview: None,
             #[cfg(target_os = "macos")]
@@ -59,34 +59,52 @@ impl TutorialView {
         self.focus_handle.clone()
     }
 
-    /// Native child views otherwise cover GPUI popup rows and intercept clicks.
+    /// Direct native children must hide behind overlays; composed pages can stay.
     pub(crate) fn set_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.menu_open = open;
         if open {
-            self.set_visible(false, cx);
+            self.hide_for_overlay(cx);
         }
         cx.notify();
     }
 
-    /// The workspace command palette is GPUI content, not a dialog or sheet,
-    /// so the render-time dialog/sheet gate does not cover it. While open the
-    /// native webview must hide or it paints over the palette list.
-    pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.palette_open = open;
-        if open {
+    /// Page replacement must hide even composed pages. Palette visibility
+    /// only needs the direct-child fallback.
+    pub(crate) fn set_workspace_visibility(
+        &mut self,
+        palette_open: bool,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette_open = palette_open;
+        self.workspace_hidden = hidden;
+        if hidden {
             self.set_visible(false, cx);
+        } else if palette_open {
+            self.hide_for_overlay(cx);
         }
         cx.notify();
     }
 
-    /// The navigation HUD is GPUI content anchored to the viewport corner, so
-    /// the same native-cover rule applies as the palette.
+    /// The navigation HUD follows the same composition rule as the palette.
     pub(crate) fn set_navigation_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.navigation_open = open;
         if open {
-            self.set_visible(false, cx);
+            self.hide_for_overlay(cx);
         }
         cx.notify();
+    }
+
+    fn hide_for_overlay(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self
+            .webview
+            .as_ref()
+            .is_some_and(|host| host.overlays_supported)
+        {
+            return;
+        }
+        self.set_visible(false, cx);
     }
 
     /// Native child views do not follow GPUI layout visibility, so the host
@@ -95,7 +113,7 @@ impl TutorialView {
     pub(crate) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         if let Some(webview) = &self.webview {
-            webview.update(cx, |view, cx| {
+            webview.view.update(cx, |view, cx| {
                 if visible != view.visible() {
                     if visible {
                         view.show();
@@ -212,27 +230,29 @@ impl Render for TutorialView {
                 });
             }
             let webview = self.webview.clone().filter(|_| self.error.is_none());
-            let visible = !self.menu_open
-                && !self.palette_open
-                && !self.navigation_open
-                && !window.has_active_dialog(cx)
-                && !window.has_active_sheet(cx);
             if let Some(webview) = &webview {
-                webview.update(cx, |view, _| {
+                let visible = !self.workspace_hidden
+                    && !window.has_active_sheet(cx)
+                    && (webview.overlays_supported
+                        || (!self.menu_open
+                            && !self.palette_open
+                            && !self.navigation_open
+                            && !window.has_active_dialog(cx)));
+                webview.view.update(cx, |view, _| {
                     if visible && !view.visible() {
                         view.show();
                     } else if !visible && view.visible() {
                         view.hide();
                     }
                 });
-                let _ = crate::webview::accessibility::attach(webview.read(cx).raw());
+                let _ = crate::webview::accessibility::attach(webview.view.read(cx).raw());
             }
             webview.map(|webview| {
                 div()
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
-                    .child(webview)
+                    .child(webview.view)
                     .into_any_element()
             })
         };

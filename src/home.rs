@@ -538,9 +538,15 @@ impl HomeView {
         paths
     }
 
-    pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        self.artifacts
-            .update(cx, |view, cx| view.set_palette_open(open, cx));
+    pub(crate) fn set_workspace_visibility(
+        &mut self,
+        palette_open: bool,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.artifacts.update(cx, |view, cx| {
+            view.set_workspace_visibility(palette_open, hidden, cx)
+        });
     }
 
     pub(crate) fn set_navigation_open(&mut self, open: bool, cx: &mut Context<Self>) {

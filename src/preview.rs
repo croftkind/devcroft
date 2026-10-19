@@ -845,8 +845,8 @@ impl Render for PreviewView {
         code_block.overflow.x = Some(Overflow::Scroll);
         // Scrollable code blocks are opt-in: with `overflow.y = Scroll`
         // plus a max height, long blocks cap their height, get their own
-        // scrollbar, and keep wheel events inside the block until the code
-        // reaches its edge (gpui-kit v0.7.1).
+        // scrollbar, and retain wheel gestures inside the block even at
+        // its edge (gpui-kit v0.8.0).
         code_block.overflow.y = Some(Overflow::Scroll);
         code_block = code_block.max_h(px(320.));
         let table_head = div()

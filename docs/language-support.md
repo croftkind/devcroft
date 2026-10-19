@@ -2,6 +2,8 @@
 
 The built-in editor supports completion, hover, definitions, and diagnostics for Rust, Go, JavaScript/TypeScript (including JSX/TSX), and Python. Other bundled languages retain syntax highlighting and plain editing.
 
+Completion labels highlight the typed characters in order, including non-contiguous matches such as `fl` in `file_loader`. This changes label highlighting only; completion filtering and application stay the same.
+
 ## First use
 
 Open a supported file and click the language indicator in the editor footer to **Trust checkout**. Trust lasts for this editor workspace's lifetime. It permits language servers to consult project configuration and tools; installing a server does not grant trust.

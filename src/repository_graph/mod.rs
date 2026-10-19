@@ -564,7 +564,6 @@ impl GraphPage {
                 .update(cx, |workspace, cx| {
                     workspace.ensure_repository_agent_idle(key, cx)
                 })
-                .map_err(anyhow::Error::from)
                 .and_then(|result| result);
             if let Err(error) = result {
                 self.error = Some(format!("{error:#}"));

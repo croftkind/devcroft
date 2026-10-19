@@ -1221,15 +1221,17 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Keep tutorial webviews behind the palette: native children paint over
-    /// GPUI popups, so both artifact browsers hide while the bar is open and
-    /// re-show on the next render once it closes.
+    /// Distinguish overlays from page replacements: composed tutorials can
+    /// remain behind the palette, but must hide when Git replaces the page.
     fn sync_tutorial_palette(&mut self, cx: &mut Context<Self>) {
-        let open = self.command_open || self.git_page_origin.is_some() || self.git_header_busy;
-        self.home
-            .update(cx, |view, cx| view.set_palette_open(open, cx));
-        self.resources
-            .update(cx, |view, cx| view.set_palette_open(open, cx));
+        let palette_open = self.command_open;
+        let hidden = self.git_page_origin.is_some() || self.git_header_busy;
+        self.home.update(cx, |view, cx| {
+            view.set_workspace_visibility(palette_open, hidden, cx)
+        });
+        self.resources.update(cx, |view, cx| {
+            view.set_workspace_visibility(palette_open, hidden, cx)
+        });
     }
 
     /// Same cover rule for the navigation HUD.
@@ -4347,25 +4349,28 @@ impl Render for Workspace {
                                     // Keep the wider palette on the same center as
                                     // the trigger, leaving room for labels and hints.
                                     .when(self.command_open, |anchor| {
-                                        anchor.child(deferred(
-                                            div()
-                                                .absolute()
-                                                .top_0()
-                                                .left_0()
-                                                .when(center_command, |palette| {
-                                                    palette.left(px((command_width
-                                                        - palette_width)
-                                                        / 2.))
-                                                })
-                                                .w(px(palette_width))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|_, _, _, cx| {
-                                                        cx.stop_propagation()
-                                                    }),
-                                                )
-                                                .child(self.render_command_bar(cx)),
-                                        ))
+                                        anchor.child(
+                                            deferred(
+                                                div()
+                                                    .absolute()
+                                                    .top_0()
+                                                    .left_0()
+                                                    .when(center_command, |palette| {
+                                                        palette.left(px((command_width
+                                                            - palette_width)
+                                                            / 2.))
+                                                    })
+                                                    .w(px(palette_width))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|_, _, _, cx| {
+                                                            cx.stop_propagation()
+                                                        }),
+                                                    )
+                                                    .child(self.render_command_bar(cx)),
+                                            )
+                                            .with_priority(1),
+                                        )
                                     }),
                             )
                             .child(self.render_navigation_indicator())
@@ -4505,7 +4510,7 @@ impl Render for Workspace {
             )
             .child(div().flex_1().min_h_0().child(active_content))
             .when(self.command_open, |this| {
-                this.child(
+                this.child(deferred(
                     div()
                         .absolute()
                         .top(px(WORKSPACE_HEADER_HEIGHT))
@@ -4519,10 +4524,10 @@ impl Render for Workspace {
                             }),
                         )
                         .child(div().absolute().size_full().bg(rgb(0x000000)).opacity(0.4)),
-                )
+                ))
             })
             .when(self.navigation_open, |this| {
-                this.child(self.render_navigation_hud(window, cx))
+                this.child(deferred(self.render_navigation_hud(window, cx)))
             })
         // Dialogs, sheets, notifications, menus and tooltips are hosted
         // by the component `Root` automatically (registered by
