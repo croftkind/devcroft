@@ -203,7 +203,7 @@ impl ReviewView {
             load_in_flight: false,
             file_changes: watch::FileChanges::new(cwd),
             feedback: feedback::Feedback::default(),
-            show_comments: true,
+            show_comments: false,
             open_error: None,
             editor_open_available: false,
         };

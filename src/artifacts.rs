@@ -3,13 +3,12 @@ mod comments;
 
 use crate::data::DataRoot;
 use crate::data::artifacts::{
-    ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, Kind, ListOptions, Snapshot,
+    ArtifactList, ArtifactPatch, ArtifactStore, CommentChange, Kind, ListOptions, Snapshot, Status,
 };
 use crate::preview::{PreviewView, TocActive, TocEntry};
 use crate::relative_time::{current_unix_secs, relative_duration_label};
 use crate::tutorial_view::TutorialView;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -92,7 +91,7 @@ pub(crate) struct ArtifactBrowser {
     scope: Scope,
     active: bool,
     refresh: Refresh,
-    include_archived: bool,
+    status_filter: Option<Status>,
     kind_filter: Option<Kind>,
     /// Active isolation profile. `None` (All or repository-scoped browsers) shows
     /// every artifact in scope; the global browser follows the workspace's
@@ -152,7 +151,7 @@ impl ArtifactBrowser {
             scope,
             active: false,
             refresh: Refresh::default(),
-            include_archived: false,
+            status_filter: None,
             kind_filter: None,
             space_filter: None,
             limit: PAGE_SIZE,
@@ -323,13 +322,28 @@ impl ArtifactBrowser {
             tutorial.update(cx, |view, cx| view.set_navigation_open(open, cx));
         }
     }
-    pub(crate) fn include_archived(&self) -> bool {
-        self.include_archived
-    }
-    pub(crate) fn set_include_archived(&mut self, value: bool, cx: &mut Context<Self>) {
-        self.include_archived = value;
-        self.limit = PAGE_SIZE;
-        self.refresh(cx);
+    pub(crate) fn set_status_filter(&mut self, value: Option<Status>, cx: &mut Context<Self>) {
+        if self.status_filter != value {
+            self.status_filter = value;
+            // Keep the detail in sync with the visible list: if the current
+            // selection is filtered out, fall back to the first visible card.
+            let selected_visible = self.selected_id.as_ref().is_some_and(|id| {
+                self.visible_artifacts()
+                    .any(|snapshot| &snapshot.artifact.id == id)
+            });
+            if !selected_visible {
+                let fallback = self.visible_artifacts().next().cloned();
+                self.select(fallback, cx);
+                self.error = None;
+            }
+            // Status filtering happens in the store before the page limit, so
+            // a new filter needs a fresh query rather than the cached page.
+            // A busy refresh coalesces via the pending flag; its stale
+            // generation is discarded on completion.
+            self.limit = PAGE_SIZE;
+            self.refresh(cx);
+            cx.notify();
+        }
     }
     /// Whether any unsaved draft (active or stashed) exists. Settings blocks
     /// catalog renames/deletes while one does: the rewrite replaces the
@@ -381,6 +395,13 @@ impl ArtifactBrowser {
     pub(crate) fn set_kind_filter(&mut self, filter: Option<Kind>, cx: &mut Context<Self>) {
         if self.kind_filter != filter {
             self.kind_filter = filter;
+            if let Some(kind) = filter
+                && self
+                    .status_filter
+                    .is_some_and(|status| !kind.statuses().contains(&status))
+            {
+                self.set_status_filter(None, cx);
+            }
             // Keep the detail in sync with the visible list: if the current
             // selection is filtered out, fall back to the first visible card.
             let selected_visible = self.selected_id.as_ref().is_some_and(|id| {
@@ -399,6 +420,9 @@ impl ArtifactBrowser {
         self.list.artifacts.iter().filter(|snapshot| {
             self.kind_filter
                 .is_none_or(|kind| snapshot.artifact.kind == kind)
+                && self
+                    .status_filter
+                    .is_none_or(|status| snapshot.artifact.status == Some(status))
                 && self.in_space(snapshot)
         })
     }
@@ -465,7 +489,7 @@ impl ArtifactBrowser {
             // Space filtering happens in the store, before the page limit:
             // another space's records must not consume the page.
             space: self.space_filter.clone(),
-            include_archived: self.include_archived,
+            status: self.status_filter,
             limit: Some(self.limit),
         };
         cx.spawn(async move |this, cx| {
@@ -490,8 +514,9 @@ impl ArtifactBrowser {
                             let pinned = selected.and_then(|result| match result {
                                 Ok(snapshot)
                                     if Some(&snapshot.artifact.id) == this.selected_id.as_ref()
-                                        && (this.include_archived
-                                            || !snapshot.artifact.archived)
+                                        && this.status_filter.is_none_or(|status| {
+                                            snapshot.artifact.status == Some(status)
+                                        })
                                         && this.in_space(&snapshot)
                                         && match &this.scope {
                                             Scope::Global => true,
@@ -527,6 +552,9 @@ impl ArtifactBrowser {
                                 .or(pinned)
                                 .filter(|s| {
                                     this.kind_filter.is_none_or(|kind| s.artifact.kind == kind)
+                                        && this
+                                            .status_filter
+                                            .is_none_or(|status| s.artifact.status == Some(status))
                                 })
                                 .or_else(|| this.draft.as_ref().map(|d| d.snapshot.clone()))
                                 .or_else(|| this.visible_artifacts().next().cloned());
@@ -543,8 +571,8 @@ impl ArtifactBrowser {
         })
         .detach();
     }
-    /// Open a referenced resource even if it is archived or beyond the current
-    /// page. Do not replace a draft or let an older list refresh win the race.
+    /// Open a referenced resource even if it is beyond the current page
+    /// or filters. Do not replace a draft or let an older list refresh win the race.
     pub(crate) fn open_by_id(&mut self, id: String, cx: &mut Context<Self>) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.draft.is_none() && !self.saving,
@@ -575,7 +603,7 @@ impl ArtifactBrowser {
                 match result {
                     Ok(snapshot) if this.draft.is_none() && !this.saving => {
                         this.kind_filter = None;
-                        this.include_archived |= snapshot.artifact.archived;
+                        this.status_filter = None;
                         if !this
                             .list
                             .artifacts
@@ -817,9 +845,7 @@ impl ArtifactBrowser {
                             },
                         ),
                         Mutation::Comment(change) => store.comment(id, revision, change),
-                        Mutation::Archive => {
-                            store.set_archived(id, revision, !snapshot.artifact.archived)
-                        }
+                        Mutation::SetStatus(status) => store.set_status(id, revision, status),
                     }
                     .map_err(|e| format!("{e:#}"))
                 })
@@ -912,12 +938,7 @@ impl ArtifactBrowser {
     }
     /// The artifact options menu, rendered at the top of the reader rail so
     /// it stays put whether or not the document has headings for an outline.
-    fn render_options_menu(
-        &self,
-        snapshot: Snapshot,
-        archived: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_options_menu(&self, snapshot: Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let menu_snapshot = snapshot;
         let view = cx.entity().downgrade();
         Button::new("artifact-options")
@@ -977,17 +998,23 @@ impl ArtifactBrowser {
                                 })
                         });
                 }
+                for &next in menu_snapshot.artifact.kind.statuses() {
+                    let checked = menu_snapshot.artifact.status == Some(next);
+                    let label = format!("Mark as {}", next.label());
+                    menu = menu.item({
+                        let view = view.clone();
+                        let snapshot = menu_snapshot.clone();
+                        PopupMenuItem::new(label).checked(checked).on_click(move |_, _, cx| {
+                            if checked {
+                                return;
+                            }
+                            let _ = view.update(cx, |this, cx| {
+                                this.mutate(snapshot.clone(), Mutation::SetStatus(next), false, cx);
+                            });
+                        })
+                    });
+                }
                 menu.item({
-                    let view = view.clone();
-                    let snapshot = menu_snapshot.clone();
-                    let label = if archived { "Unarchive" } else { "Archive" };
-                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |this, cx| {
-                            this.mutate(snapshot.clone(), Mutation::Archive, false, cx);
-                        });
-                    })
-                })
-                .item({
                     let view = view.clone();
                     let snapshot = menu_snapshot.clone();
                     PopupMenuItem::new("Delete").on_click(move |_, window, cx| {
@@ -1100,7 +1127,7 @@ impl ArtifactBrowser {
 enum Mutation {
     Document(String),
     Comment(CommentChange),
-    Archive,
+    SetStatus(Status),
 }
 
 /// Distinct sidebar/detail pill per artifact type so kinds are scannable
@@ -1127,6 +1154,23 @@ fn kind_tag(kind: Kind) -> Tag {
         .child(kind.label())
 }
 
+/// Workflow status colors follow the initial, active, and completed stages.
+fn status_tag_color(status: Status) -> ColorName {
+    match status {
+        Status::Todo | Status::ToReview => ColorName::Gray,
+        Status::InProgress | Status::Approved => ColorName::Amber,
+        Status::Done | Status::Implemented => ColorName::Green,
+    }
+}
+
+fn status_tag(status: Status) -> Tag {
+    Tag::color(status_tag_color(status))
+        .with_size(Size::Small)
+        .rounded_full()
+        .flex_none()
+        .child(status.label())
+}
+
 /// `Updated 2h ago` for sidebar cards. `updated_at_ms` is unix millis (see
 /// `data::record::timestamp`); future values read as `just now` rather than
 /// a negative duration. Pure over `now_secs` for tests.
@@ -1151,72 +1195,138 @@ impl Render for ArtifactBrowser {
             .border_r_1()
             .border_color(cx.theme().border)
             .child({
-                let active = self.kind_filter;
+                let kind_active = self.kind_filter;
+                let status_active = self.status_filter;
                 let disabled = self.draft.is_some() || self.saving;
-                let current = active.map(Kind::label).unwrap_or("All");
+                let kind_current = kind_active.map(Kind::label).unwrap_or("All");
+                let status_current = status_active.map(Status::label).unwrap_or("All");
+                let statuses = kind_active.map(Kind::statuses).unwrap_or(&Status::ALL);
                 let view = cx.entity().downgrade();
+                let kind_view = view.clone();
+                let status_view = view.clone();
                 h_flex()
                     .w_full()
+                    .items_start()
                     .gap_2()
-                    .items_center()
                     .child(
-                        div().flex_1().min_w_0().child(
-                            Button::new("resource-kind-filter")
-                                .label(current)
-                                .w_full()
-                                .accessibility_label(format!(
-                                    "Filter resources by type, currently {current}"
-                                ))
-                                .dropdown_caret(true)
-                                .outline()
-                                .disabled(disabled)
-                                .dropdown_menu_with_anchor(
-                                    Anchor::BottomLeft,
-                                    move |menu, _, _| {
-                                        let mut menu = menu;
-                                        for kind in [None]
-                                            .into_iter()
-                                            .chain(Kind::ALL.iter().copied().map(Some))
-                                        {
-                                            let view: WeakEntity<Self> = view.clone();
-                                            let checked = active == kind;
-                                            let label = kind.map(Kind::label).unwrap_or("All");
-                                            menu = menu.item(
-                                                PopupMenuItem::new(label)
-                                                    .checked(checked)
-                                                    .on_click(move |_, _, cx| {
-                                                        let _ = view.update(cx, |this, cx| {
-                                                            this.set_kind_filter(kind, cx)
-                                                        });
-                                                    }),
-                                            );
-                                        }
-                                        menu
-                                    },
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Type"),
+                            )
+                            .child(
+                                div().w_full().min_w_0().child(
+                                    Button::new("resource-kind-filter")
+                                        .label(kind_current)
+                                        .w_full()
+                                        .accessibility_label(format!(
+                                            "Filter resources by type, currently {kind_current}"
+                                        ))
+                                        .dropdown_caret(true)
+                                        .outline()
+                                        .disabled(disabled)
+                                        .dropdown_menu_with_anchor(
+                                            Anchor::BottomLeft,
+                                            move |menu, _, _| {
+                                                let mut menu = menu;
+                                                for kind in [None]
+                                                    .into_iter()
+                                                    .chain(Kind::ALL.iter().copied().map(Some))
+                                                {
+                                                    let view: WeakEntity<Self> = kind_view.clone();
+                                                    let checked = kind_active == kind;
+                                                    let label =
+                                                        kind.map(Kind::label).unwrap_or("All");
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(label)
+                                                            .checked(checked)
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ =
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.set_kind_filter(
+                                                                            kind, cx,
+                                                                        )
+                                                                    });
+                                                            }),
+                                                    );
+                                                }
+                                                menu
+                                            },
+                                        ),
                                 ),
-                        ),
+                            ),
                     )
-                    .child(
-                        Checkbox::new("resource-archived")
-                            .label("Archived")
-                            .accessibility_label("Show archived resources")
-                            .checked(self.include_archived)
-                            .disabled(disabled)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.set_include_archived(*checked, cx);
-                            })),
-                    )
+                    .when(!statuses.is_empty(), |row| {
+                        row.child(v_flex().flex_1().min_w_0().gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("State"),
+                            )
+                            .child(
+                                div().w_full().min_w_0().child(
+                                    Button::new("resource-status-filter")
+                                        .label(status_current)
+                                        .w_full()
+                                        .accessibility_label(format!(
+                                            "Filter resources by state, currently {status_current}"
+                                        ))
+                                        .dropdown_caret(true)
+                                        .outline()
+                                        .disabled(disabled)
+                                        .dropdown_menu_with_anchor(
+                                            Anchor::BottomLeft,
+                                            move |menu, _, _| {
+                                                let mut menu = menu;
+                                                for status in [None]
+                                                    .into_iter()
+                                                    .chain(statuses.iter().copied().map(Some))
+                                                {
+                                                    let view: WeakEntity<Self> =
+                                                        status_view.clone();
+                                                    let checked = status_active == status;
+                                                    let label =
+                                                        status.map(Status::label).unwrap_or("All");
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(label)
+                                                            .checked(checked)
+                                                            .on_click(move |_, _, cx| {
+                                                                let _ =
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.set_status_filter(
+                                                                            status, cx,
+                                                                        )
+                                                                    });
+                                                            }),
+                                                    );
+                                                }
+                                                menu
+                                            },
+                                        ),
+                                ),
+                            ))
+                    })
             });
         let visible: Vec<Snapshot> = self.visible_artifacts().cloned().collect();
         for snapshot in &visible {
             let snapshot = snapshot.clone();
             let artifact = &snapshot.artifact;
-            let age = updated_label(artifact.updated_at, current_unix_secs());
-            let mut recency = age.clone();
-            if artifact.archived {
-                recency.push_str(" · Archived");
-            }
-            let tooltip = format!("{}\n{} · {recency}", artifact.title, artifact.kind.label());
+            let recency = updated_label(artifact.updated_at, current_unix_secs());
+            let tooltip = format!(
+                "{}\n{} · {}{recency}",
+                artifact.title,
+                artifact.kind.label(),
+                artifact
+                    .status
+                    .map(|status| format!("{} · ", status.label()))
+                    .unwrap_or_default()
+            );
             sidebar = sidebar.child(
                 Button::new(SharedString::from(artifact.id.clone()))
                     .ghost()
@@ -1236,6 +1346,7 @@ impl Render for ArtifactBrowser {
                                     .items_center()
                                     .gap_1()
                                     .child(kind_tag(artifact.kind))
+                                    .children(artifact.status.map(status_tag))
                                     .child(div().text_xs().child(recency)),
                             ),
                     )
@@ -1275,7 +1386,6 @@ impl Render for ArtifactBrowser {
             .min_h_0();
         if let Some(snapshot) = self.selected.clone() {
             let artifact = &snapshot.artifact;
-            let archived = artifact.archived;
             // Right padding stays tight so the document scrollbar docks
             // beside the outline rail instead of floating mid-pane.
             let mut main = v_flex()
@@ -1297,6 +1407,7 @@ impl Render for ArtifactBrowser {
                 .gap_2()
                 .items_center()
                 .child(kind_tag(artifact.kind))
+                .children(artifact.status.map(status_tag))
                 .child(
                     div()
                         .text_xs()
@@ -1345,14 +1456,6 @@ impl Render for ArtifactBrowser {
                             .text_color(cx.theme().muted_foreground)
                             .child(repository),
                     );
-            }
-            if archived {
-                meta = meta.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().danger)
-                        .child("Archived"),
-                );
             }
             if !artifact.sessions.is_empty() {
                 meta = meta
@@ -1451,11 +1554,7 @@ impl Render for ArtifactBrowser {
                                             .bg(cx.theme().accent),
                                     )
                                     .child(div().flex_1())
-                                    .child(self.render_options_menu(
-                                        snapshot.clone(),
-                                        archived,
-                                        cx,
-                                    )),
+                                    .child(self.render_options_menu(snapshot.clone(), cx)),
                             ),
                     )
                     .child(div().flex_1().min_h_0().child(tutorial.clone()));
@@ -1498,7 +1597,7 @@ impl Render for ArtifactBrowser {
                                     })),
                             )
                             .child(div().flex_1())
-                            .child(self.render_options_menu(snapshot.clone(), archived, cx)),
+                            .child(self.render_options_menu(snapshot.clone(), cx)),
                     )
                     .child(if self.show_comments {
                         self.render_comments_panel(&snapshot, cx).into_any_element()

@@ -25,6 +25,66 @@ fn kind_labels_cover_every_filter_option() {
 }
 
 #[gpui_kit::test]
+fn switching_kind_clears_incompatible_status_and_refetches_the_filtered_page(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/repo/repository.json"),
+        &serde_json::json!({"key": "repo"}),
+    )
+    .unwrap();
+    let store = ArtifactStore::new(&root);
+    for kind in [Kind::Plan, Kind::Rfc, Kind::Note] {
+        store
+            .create(NewArtifact {
+                repository: Some("repo".into()),
+                sessions: vec![],
+                title: kind.label().into(),
+                kind,
+                content: "# Document".into(),
+                status: None,
+            })
+            .unwrap();
+    }
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
+    browser.update(cx, |browser, cx| {
+        browser.set_status_filter(Some(Status::Todo), cx);
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, cx| {
+        assert_eq!(browser.list.artifacts.len(), 1);
+        browser.set_kind_filter(Some(Kind::Rfc), cx);
+        assert!(browser.status_filter.is_none());
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, cx| {
+        assert_eq!(browser.visible_artifacts().count(), 1);
+        assert_eq!(browser.selected.as_ref().unwrap().artifact.kind, Kind::Rfc);
+        browser.set_status_filter(Some(Status::ToReview), cx);
+        browser.set_kind_filter(Some(Kind::Rfc), cx);
+        assert_eq!(browser.status_filter, Some(Status::ToReview));
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, cx| {
+        browser.set_kind_filter(Some(Kind::Note), cx);
+        assert!(browser.status_filter.is_none());
+    });
+    cx.run_until_parked();
+    browser.update(cx, |browser, _| {
+        let visible = browser.visible_artifacts().collect::<Vec<_>>();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].artifact.kind, Kind::Note);
+        assert_eq!(browser.selected.as_ref().unwrap().artifact.status, None);
+    });
+}
+
+#[gpui_kit::test]
 fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
     cx: &mut gpui_kit::TestAppContext,
 ) {
@@ -46,6 +106,7 @@ fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
             title: "Two records".into(),
             kind: Kind::Tutorial,
             content: "<!doctype html><html><body><p>Two records</p></body></html>".into(),
+            status: None,
         })
         .unwrap();
     let note = store
@@ -55,6 +116,7 @@ fn tutorial_selection_swaps_the_markdown_reader_for_the_sandboxed_viewer(
             title: "Note".into(),
             kind: Kind::Note,
             content: "# Note".into(),
+            status: None,
         })
         .unwrap();
     cx.update(gpui_kit::init);
@@ -124,6 +186,7 @@ fn tutorials_reject_edit_and_comment_commands(cx: &mut gpui_kit::TestAppContext)
             title: "Two records".into(),
             kind: Kind::Tutorial,
             content: "<!doctype html><html><body><p>Two records</p></body></html>".into(),
+            status: None,
         })
         .unwrap();
     cx.update(gpui_kit::init);
@@ -161,10 +224,10 @@ fn updated_label_buckets_like_relative_durations() {
 }
 
 #[gpui_kit::test]
-fn direct_reference_opens_archived_resource_and_preserves_drafts(
+fn direct_reference_opens_filtered_resource_and_preserves_drafts(
     cx: &mut gpui_kit::TestAppContext,
 ) {
-    use crate::data::artifacts::NewArtifact;
+    use crate::data::artifacts::{NewArtifact, Status};
     let dir = tempfile::tempdir().unwrap();
     let root = DataRoot::new(dir.path().to_owned());
     crate::data::write_json_atomic(
@@ -181,21 +244,16 @@ fn direct_reference_opens_archived_resource_and_preserves_drafts(
                 repository: Some("repo".into()),
                 sessions: vec![],
                 title: format!("Target {index}"),
-                kind: Kind::Note,
+                kind: Kind::Plan,
                 content: "# Target".into(),
+                status: Some(Status::Done),
             })
             .unwrap();
-        store
-            .set_archived(&target.artifact.id, &target.revision, true)
-            .unwrap();
+        assert_eq!(target.artifact.status, Some(Status::Done));
     }
-    let all = store
-        .list(&ListOptions {
-            include_archived: true,
-            ..Default::default()
-        })
-        .unwrap();
-    // This target is both archived and outside the one-record page used below.
+    let all = store.list(&ListOptions::default()).unwrap();
+    assert_eq!(all.artifacts.len(), 3);
+    // This target is outside the one-record page used below.
     let id = all.artifacts.last().unwrap().artifact.id.clone();
     cx.update(gpui_kit::init);
     let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
@@ -203,15 +261,16 @@ fn direct_reference_opens_archived_resource_and_preserves_drafts(
     let (_, cx) =
         cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
     browser.update(cx, |browser, cx| {
-        browser.kind_filter = Some(Kind::Plan);
+        browser.kind_filter = Some(Kind::Note);
+        browser.status_filter = Some(Status::Todo);
         browser.limit = 1;
         browser.open_by_id(id.clone(), cx).unwrap();
     });
     cx.run_until_parked();
     browser.update(cx, |browser, cx| {
         assert_eq!(browser.selected_id.as_ref(), Some(&id));
-        assert!(browser.include_archived);
         assert!(browser.kind_filter.is_none());
+        assert!(browser.status_filter.is_none());
         assert!(browser.visible_artifacts().any(|s| s.artifact.id == id));
         browser.refresh(cx);
     });
@@ -243,6 +302,7 @@ fn block_comment_editor_keeps_reader_and_persists_anchor(cx: &mut gpui_kit::Test
     let snapshot = store.create(NewArtifact {
         repository: Some("repo".into()), sessions: vec![], title: "Block feedback".into(), kind: Kind::Note,
         content: "# Example\n\nParagraph with **bold** and `code`.\n\n- First\n- Second\n\n```rs\nlet x = 1;\n```\n".into(),
+        status: None,
     }).unwrap();
     cx.update(gpui_kit::init);
     let browser = cx.new(|cx| ArtifactBrowser::new(Some(root), cx));
@@ -324,6 +384,7 @@ fn space_switching_stashes_drafts_and_never_shows_another_spaces_editor(
                 title: title.into(),
                 kind: Kind::Note,
                 content: format!("# {title}\n"),
+                status: None,
             })
             .unwrap()
     };
@@ -420,6 +481,7 @@ fn repository_scoped_drafts_report_their_resolved_space(cx: &mut gpui_kit::TestA
             title: "Work doc".into(),
             kind: Kind::Note,
             content: "# Work\n".into(),
+            status: None,
         })
         .unwrap();
 
@@ -470,6 +532,7 @@ fn selected_text_draft_saves_selection_instead_of_containing_block(
             title: "Selection feedback".into(),
             kind: Kind::Note,
             content: content.into(),
+            status: None,
         })
         .unwrap();
     cx.update(gpui_kit::init);

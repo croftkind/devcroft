@@ -122,6 +122,7 @@ fn input(repository: &str) -> NewArtifact {
         title: "Plan".into(),
         kind: Kind::Plan,
         content: "# Plan\n\n- [ ] Ship λ\n".into(),
+        status: None,
     }
 }
 #[test]
@@ -157,6 +158,7 @@ fn tutorial(repository: &str, html: &str) -> NewArtifact {
         title: "Change tutorial".into(),
         kind: Kind::Tutorial,
         content: html.into(),
+        status: None,
     }
 }
 
@@ -279,7 +281,7 @@ fn tutorial_content_must_be_a_nonempty_document_while_markdown_may_be_empty() {
 }
 
 #[test]
-fn repository_filter_order_archive_and_partial_errors() {
+fn repository_filter_order_status_and_partial_errors() {
     let (_dir, store) = fixture();
     let first = store.create(input("repo")).unwrap();
     let second = store.create(input("repo")).unwrap();
@@ -298,17 +300,224 @@ fn repository_filter_order_archive_and_partial_errors() {
     let list = store.list(&options).unwrap();
     assert_eq!(list.artifacts.len(), 2);
     assert_eq!(list.artifacts[0].artifact.id, first.artifact.id);
-    store
-        .set_archived(&first.artifact.id, &updated.revision, true)
+    // Status changes are revision-checked and visible in default lists.
+    let done = store
+        .set_status(&first.artifact.id, &updated.revision, Status::Done)
         .unwrap();
-    assert_eq!(
-        store.list(&options).unwrap().artifacts[0].artifact.id,
-        second.artifact.id
-    );
+    assert_eq!(done.artifact.status, Some(Status::Done));
+    assert_eq!(store.list(&options).unwrap().artifacts.len(), 2);
+    let filtered = store
+        .list(&ListOptions {
+            repository: Some("repo".into()),
+            status: Some(Status::Done),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(filtered.artifacts.len(), 1);
+    assert_eq!(filtered.artifacts[0].artifact.id, first.artifact.id);
+    let planned = store
+        .list(&ListOptions {
+            repository: Some("repo".into()),
+            status: Some(Status::Todo),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(planned.artifacts.len(), 1);
+    assert_eq!(planned.artifacts[0].artifact.id, second.artifact.id);
     fs::create_dir(store.checked_path(None).unwrap().join("broken")).unwrap();
     let list = store.list(&options).unwrap();
-    assert_eq!(list.artifacts.len(), 1);
+    assert_eq!(list.artifacts.len(), 2);
     assert_eq!(list.errors.len(), 1);
+}
+
+#[test]
+fn workflows_are_specific_to_kind_and_stateless_kinds_omit_status() {
+    let (_dir, store) = fixture();
+    for kind in Kind::ALL {
+        let mut data = input("repo");
+        data.kind = kind;
+        let mut current = store.create(data.clone()).unwrap();
+        assert_eq!(current.artifact.status, kind.default_status());
+        let serialized = serde_json::to_value(&current.artifact).unwrap();
+        assert_eq!(
+            serialized.get("status").is_some(),
+            !kind.statuses().is_empty()
+        );
+        let path = store
+            .checked_path(Some(&current.artifact.id))
+            .unwrap()
+            .join("artifact.md");
+        assert_eq!(
+            fs::read_to_string(path).unwrap().contains("\"status\""),
+            !kind.statuses().is_empty()
+        );
+        for &status in kind.statuses() {
+            current = store
+                .set_status(&current.artifact.id, &current.revision, status)
+                .unwrap();
+            assert_eq!(current.artifact.status, Some(status));
+            assert_eq!(current.artifact.content, data.content);
+        }
+        for status in Status::ALL {
+            if kind.statuses().contains(&status) {
+                continue;
+            }
+            data.status = Some(status);
+            assert!(store.create(data.clone()).is_err());
+            assert!(
+                store
+                    .set_status(&current.artifact.id, &current.revision, status)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .update(
+                        &current.artifact.id,
+                        &current.revision,
+                        ArtifactPatch {
+                            title: Some("Must not persist".into()),
+                            status: Some(status),
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(store.get(&current.artifact.id).unwrap(), current);
+        }
+    }
+}
+
+#[test]
+fn changing_markdown_kind_resets_or_removes_status_and_validates_explicit_status() {
+    let (_dir, store) = fixture();
+    let mut current = store
+        .create(NewArtifact {
+            status: Some(Status::InProgress),
+            ..input("repo")
+        })
+        .unwrap();
+    // Re-sending the same kind preserves its workflow progress.
+    for (kind, explicit, expected) in [
+        (Kind::Plan, None, Some(Status::InProgress)),
+        (Kind::Rfc, None, Some(Status::ToReview)),
+        (Kind::Rfc, Some(Status::Approved), Some(Status::Approved)),
+        (Kind::Plan, Some(Status::Done), Some(Status::Done)),
+        (Kind::Note, None, None),
+        (Kind::Rfc, None, Some(Status::ToReview)),
+        (Kind::Review, None, None),
+        (Kind::Plan, None, Some(Status::Todo)),
+    ] {
+        current = store
+            .update(
+                &current.artifact.id,
+                &current.revision,
+                ArtifactPatch {
+                    kind: Some(kind),
+                    status: explicit,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(current.artifact.kind, kind);
+        assert_eq!(current.artifact.status, expected);
+    }
+    for (kind, status) in [(Kind::Rfc, Status::Done), (Kind::Note, Status::Todo)] {
+        assert!(
+            store
+                .update(
+                    &current.artifact.id,
+                    &current.revision,
+                    ArtifactPatch {
+                        kind: Some(kind),
+                        status: Some(status),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(store.get(&current.artifact.id).unwrap(), current);
+    }
+}
+
+#[test]
+fn legacy_workflows_migrate_by_kind_without_writing_until_an_explicit_edit() {
+    let (_dir, store) = fixture();
+    for schema in 3..=5 {
+        for kind in Kind::ALL {
+            let cases: &[(bool, Option<&str>)] = if schema == 5 {
+                &[
+                    (false, Some("planned")),
+                    (false, Some("in_progress")),
+                    (false, Some("done")),
+                ]
+            } else {
+                &[(false, None), (true, None)]
+            };
+            for &(archived, status) in cases {
+                let first = store
+                    .create(NewArtifact {
+                        kind,
+                        ..input("repo")
+                    })
+                    .unwrap();
+                let dir = store.checked_path(Some(&first.artifact.id)).unwrap();
+                let path = dir.join(if schema == 3 {
+                    "artifact.json"
+                } else {
+                    "artifact.md"
+                });
+                let mut metadata = serde_json::to_value(&first.artifact).unwrap();
+                metadata["schemaVersion"] = schema.into();
+                metadata.as_object_mut().unwrap().remove("status");
+                if let Some(status) = status {
+                    metadata["status"] = status.into();
+                } else {
+                    metadata["archived"] = archived.into();
+                }
+                let text = if schema == 3 {
+                    fs::remove_file(dir.join("artifact.md")).unwrap();
+                    serde_json::to_string_pretty(&metadata).unwrap()
+                } else {
+                    metadata.as_object_mut().unwrap().remove("content");
+                    format!(
+                        "---\n{}\n---\n{}",
+                        serde_json::to_string_pretty(&metadata).unwrap(),
+                        first.artifact.content
+                    )
+                };
+                fs::write(&path, &text).unwrap();
+                let migrated = store.get(&first.artifact.id).unwrap();
+                let expected = match kind {
+                    Kind::Plan => Some(match (archived, status) {
+                        (true, _) | (_, Some("done")) => Status::Done,
+                        (_, Some("in_progress")) => Status::InProgress,
+                        _ => Status::Todo,
+                    }),
+                    Kind::Rfc => Some(match (archived, status) {
+                        (true, _) | (_, Some("done")) => Status::Implemented,
+                        (_, Some("in_progress")) => Status::Approved,
+                        _ => Status::ToReview,
+                    }),
+                    _ => None,
+                };
+                assert_eq!(migrated.artifact.status, expected);
+                assert_eq!(fs::read_to_string(&path).unwrap(), text);
+                let rewritten = store
+                    .update(
+                        &first.artifact.id,
+                        &migrated.revision,
+                        ArtifactPatch::default(),
+                    )
+                    .unwrap();
+                assert_eq!(rewritten.artifact.status, expected);
+                let raw = fs::read_to_string(dir.join("artifact.md")).unwrap();
+                assert!(!raw.contains("\"archived\""));
+                assert_eq!(raw.contains("\"status\""), expected.is_some());
+                assert_eq!(rewritten.artifact.schema_version, SCHEMA_VERSION);
+                assert_eq!(store.get(&first.artifact.id).unwrap(), rewritten);
+            }
+        }
+    }
 }
 #[test]
 fn comments_lifecycle_preserves_document_and_sessions_and_rejects_stale_writes() {

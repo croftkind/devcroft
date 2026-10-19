@@ -286,11 +286,10 @@ fn resolve_details(
                     "{} · {}{}",
                     artifact.kind.label(),
                     artifact.repository.unwrap_or_else(|| "Unassociated".into()),
-                    if artifact.archived {
-                        " · Archived"
-                    } else {
-                        ""
-                    }
+                    artifact
+                        .status
+                        .map(|status| format!(" · {}", status.label()))
+                        .unwrap_or_default()
                 ),
             }
         }

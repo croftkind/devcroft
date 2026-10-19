@@ -442,7 +442,10 @@ mod tests {
 
     #[test]
     fn swift_files_highlight_in_both_appearance_variants() {
-        assert_eq!(syntax_for_path("Sources/ContentView.swift").unwrap().name, "Swift");
+        assert_eq!(
+            syntax_for_path("Sources/ContentView.swift").unwrap().name,
+            "Swift"
+        );
         let highlights = highlight(&swift_diff());
         for dark in [false, true] {
             for line in [0, 1] {

@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use serde_json::json;
 
-use crate::cli::resources::{ArtifactArgs, ArtifactCommand, KindArg};
+use crate::cli::resources::{ArtifactArgs, ArtifactCommand, KindArg, StatusArg};
 use crate::data::artifacts::{self, ArtifactPatch, ArtifactStore, NewArtifact};
 
 use super::{input, output};
@@ -16,6 +16,17 @@ fn kind(value: KindArg) -> artifacts::Kind {
     }
 }
 
+fn status(value: StatusArg) -> artifacts::Status {
+    match value {
+        StatusArg::Todo => artifacts::Status::Todo,
+        StatusArg::InProgress => artifacts::Status::InProgress,
+        StatusArg::Done => artifacts::Status::Done,
+        StatusArg::ToReview => artifacts::Status::ToReview,
+        StatusArg::Approved => artifacts::Status::Approved,
+        StatusArg::Implemented => artifacts::Status::Implemented,
+    }
+}
+
 pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
     let store = ArtifactStore::new(&crate::data::resolve_data_root()?);
     let snapshot = match args.command {
@@ -24,7 +35,7 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
                 .list(&artifacts::ListOptions {
                     repository: options.repository,
                     space: options.space,
-                    include_archived: options.include_archived,
+                    status: options.status.map(status),
                     limit: Some(options.bounds.limit.into()),
                 })
                 .context("listing artifacts")?;
@@ -84,6 +95,7 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
                 title: input_args.title,
                 kind: kind(input_args.kind),
                 content: input::content(&input_args.content_file)?,
+                status: input_args.status.map(status),
             })
             .context("creating artifact")?,
         ArtifactCommand::Update(patch) => store
@@ -96,15 +108,13 @@ pub(crate) fn artifact(args: ArtifactArgs) -> Result<()> {
                     title: patch.title,
                     kind: patch.kind.map(kind),
                     content: input::text_patch(patch.content_file.as_deref(), patch.clear_content)?,
+                    status: patch.status.map(status),
                 },
             )
             .context("updating artifact")?,
-        ArtifactCommand::Archive(record) => store
-            .set_archived(&record.id, &record.revision, true)
-            .context("archiving artifact")?,
-        ArtifactCommand::Unarchive(record) => store
-            .set_archived(&record.id, &record.revision, false)
-            .context("unarchiving artifact")?,
+        ArtifactCommand::Status(args) => store
+            .set_status(&args.record.id, &args.record.revision, status(args.status))
+            .context("updating artifact status")?,
         ArtifactCommand::Delete(record) => {
             store
                 .delete(&record.id, &record.revision)

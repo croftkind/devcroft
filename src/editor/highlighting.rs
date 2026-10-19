@@ -106,7 +106,10 @@ service FleetService {
 
     /// Resolve a Swift path exactly as the editor does (see above).
     fn resolve_swift() {
-        assert_eq!(language_for(Path::new("Sources/ContentView.swift")), "swift");
+        assert_eq!(
+            language_for(Path::new("Sources/ContentView.swift")),
+            "swift"
+        );
     }
 
     #[test]

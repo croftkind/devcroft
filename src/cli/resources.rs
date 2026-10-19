@@ -148,18 +148,16 @@ pub(crate) struct ArtifactArgs {
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 pub(crate) enum ArtifactCommand {
-    /// List standalone artifacts; archived records are excluded by default.
+    /// List standalone artifacts, optionally filtered by status.
     List(ListArgs),
-    /// Read current metadata and Markdown, including archived artifacts.
+    /// Read current metadata and Markdown.
     Get(IdArgs),
     /// Create a standalone RFC, plan, note, or review from UTF-8 Markdown.
     Create(ArtifactCreateArgs),
     /// Patch metadata and/or Markdown with one revision-checked mutation.
     Update(ArtifactUpdateArgs),
-    /// Hide an artifact from default lists without breaking existing links.
-    Archive(RevisionArgs),
-    /// Restore an artifact to default lists.
-    Unarchive(RevisionArgs),
+    /// Move an artifact to a new status without touching its content.
+    Status(ArtifactStatusArgs),
     /// Permanently delete an artifact and its comments.
     Delete(RevisionArgs),
     /// Read and manage artifact feedback.
@@ -182,9 +180,9 @@ pub(crate) struct ListArgs {
     pub(crate) space: Option<String>,
     #[command(flatten)]
     pub(crate) bounds: LimitArgs,
-    /// Include archived records as well as active ones.
-    #[arg(long)]
-    pub(crate) include_archived: bool,
+    /// Only list artifacts with this status; absent lists every status.
+    #[arg(long, value_enum)]
+    pub(crate) status: Option<StatusArg>,
 }
 
 #[derive(Debug, PartialEq, Eq, Args)]
@@ -211,6 +209,17 @@ pub(crate) enum KindArg {
     Tutorial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum StatusArg {
+    Todo,
+    #[value(name = "in-progress")]
+    InProgress,
+    Done,
+    ToReview,
+    Approved,
+    Implemented,
+}
+
 #[derive(Debug, PartialEq, Eq, Args)]
 pub(crate) struct ArtifactCreateArgs {
     /// Portable repository key.
@@ -223,6 +232,10 @@ pub(crate) struct ArtifactCreateArgs {
     pub(crate) title: String,
     #[arg(long, value_enum)]
     pub(crate) kind: KindArg,
+    /// Plan: todo (default), in-progress, done. RFC: to-review (default), approved, implemented.
+    /// Other artifact kinds do not support status.
+    #[arg(long, value_enum)]
+    pub(crate) status: Option<StatusArg>,
     /// UTF-8 Markdown for rfc/plan/note/review, or a self-contained HTML
     /// document for tutorial; - for stdin (maximum 4 MiB; empty Markdown is valid).
     #[arg(long, value_name = "PATH|-")]
@@ -249,6 +262,18 @@ pub(crate) struct ArtifactUpdateArgs {
     /// Explicitly replace content with an empty string (Markdown kinds only).
     #[arg(long, conflicts_with = "content_file")]
     pub(crate) clear_content: bool,
+    /// Plan: todo, in-progress, done. RFC: to-review, approved, implemented.
+    #[arg(long, value_enum)]
+    pub(crate) status: Option<StatusArg>,
+}
+
+#[derive(Debug, PartialEq, Eq, Args)]
+pub(crate) struct ArtifactStatusArgs {
+    #[command(flatten)]
+    pub(crate) record: RevisionArgs,
+    /// Plan: todo, in-progress, done. RFC: to-review, approved, implemented.
+    #[arg(long, value_enum)]
+    pub(crate) status: StatusArg,
 }
 
 #[cfg(test)]

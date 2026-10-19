@@ -67,7 +67,6 @@ use crate::review::ReviewView;
 use crate::settings::SettingsView;
 use crate::tools::{ToolKind, ToolView};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Confirm, DialogFooter};
 use gpui_kit::component::scroll::ScrollableElement as _;
 
@@ -3981,20 +3980,14 @@ impl Render for Workspace {
         let active_content = self.render_active_content(cx);
         // Resources and Artifacts full-pages share the repository workspace
         // chrome: title and back navigation live here, not in a second row.
-        // The archived filter also lives here; the portable git status is
-        // hidden on these pages and the lists stay live through their active
-        // polls.
+        // The portable git status is hidden on these pages and the lists
+        // stay live through their active polls.
         let is_artifacts = self.home_visible
             && !self.relationships_visible
             && self.home.read(cx).is_artifacts_page();
         let is_projects = self.home_visible
             && !self.relationships_visible
             && self.home.read(cx).is_projects_page();
-        let show_archived = if is_artifacts {
-            self.home.read(cx).artifacts_include_archived(cx)
-        } else {
-            false
-        };
         let artifacts_back = if is_artifacts {
             self.artifacts_back_label()
         } else {
@@ -4405,19 +4398,6 @@ impl Render for Workspace {
                                 )
                             }),
                     )
-                    .when(is_artifacts, |header| {
-                        header.child(
-                            Checkbox::new("show-archived-artifacts")
-                                .label("Show archived")
-                                .checked(show_archived)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    let checked = *checked;
-                                    this.home.update(cx, |view, cx| {
-                                        view.set_artifacts_archived(checked, cx)
-                                    });
-                                })),
-                        )
-                    })
                     .when(self.home_visible && !is_home_page, |header| {
                         let status = self.portable_git_poll.status();
                         // Just the state tag — branch and counts live in the

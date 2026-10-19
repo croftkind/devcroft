@@ -538,15 +538,6 @@ impl HomeView {
         paths
     }
 
-    pub(crate) fn artifacts_include_archived(&self, cx: &gpui_kit::App) -> bool {
-        self.artifacts.read(cx).include_archived()
-    }
-
-    pub(crate) fn set_artifacts_archived(&self, include: bool, cx: &mut Context<Self>) {
-        self.artifacts
-            .update(cx, |view, cx| view.set_include_archived(include, cx));
-    }
-
     pub(crate) fn set_palette_open(&mut self, open: bool, cx: &mut Context<Self>) {
         self.artifacts
             .update(cx, |view, cx| view.set_palette_open(open, cx));

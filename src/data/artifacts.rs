@@ -20,7 +20,41 @@ use super::store_lock::{artifact_lock, ensure_directory, portable_gate, reject_s
 pub(crate) mod anchors;
 pub(crate) use anchors::CommentAnchor;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Status {
+    #[serde(alias = "planned")]
+    Todo,
+    InProgress,
+    Done,
+    ToReview,
+    Approved,
+    Implemented,
+}
+
+impl Status {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Todo,
+        Self::InProgress,
+        Self::Done,
+        Self::ToReview,
+        Self::Approved,
+        Self::Implemented,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Todo => "Todo",
+            Self::InProgress => "In Progress",
+            Self::Done => "Done",
+            Self::ToReview => "To Review",
+            Self::Approved => "Approved",
+            Self::Implemented => "Implemented",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +67,18 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    pub(crate) fn statuses(self) -> &'static [Status] {
+        match self {
+            Self::Plan => &[Status::Todo, Status::InProgress, Status::Done],
+            Self::Rfc => &[Status::ToReview, Status::Approved, Status::Implemented],
+            Self::Note | Self::Review | Self::Tutorial => &[],
+        }
+    }
+
+    pub(crate) fn default_status(self) -> Option<Status> {
+        self.statuses().first().copied()
+    }
+
     pub(crate) const ALL: [Self; 5] = [
         Self::Rfc,
         Self::Plan,
@@ -92,8 +138,8 @@ pub(crate) struct Artifact {
     pub(crate) sessions: Vec<OriginSession>,
     #[serde(default)]
     pub(crate) comments: Vec<Comment>,
-    #[serde(default)]
-    pub(crate) archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) status: Option<Status>,
     pub(crate) created_at: u64,
     pub(crate) updated_at: u64,
     #[serde(flatten)]
@@ -120,6 +166,19 @@ impl Artifact {
         );
         validate_id(&self.id)?;
         nonblank(&self.title, "artifact title")?;
+        match self.status {
+            Some(status) => ensure!(
+                self.kind.statuses().contains(&status),
+                "status {} is not supported for {} artifacts",
+                status.label(),
+                self.kind.label()
+            ),
+            None => ensure!(
+                self.kind.statuses().is_empty(),
+                "{} artifacts require a workflow status",
+                self.kind.label()
+            ),
+        }
         if self.kind == Kind::Tutorial {
             ensure!(
                 !self.content.trim().is_empty(),
@@ -162,6 +221,7 @@ pub(crate) struct NewArtifact {
     pub(crate) title: String,
     pub(crate) kind: Kind,
     pub(crate) content: String,
+    pub(crate) status: Option<Status>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -171,6 +231,7 @@ pub(crate) struct ArtifactPatch {
     pub(crate) title: Option<String>,
     pub(crate) kind: Option<Kind>,
     pub(crate) content: Option<String>,
+    pub(crate) status: Option<Status>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -186,7 +247,7 @@ pub(crate) struct ListOptions {
     /// (before the limit is applied, so another space's records cannot
     /// consume the page). `None` lists every space.
     pub(crate) space: Option<String>,
-    pub(crate) include_archived: bool,
+    pub(crate) status: Option<Status>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -245,7 +306,7 @@ impl ArtifactStore {
                 space: String::new(),
                 sessions: input.sessions.clone(),
                 comments: Vec::new(),
-                archived: false,
+                status: input.status.or_else(|| input.kind.default_status()),
                 created_at: now,
                 updated_at: now,
                 extra: BTreeMap::new(),
@@ -319,7 +380,9 @@ impl ArtifactStore {
             let id = entry.file_name().to_string_lossy().into_owned();
             match self.read(&id, &spaces) {
                 Ok(snapshot)
-                    if (options.include_archived || !snapshot.artifact.archived)
+                    if options
+                        .status
+                        .is_none_or(|status| snapshot.artifact.status == Some(status))
                         && options.repository.as_ref().is_none_or(|key| {
                             snapshot.artifact.repository.as_ref() == Some(key)
                         })
@@ -373,22 +436,23 @@ impl ArtifactStore {
                     (artifact.kind == Kind::Tutorial) == (v == Kind::Tutorial),
                     "artifact kind cannot change between tutorial and Markdown formats"
                 );
-                artifact.kind = v;
+                if artifact.kind != v {
+                    artifact.kind = v;
+                    artifact.status = v.default_status();
+                }
             }
             if let Some(v) = patch.content {
                 artifact.content = v;
+            }
+            if let Some(v) = patch.status {
+                artifact.status = Some(v);
             }
             Ok(())
         })
     }
 
-    pub(crate) fn set_archived(
-        &self,
-        id: &str,
-        revision: &str,
-        archived: bool,
-    ) -> Result<Snapshot> {
-        self.mutate(id, revision, |artifact| artifact.archived = archived)
+    pub(crate) fn set_status(&self, id: &str, revision: &str, status: Status) -> Result<Snapshot> {
+        self.mutate(id, revision, |artifact| artifact.status = Some(status))
     }
 
     pub(crate) fn delete(&self, id: &str, revision: &str) -> Result<()> {
@@ -585,14 +649,38 @@ impl ArtifactStore {
                 "unsupported split artifact representation; record was not modified"
             );
             let bytes = read_bounded(&dir.join("artifact.json"))?;
-            let mut artifact: Artifact = serde_json::from_slice(&bytes)?;
+            let artifact: Artifact = serde_json::from_slice(&bytes)?;
             ensure!(
                 artifact.schema_version == 3,
                 "unsupported legacy artifact schema"
             );
-            artifact.schema_version = SCHEMA_VERSION;
             (bytes, artifact)
         };
+        // Older records used an archived flag (schemas 3/4) or the same
+        // three statuses for every kind (schema 5). Normalize these in memory;
+        // the file upgrades only on the next explicit write.
+        let archived = artifact
+            .extra
+            .remove("archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if matches!(artifact.schema_version, 3..=5) {
+            artifact.status = match artifact.kind {
+                Kind::Plan => Some(if archived {
+                    Status::Done
+                } else {
+                    artifact.status.unwrap_or(Status::Todo)
+                }),
+                Kind::Rfc => Some(match (archived, artifact.status) {
+                    (true, _) | (_, Some(Status::Done)) => Status::Implemented,
+                    (_, Some(Status::InProgress)) => Status::Approved,
+                    (_, None | Some(Status::Todo)) => Status::ToReview,
+                    (_, Some(status)) => status,
+                }),
+                Kind::Note | Kind::Review | Kind::Tutorial => None,
+            };
+            artifact.schema_version = SCHEMA_VERSION;
+        }
         artifact.validate()?;
         ensure!(
             artifact.id == id,

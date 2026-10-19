@@ -154,7 +154,138 @@ fn resource_and_feedback_workflow_without_desktop() {
         ],
     );
     assert_eq!(updated["artifact"]["repository"], "other");
+    assert_eq!(updated["artifact"]["status"], "todo");
+    let done = json(
+        &root,
+        &[
+            "artifact",
+            "status",
+            id,
+            "--revision",
+            updated["revision"].as_str().unwrap(),
+            "--status",
+            "done",
+            "--json",
+        ],
+    );
+    assert_eq!(done["artifact"]["status"], "done");
+    let filtered = json(
+        &root,
+        &[
+            "artifact",
+            "list",
+            "--repository",
+            "other",
+            "--status",
+            "done",
+            "--json",
+        ],
+    );
+    assert_eq!(filtered["artifacts"].as_array().unwrap().len(), 1);
+    let todo = json(
+        &root,
+        &[
+            "artifact",
+            "list",
+            "--repository",
+            "other",
+            "--status",
+            "todo",
+            "--json",
+        ],
+    );
+    assert!(todo["artifacts"].as_array().unwrap().is_empty());
 }
+#[test]
+fn artifact_workflows_validate_kind_and_omit_status_for_other_kinds() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("data");
+    let repository = root.join("portable/repositories/repo");
+    fs::create_dir_all(&repository).unwrap();
+    fs::write(repository.join("repository.json"), "{}").unwrap();
+    let content = temp.path().join("content.md");
+    fs::write(&content, "# Artifact").unwrap();
+    for (kind, statuses) in [
+        ("plan", &["todo", "in-progress", "done"][..]),
+        ("rfc", &["to-review", "approved", "implemented"][..]),
+        ("note", &[][..]),
+        ("review", &[][..]),
+        ("tutorial", &[][..]),
+    ] {
+        let args = [
+            "artifact",
+            "create",
+            "--repository",
+            "repo",
+            "--title",
+            kind,
+            "--kind",
+            kind,
+            "--content-file",
+            content.to_str().unwrap(),
+            "--json",
+        ];
+        let mut current = json(&root, &args);
+        assert_eq!(
+            current["artifact"].get("status").is_some(),
+            !statuses.is_empty()
+        );
+        if let Some(default) = statuses.first() {
+            assert_eq!(current["artifact"]["status"], default.replace('-', "_"));
+        }
+        for status in statuses {
+            current = json(
+                &root,
+                &[
+                    "artifact",
+                    "status",
+                    current["artifact"]["id"].as_str().unwrap(),
+                    "--revision",
+                    current["revision"].as_str().unwrap(),
+                    "--status",
+                    status,
+                    "--json",
+                ],
+            );
+            assert_eq!(current["artifact"]["status"], status.replace('-', "_"));
+        }
+        let id = current["artifact"]["id"].as_str().unwrap();
+        let invalid = if kind == "plan" { "approved" } else { "todo" };
+        for command in ["status", "update"] {
+            let failed = run(
+                &root,
+                &[
+                    "artifact",
+                    command,
+                    id,
+                    "--revision",
+                    current["revision"].as_str().unwrap(),
+                    "--status",
+                    invalid,
+                    "--json",
+                ],
+            );
+            assert!(!failed.status.success());
+            assert!(failed.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&failed.stderr).contains("not supported"));
+        }
+        assert_eq!(json(&root, &["artifact", "get", id, "--json"]), current);
+        let summary = run(&root, &["artifact", "get", id]);
+        assert!(summary.status.success());
+        let summary = String::from_utf8(summary.stdout).unwrap();
+        assert_eq!(summary.contains("] ["), !statuses.is_empty());
+        let mut invalid_create = args.to_vec();
+        invalid_create.extend(["--status", invalid]);
+        assert!(!run(&root, &invalid_create).status.success());
+    }
+    let implemented = json(
+        &root,
+        &["artifact", "list", "--status", "implemented", "--json"],
+    );
+    assert_eq!(implemented["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(implemented["artifacts"][0]["artifact"]["kind"], "rfc");
+}
+
 #[test]
 fn task_commands_are_removed_and_repository_is_required() {
     let temp = tempfile::tempdir().unwrap();
@@ -194,8 +325,8 @@ fn desktop_block_feedback_is_discoverable_and_resolvable_headlessly() {
     fs::create_dir_all(&dir).unwrap();
     // A desktop-produced artifact fixture. CLI reads the same metadata record.
     let metadata = serde_json::json!({
-        "schemaVersion": 4, "id": "art-23456789", "title": "Block feedback", "kind": "note",
-        "archived": false, "createdAt": 1, "updatedAt": 1,
+        "schemaVersion": 6, "id": "art-23456789", "title": "Block feedback", "kind": "note",
+        "createdAt": 1, "updatedAt": 1,
         "comments": [{"id": "comment-23456789", "body": "Explain this", "resolved": false,
             "anchor": {"kind": "block", "start": 9, "end": 19, "startLine": 3, "endLine": 3,
                 "source": "Paragraph.", "prefix": "# Title\n\n", "suffix": "\n", "quote": "Paragraph",

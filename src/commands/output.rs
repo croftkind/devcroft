@@ -49,8 +49,11 @@ pub(super) fn artifact_summary(snapshot: &artifacts::Snapshot) -> String {
         "{}\t[{}] {}{}\n  Revision: {}\n",
         artifact.id,
         kind(artifact.kind),
+        artifact
+            .status
+            .map(|status| format!("[{}] ", status.label()))
+            .unwrap_or_default(),
         artifact.title,
-        if artifact.archived { " (archived)" } else { "" },
         snapshot.revision
     )
 }
