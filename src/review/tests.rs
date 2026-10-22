@@ -41,6 +41,171 @@ fn commit(root: &Path) {
     git(root, &["commit", "-m", "fixture"]);
 }
 
+#[gpui_kit::test]
+fn long_file_names_scroll_independently(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    for prefix in 0..60 {
+        fs::write(
+            dir.path()
+                .join(format!("{prefix:02}_{}.rs", "long_name_".repeat(15))),
+            "new\n",
+        )
+        .unwrap();
+    }
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let tree_scroll = view.read_with(cx, |view, cx| {
+        view.tree_state.read(cx).scroll_handle().clone()
+    });
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    cx.update(|window, cx| window.render_frame(cx));
+    let first = cx.debug_bounds("review-file-name-0").unwrap();
+    let second = cx.debug_bounds("review-file-name-1").unwrap();
+    assert!(first.size.width > px(320.), "fixture must overflow sidebar");
+    let area = cx.debug_bounds("review-name-area-0").unwrap();
+    assert!(
+        area.right() < px(320.),
+        "filename must leave room for status"
+    );
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: gpui_kit::point(px(150.), first.center().y),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(-120.), px(0.))),
+        ..Default::default()
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let moved = cx.debug_bounds("review-file-name-0").unwrap();
+    let other = cx.debug_bounds("review-file-name-1").unwrap();
+    assert_eq!(
+        moved.left(),
+        first.left() - px(120.),
+        "long filename must scroll horizontally 1:1 with the wheel delta"
+    );
+    assert_eq!(other.left(), second.left(), "other filenames must not move");
+    assert_eq!(
+        tree_scroll.0.borrow().base_handle.offset().y,
+        px(0.),
+        "horizontal gestures must not move the file list"
+    );
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: gpui_kit::point(px(150.), first.center().y),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(-10_000.), px(0.))),
+        ..Default::default()
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let at_end = cx.debug_bounds("review-file-name-0").unwrap();
+    assert_eq!(
+        at_end.right(),
+        area.right(),
+        "horizontal scroll must clamp at the end of the filename"
+    );
+    assert_eq!(
+        tree_scroll.0.borrow().base_handle.offset().y,
+        px(0.),
+        "overscrolling horizontally must not move the file list"
+    );
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: gpui_kit::point(px(150.), first.center().y),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(10_000.), px(0.))),
+        ..Default::default()
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    let at_start = cx.debug_bounds("review-file-name-0").unwrap();
+    assert_eq!(
+        at_start.left(),
+        first.left(),
+        "horizontal scroll must clamp at the start of the filename"
+    );
+    assert_eq!(
+        tree_scroll.0.borrow().base_handle.offset().y,
+        px(0.),
+        "overscrolling back to the start must not move the file list"
+    );
+    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+        position: gpui_kit::point(px(150.), first.center().y),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-120.))),
+        ..Default::default()
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    assert!(
+        tree_scroll.0.borrow().base_handle.offset().y < px(0.),
+        "vertical wheel must scroll the file list"
+    );
+}
+
+#[gpui_kit::test]
+fn long_diff_lines_grow_without_overlapping_following_rows(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    // Include an unbroken token as well as ordinary code with spaces.
+    let source = format!(
+        "{}\n{}\n{}",
+        "identifier".repeat(100),
+        "let value = 42; ".repeat(80),
+        "short\n".repeat(100)
+    );
+    fs::write(dir.path().join("a.txt"), source).unwrap();
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let row = view.read_with(cx, |view, _| {
+        let ReviewState::Loaded(loaded) = &view.state else {
+            unreachable!()
+        };
+        loaded
+            .rows
+            .iter()
+            .position(|row| {
+                let stream::StreamRow::Line { file, hunk, line } = *row else {
+                    return false;
+                };
+                let model::FileContent::Text { hunks, .. } = &loaded.diff.files[file].content
+                else {
+                    return false;
+                };
+                hunks[hunk].lines[line].new_no == Some(1)
+            })
+            .unwrap()
+    });
+    let render_view = view.clone();
+    let (_, cx) = cx
+        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
+    cx.simulate_resize(gpui_kit::size(px(900.), px(900.)));
+    cx.update(|window, cx| window.render_frame(cx));
+    let first_selector = format!("review-row-{row}").leak();
+    let first = cx.debug_bounds(first_selector).unwrap();
+    assert!(
+        first.size.height > px(stream::ROW_H),
+        "long tokens must wrap"
+    );
+    let next_selector = format!("review-row-{}", row + 1).leak();
+    let next = cx.debug_bounds(next_selector).unwrap();
+    assert!(next.size.height > px(stream::ROW_H), "long code must wrap");
+    assert!(
+        next.top() >= first.bottom(),
+        "wrapped rows must not overlap"
+    );
+    cx.simulate_resize(gpui_kit::size(px(1600.), px(900.)));
+    cx.update(|window, cx| window.render_frame(cx));
+    let wider = cx.debug_bounds(first_selector).unwrap();
+    assert!(
+        wider.size.height < first.size.height,
+        "widening must reflow wrapped rows"
+    );
+    view.update(cx, |view, _| {
+        view.list_handle.scroll_to(ListOffset {
+            item_ix: row,
+            offset_in_item: px(48.),
+        });
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    view.read_with(cx, |view, _| {
+        let top = view.list_handle.logical_scroll_top();
+        assert_eq!(top.item_ix, row);
+        assert_eq!(top.offset_in_item, px(48.));
+    });
+}
+
 fn assert_progress(view: &ReviewView, path: &str, viewed: bool, collapsed: bool) {
     assert_eq!(
         view.viewed.borrow().contains(path),

@@ -2,7 +2,7 @@
 //!
 //! The stream flattens a loaded diff into [`StreamRow`]s once per load
 //! ([`flatten`]); the view renders only the visible window through
-//! a variable-height list. Diff rows are [`ROW_H`] tall; the view can append
+//! a variable-height list. Diff rows are at least [`ROW_H`] tall; the view can append
 //! an inline comment editor to the row at the end of a selected range.
 //! Per-load flattening plus per-frame visible-only rendering is what keeps
 //! large diffs smooth: fully expanded, a big review would otherwise be tens
@@ -29,7 +29,7 @@ use super::model::{
     ChangedFile, FileStatus, Hunk, HunkLine, LineTag, ReviewDiff, UnavailableReason,
 };
 
-/// Height of every diff content row. File headers use [`FILE_HEADER_H`] so
+/// Minimum height of a diff content row. File headers use [`FILE_HEADER_H`] so
 /// they stand out from code lines (see module docs).
 pub(crate) const ROW_H: f32 = 24.0;
 /// Tint of a removed line. Shared so the diff tool's cells read as the same
@@ -252,6 +252,7 @@ pub(crate) fn file_header_row(
         )
         .child(
             div()
+                .flex_none()
                 .text_xs()
                 .font_semibold()
                 .text_color(rgb(status_color(file.status)))
@@ -336,12 +337,11 @@ fn line_row(
     let open_line = line.new_no;
     let open_view = view.clone();
     div()
-        .h(px(ROW_H))
+        .min_h(px(ROW_H))
         .flex_none()
         .flex()
         .flex_row()
-        .items_center()
-        .overflow_hidden()
+        .items_start()
         .whitespace_nowrap()
         .font_family(TERMINAL_FONT_FAMILY)
         .text_size(px(review_font_size()))
@@ -383,7 +383,7 @@ fn line_row(
                 .child(sign),
         )
         .child(
-            div().flex_1().min_w_0().child(
+            div().flex_1().min_w_0().whitespace_normal().child(
                 StyledText::new(line.text.clone())
                     .with_highlights(super::syntax::styled_highlights(spans)),
             ),
