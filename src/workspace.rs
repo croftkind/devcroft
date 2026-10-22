@@ -1029,18 +1029,24 @@ impl Workspace {
         self.editor_preference = choice;
         if !self.home_visible {
             self.editor_instance = Some(choice);
-            if choice == EditorChoice::BuiltIn && self.native_editor.is_none() {
-                let external_editors = self.external_editors.clone();
-                let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
-                self.native_editor = Some(cx.new(|cx| {
-                    NativeEditor::new(
-                        &self.working_directory,
-                        external_editors,
-                        draft_root.as_deref(),
-                        window,
-                        cx,
-                    )
-                }));
+            if choice == EditorChoice::BuiltIn {
+                if let Some(editor) = self.native_editor.as_ref() {
+                    if self.active_tab == WorkspaceTab::Editor {
+                        editor.update(cx, |editor, cx| editor.activate(window, cx));
+                    }
+                } else {
+                    let external_editors = self.external_editors.clone();
+                    let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
+                    self.native_editor = Some(cx.new(|cx| {
+                        NativeEditor::new(
+                            &self.working_directory,
+                            external_editors,
+                            draft_root.as_deref(),
+                            window,
+                            cx,
+                        )
+                    }));
+                }
             }
             if choice == EditorChoice::Neovim && self.tabs[WorkspaceTab::Editor as usize].is_none()
             {
@@ -2049,18 +2055,24 @@ impl Workspace {
         if self.editor_instance.is_none() {
             self.editor_instance = Some(self.editor_preference);
         }
-        if self.editor_instance == Some(EditorChoice::BuiltIn) && self.native_editor.is_none() {
-            let external_editors = self.external_editors.clone();
-            let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
-            self.native_editor = Some(cx.new(|cx| {
-                NativeEditor::new(
-                    &self.working_directory,
-                    external_editors,
-                    draft_root.as_deref(),
-                    window,
-                    cx,
-                )
-            }));
+        if self.editor_instance == Some(EditorChoice::BuiltIn) {
+            if let Some(editor) = self.native_editor.as_ref() {
+                if self.active_tab == WorkspaceTab::Editor {
+                    editor.update(cx, |editor, cx| editor.activate(window, cx));
+                }
+            } else {
+                let external_editors = self.external_editors.clone();
+                let draft_root = self.data_root.as_ref().map(|root| root.root().to_owned());
+                self.native_editor = Some(cx.new(|cx| {
+                    NativeEditor::new(
+                        &self.working_directory,
+                        external_editors,
+                        draft_root.as_deref(),
+                        window,
+                        cx,
+                    )
+                }));
+            }
         }
         self.refresh_review_editor_action(cx);
         self.sync_git_view(cx);

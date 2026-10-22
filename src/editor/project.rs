@@ -1,20 +1,162 @@
 //! Bounded checkout discovery for the built-in editor. The same index feeds
 //! the file tree, fuzzy opener, and text search, so all three honor ignores.
 
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use std::{
     fs,
     io::Read as _,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const MAX_FILES: usize = 100_000;
 const MAX_SEARCH_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RESULTS: usize = 200;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ProjectFile {
     pub path: PathBuf,
     pub label: String,
+}
+
+pub(super) fn is_git_component(part: &std::ffi::OsStr) -> bool {
+    part.to_string_lossy()
+        .trim_end_matches(['.', ' '])
+        .eq_ignore_ascii_case(".git")
+}
+
+fn build_gitignore(checkout: &Path, exclude_files: &[PathBuf]) -> ignore::gitignore::Gitignore {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(checkout);
+    let _ = builder.add(checkout.join(".gitignore"));
+    for exclude in exclude_files {
+        let _ = builder.add(exclude);
+    }
+    builder
+        .build()
+        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
+}
+
+pub(super) struct FileChanges {
+    watcher: Option<RecommendedWatcher>,
+    changed: Arc<AtomicBool>,
+}
+
+impl FileChanges {
+    pub(super) fn new(root: &Path) -> Self {
+        let changed = Arc::new(AtomicBool::new(false));
+        let pending = changed.clone();
+        let checkout = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+        let git_dirs = match gix::discover(&checkout) {
+            Ok(repo) => vec![repo.git_dir().to_owned(), repo.common_dir().to_owned()],
+            Err(_) => Vec::new(),
+        };
+        let exclude_files: Vec<PathBuf> = git_dirs
+            .iter()
+            .map(|dir| dir.join("info/exclude"))
+            .collect();
+        let watched_checkout = checkout.clone();
+        let watched_git_dirs = git_dirs.clone();
+        let mut gitignore = build_gitignore(&checkout, &exclude_files);
+        let watcher = (|| -> notify::Result<RecommendedWatcher> {
+            let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+                if event.map_or(true, |event| {
+                    affects_project(
+                        &watched_checkout,
+                        &watched_git_dirs,
+                        &exclude_files,
+                        &mut gitignore,
+                        &event,
+                    )
+                }) {
+                    pending.store(true, Ordering::Release);
+                }
+            })?;
+            watcher.watch(&checkout, RecursiveMode::Recursive)?;
+            for git_dir in &git_dirs {
+                if !git_dir.starts_with(&checkout) {
+                    let info_dir = git_dir.join("info");
+                    if info_dir.is_dir() {
+                        let _ = watcher.watch(&info_dir, RecursiveMode::NonRecursive);
+                    }
+                }
+            }
+            Ok(watcher)
+        })()
+        .ok();
+        Self { watcher, changed }
+    }
+
+    pub(super) fn take_changed(&self) -> bool {
+        // Fall back to polling when the platform cannot watch this checkout.
+        self.watcher.is_none() || self.changed.swap(false, Ordering::AcqRel)
+    }
+
+    pub(super) fn mark_changed(&self) {
+        self.changed.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_watching(&self) -> bool {
+        self.watcher.is_some()
+    }
+}
+
+fn affects_project(
+    checkout: &Path,
+    git_dirs: &[PathBuf],
+    exclude_files: &[PathBuf],
+    gitignore: &mut ignore::gitignore::Gitignore,
+    event: &Event,
+) -> bool {
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
+    if event.paths.is_empty() {
+        return true;
+    }
+    if event.paths.iter().any(|path| {
+        path.file_name().is_some_and(|name| name == ".gitignore")
+            || exclude_files.iter().any(|exclude| path == exclude)
+    }) {
+        *gitignore = build_gitignore(checkout, exclude_files);
+        return true;
+    }
+    let is_dir_event = matches!(
+        event.kind,
+        EventKind::Create(notify::event::CreateKind::Folder)
+            | EventKind::Remove(notify::event::RemoveKind::Folder)
+    );
+    event.paths.iter().any(|path| {
+        if git_dirs.iter().any(|dir| path.starts_with(dir)) {
+            return false;
+        }
+        if let Ok(relative) = path.strip_prefix(checkout) {
+            if relative
+                .components()
+                .any(|component| is_git_component(component.as_os_str()))
+            {
+                return false;
+            }
+            // A top-level ignored directory (such as `target/` or `node_modules/`)
+            // is pruned at the root by `WalkBuilder` and cannot be re-included by a
+            // nested `.gitignore`. A root-level file has no nested `.gitignore`
+            // below it either.
+            let mut components = relative.components();
+            if let Some(first) = components.next() {
+                let is_nested = components.next().is_some();
+                if gitignore
+                    .matched(Path::new(first.as_os_str()), is_nested || is_dir_event || path.is_dir())
+                    .is_ignore()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +246,7 @@ pub(super) fn scan(root: &Path) -> Vec<ProjectFile> {
         .parents(true)
         .require_git(false)
         .filter_entry(move |entry| {
-            if entry.file_name() == ".git" {
+            if is_git_component(entry.file_name()) {
                 return false;
             }
             !(entry.file_type().is_some_and(|kind| kind.is_dir())
@@ -441,5 +583,75 @@ mod tests {
                 .items
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn project_watch_ignores_reads_git_internals_and_ignored_build_outputs_but_tracks_worktree() {
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), "/target/\n*.log\nignored.txt\n").unwrap();
+        let git_dirs = [root.join(".git")];
+        let exclude_files = [root.join(".git/info/exclude")];
+        let mut gitignore = ignore::gitignore::Gitignore::empty();
+        for access_path in ["src/main.rs", ".gitignore", ".git/info/exclude"] {
+            assert!(!affects_project(
+                root,
+                &git_dirs,
+                &exclude_files,
+                &mut gitignore,
+                &Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
+                    .add_path(root.join(access_path))
+            ));
+        }
+        assert!(
+            !gitignore.matched(Path::new("ignored.txt"), false).is_ignore(),
+            "Access(Open) on .gitignore must not rebuild the matcher"
+        );
+        assert!(affects_project(
+            root,
+            &git_dirs,
+            &exclude_files,
+            &mut gitignore,
+            &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(".gitignore"))
+        ));
+        assert!(
+            gitignore.matched(Path::new("ignored.txt"), false).is_ignore(),
+            "non-access event on .gitignore rebuilds the matcher"
+        );
+        for ignored in [
+            ".git/index",
+            ".GIT/config",
+            "target/debug/deps/app.d",
+            "ignored.txt",
+        ] {
+            assert!(
+                !affects_project(
+                    root,
+                    &git_dirs,
+                    &exclude_files,
+                    &mut gitignore,
+                    &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(ignored))
+                ),
+                "expected {ignored} to be ignored by watcher"
+            );
+        }
+        for tracked in [
+            "src/new.rs",
+            "src/keep.log",
+            ".gitignore",
+            ".git/info/exclude",
+        ] {
+            assert!(
+                affects_project(
+                    root,
+                    &git_dirs,
+                    &exclude_files,
+                    &mut gitignore,
+                    &Event::new(EventKind::Create(CreateKind::Any)).add_path(root.join(tracked))
+                ),
+                "expected {tracked} to trigger project refresh"
+            );
+        }
     }
 }

@@ -35,7 +35,7 @@ use gpui_kit::component::{
         Editor, EditorState, Input, InputEvent, InputState, MoveDown, MoveUp, Position,
         ShowCompletions, highlight_characters,
     },
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -44,7 +44,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    StatefulInteractiveElement, Styled, TestSupportExt as _, Window, div, px, rgb,
 };
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -89,6 +89,7 @@ pub(crate) struct NativeEditor {
     inactive_documents: HashMap<PathBuf, StashedDocument>,
     close_pending: Option<PathBuf>,
     files: Vec<ProjectFile>,
+    created_files: HashSet<PathBuf>,
     icon_tiles: crate::review::icons::IconTiles,
     file_selection: usize,
     finder: Option<Arc<Mutex<Finder>>>,
@@ -107,9 +108,12 @@ pub(crate) struct NativeEditor {
     finder_previous: BrowserMode,
     finder_scroll: gpui_kit::UniformListScrollHandle,
     index_generation: u64,
+    scan_in_flight: bool,
+    file_changes: project::FileChanges,
     file_query: Entity<InputState>,
     text_query: Entity<InputState>,
     line_query: Entity<InputState>,
+    new_file_query: Entity<InputState>,
     search_results: Vec<TextMatch>,
     browser: BrowserMode,
     indexing: bool,
@@ -217,9 +221,42 @@ impl TreeRow {
         };
         format!("native-tree-{kind}-{}", self.key)
     }
+
+    fn directory(&self) -> String {
+        if self.file.is_some() {
+            self.key
+                .rsplit_once('/')
+                .map_or_else(String::new, |(parent, _)| parent.to_owned())
+        } else {
+            self.key.clone()
+        }
+    }
 }
 
 const TREE_PAGE_SIZE: usize = 100;
+
+fn merge_created_files(
+    canonical_root: &Path,
+    files: &mut Vec<ProjectFile>,
+    created_files: &HashSet<PathBuf>,
+) {
+    for path in created_files {
+        if files.iter().any(|file| &file.path == path) || !path.is_file() {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(canonical_root) else {
+            continue;
+        };
+        files.push(ProjectFile {
+            path: path.clone(),
+            label: relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        });
+    }
+}
 
 /// Sort the index once in the background, before rendering or paginating
 /// the tree. At each level, directories precede files and siblings sort by
@@ -390,6 +427,9 @@ impl NativeEditor {
             }
         })
         .detach();
+        let new_file_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder("path/to/file.rs"));
+        let file_changes = project::FileChanges::new(root);
         let scan_root = root.to_owned();
         cx.spawn_in(window, async move |view, cx| {
             let (files, finder) = cx
@@ -402,12 +442,16 @@ impl NativeEditor {
                 .await;
             let _ = view.update(cx, |this, cx| {
                 if this.index_generation == 0 {
+                    let mut files = files;
+                    merge_created_files(&this.canonical_root, &mut files, &this.created_files);
+                    sort_tree_files(&mut files);
                     crate::review::icons::ensure_tiles(
                         files.iter().map(|file| file.label.as_str()),
                         &mut this.icon_tiles,
                         cx,
                     );
                     this.files = files;
+                    this.scan_in_flight = false;
                     this.indexing = false;
                     this.install_finder(finder, cx);
                     cx.notify();
@@ -415,12 +459,15 @@ impl NativeEditor {
             });
         })
         .detach();
-        // Watch the open file for external edits (agents write on save). The
-        // loop lives with the entity and reads only the current document.
+        // Watch the open file and checkout index for external edits (agents
+        // and terminal commands). The loop lives with the entity.
         cx.spawn_in(window, async move |view, cx| {
             loop {
                 cx.background_executor().timer(DISK_POLL_INTERVAL).await;
-                let change = view.update(cx, |this, cx| this.detect_disk_change(cx));
+                let change = view.update(cx, |this, cx| {
+                    this.refresh_files_if_changed(cx);
+                    this.detect_disk_change(cx)
+                });
                 let Ok(change) = change else {
                     break;
                 };
@@ -505,6 +552,7 @@ impl NativeEditor {
             inactive_documents,
             close_pending: None,
             files: Vec::new(),
+            created_files: HashSet::new(),
             icon_tiles: HashMap::new(),
             file_selection: 0,
             finder: None,
@@ -523,9 +571,12 @@ impl NativeEditor {
             finder_previous: BrowserMode::Tree,
             finder_scroll: gpui_kit::UniformListScrollHandle::new(),
             index_generation: 0,
+            scan_in_flight: true,
+            file_changes,
             file_query,
             text_query,
             line_query,
+            new_file_query,
             search_results: Vec::new(),
             browser: BrowserMode::Tree,
             indexing: true,
@@ -779,6 +830,58 @@ impl NativeEditor {
         cx.notify();
     }
 
+    pub(crate) fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.check_disk(window, cx);
+        self.refresh_files_if_changed(cx);
+    }
+
+    pub(crate) fn refresh_files_if_changed(&mut self, cx: &mut Context<Self>) {
+        if !self.scan_in_flight && self.file_changes.take_changed() {
+            self.refresh_files_in_background(cx);
+        }
+    }
+
+    fn refresh_files_in_background(&mut self, cx: &mut Context<Self>) {
+        self.index_generation += 1;
+        let generation = self.index_generation;
+        self.scan_in_flight = true;
+        self.file_changes.take_changed();
+        let root = self.root.clone();
+        let canonical_root = self.canonical_root.clone();
+        let created_files = self.created_files.clone();
+        cx.spawn(async move |view, cx| {
+            let (files, finder) = cx
+                .background_spawn(async move {
+                    let mut files = project::scan(&root);
+                    merge_created_files(&canonical_root, &mut files, &created_files);
+                    let finder = Finder::new(&files);
+                    sort_tree_files(&mut files);
+                    (files, finder)
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.index_generation == generation {
+                    this.scan_in_flight = false;
+                    this.indexing = false;
+                    let files_changed = this.files != files;
+                    if files_changed || this.finder.is_none() {
+                        crate::review::icons::ensure_tiles(
+                            files.iter().map(|file| file.label.as_str()),
+                            &mut this.icon_tiles,
+                            cx,
+                        );
+                        this.files = files;
+                        this.install_finder(finder, cx);
+                        cx.notify();
+                    } else if this.browser == BrowserMode::Text {
+                        this.search_project(cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     fn refresh_files(&mut self, cx: &mut Context<Self>) {
         if self.browser == BrowserMode::Buffers {
             self.refresh_buffer_finder(cx);
@@ -786,14 +889,19 @@ impl NativeEditor {
         }
         self.index_generation += 1;
         let generation = self.index_generation;
+        self.scan_in_flight = true;
+        self.file_changes.take_changed();
         self.indexing = true;
         self.finder = None;
         self.reset_finder_results();
         let root = self.root.clone();
+        let canonical_root = self.canonical_root.clone();
+        let created_files = self.created_files.clone();
         cx.spawn(async move |view, cx| {
             let (files, finder) = cx
                 .background_spawn(async move {
                     let mut files = project::scan(&root);
+                    merge_created_files(&canonical_root, &mut files, &created_files);
                     let finder = Finder::new(&files);
                     sort_tree_files(&mut files);
                     (files, finder)
@@ -807,6 +915,7 @@ impl NativeEditor {
                         cx,
                     );
                     this.files = files;
+                    this.scan_in_flight = false;
                     this.indexing = false;
                     this.install_finder(finder, cx);
                     cx.notify();
@@ -815,6 +924,230 @@ impl NativeEditor {
         })
         .detach();
         cx.notify();
+    }
+
+    fn active_file_directory(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .and_then(|parent| parent.strip_prefix(&self.canonical_root).ok())
+            .map(|relative| {
+                relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default()
+    }
+
+    fn open_new_file_dialog(
+        &mut self,
+        directory: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefix = directory.trim_matches('/');
+        let initial = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        self.new_file_query
+            .update(cx, |input, cx| input.set_value(initial, window, cx));
+        // Focus a persistent editor/sidebar handle before opening the dialog so
+        // cancelling the dialog never tries to restore focus to a dismissed menu.
+        if self.path.is_some() {
+            self.editor_focus(cx).focus(window, cx);
+        } else {
+            self.sidebar_focus.focus(window, cx);
+        }
+        let view = cx.entity().downgrade();
+        let input = self.new_file_query.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            let input = input.clone();
+            let input_for_ok = input.clone();
+            dialog
+                .title("New file")
+                .w(px(420.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x858989))
+                                .child("Enter a file path relative to the checkout root."),
+                        )
+                        .child(Input::new(&input)),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-new-file")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-new-file")
+                                .primary()
+                                .label("Create")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    let path = input_for_ok.read(cx).value().to_string();
+                    let result = view.update(cx, |this, cx| this.create_file(&path, window, cx));
+                    if let Ok(Err(error)) = result {
+                        window.push_notification(format!("{error:#}"), cx);
+                    }
+                    false
+                })
+        });
+        self.new_file_query
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    fn create_file(
+        &mut self,
+        relative_path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let trimmed = relative_path.trim();
+        if trimmed.is_empty() || trimmed.ends_with('/') || trimmed.ends_with('\\') {
+            bail!("Enter a file name.");
+        }
+        let candidate = Path::new(trimmed);
+        if candidate.is_absolute() {
+            bail!("Choose a relative path inside this checkout.");
+        }
+        let mut parts = Vec::new();
+        for component in candidate.components() {
+            match component {
+                std::path::Component::Normal(part) => {
+                    if project::is_git_component(part) {
+                        bail!("Cannot create files inside .git.");
+                    }
+                    parts.push(part.to_os_string());
+                }
+                std::path::Component::CurDir => {}
+                _ => bail!("Choose a path inside this checkout."),
+            }
+        }
+        if parts.is_empty() {
+            bail!("Enter a file name.");
+        }
+        let canonical_root = self
+            .root
+            .canonicalize()
+            .context("Checkout is unavailable")?;
+        let mut current = canonical_root.clone();
+        for dir_name in &parts[..parts.len() - 1] {
+            current.push(dir_name);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        bail!("Choose a path inside this checkout.");
+                    }
+                    if !metadata.is_dir() {
+                        bail!("{} is not a directory.", current.display());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&current)
+                        .with_context(|| format!("Could not create {}", current.display()))?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Could not inspect {}", current.display()));
+                }
+            }
+        }
+        let parent_canonical = current
+            .canonicalize()
+            .context("Could not resolve parent directory")?;
+        let Ok(relative_parent) = parent_canonical.strip_prefix(&canonical_root) else {
+            bail!("Choose a file inside this checkout.");
+        };
+        if relative_parent
+            .components()
+            .any(|component| project::is_git_component(component.as_os_str()))
+        {
+            bail!("Cannot create files inside .git.");
+        }
+        if let Ok(repo) = gix::discover(&canonical_root) {
+            for git_dir in [repo.git_dir(), repo.common_dir()] {
+                if let Ok(canonical_git) = git_dir.canonicalize()
+                    && parent_canonical.starts_with(&canonical_git)
+                {
+                    bail!("Cannot create files inside .git.");
+                }
+            }
+        }
+        let file_name = parts.last().unwrap();
+        let target = parent_canonical.join(file_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                bail!("{trimmed} already exists.");
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Could not create {trimmed}"));
+            }
+        }
+        let target = target.canonicalize().unwrap_or(target);
+        let relative = target
+            .strip_prefix(&canonical_root)
+            .context("Created file escaped checkout")?;
+        let canonical_parts: Vec<String> = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        self.expanded_dirs.insert(String::new());
+        let label = canonical_parts.join("/");
+        let mut prefix = String::new();
+        for part in &canonical_parts[..canonical_parts.len().saturating_sub(1)] {
+            prefix = if prefix.is_empty() {
+                part.clone()
+            } else {
+                format!("{prefix}/{part}")
+            };
+            self.expanded_dirs.insert(prefix.clone());
+        }
+        if self.browser == BrowserMode::Closed {
+            self.browser = BrowserMode::Tree;
+        }
+        crate::review::icons::ensure_tiles(
+            std::iter::once(label.as_str()),
+            &mut self.icon_tiles,
+            cx,
+        );
+        self.created_files.insert(target.clone());
+        if !self.files.iter().any(|file| file.path == target) {
+            self.files.push(ProjectFile {
+                path: target.clone(),
+                label,
+            });
+            sort_tree_files(&mut self.files);
+        }
+        self.file_changes.mark_changed();
+        self.refresh_files_if_changed(cx);
+        window.close_dialog(cx);
+        self.error = None;
+        self.open(&target, None, window, cx)?;
+        cx.notify();
+        Ok(())
     }
 
     fn compare_with_disk(&mut self, cx: &mut Context<Self>) {
@@ -884,6 +1217,8 @@ impl NativeEditor {
                             target.display()
                         ));
                         this.error = None;
+                        this.file_changes.mark_changed();
+                        this.refresh_files_if_changed(cx);
                     }
                     Err(error) => this.error = Some(format!("Could not save a copy: {error:#}")),
                 }
@@ -2185,6 +2520,7 @@ impl NativeEditor {
                     ("Go to line", 2, has_file),
                     ("Go back", 12, can_go_back),
                     ("Go forward", 13, can_go_forward),
+                    ("New file", 14, true),
                     ("Save", 3, dirty),
                     ("Save as", 4, has_file),
                     ("Discard changes", 5, dirty),
@@ -2214,6 +2550,10 @@ impl NativeEditor {
                                 9 => this.refresh_files(cx),
                                 12 => this.go_back(window, cx),
                                 13 => this.go_forward(window, cx),
+                                14 => {
+                                    let dir = this.active_file_directory();
+                                    this.open_new_file_dialog(&dir, window, cx);
+                                }
                                 10 => this.restart_language_server(window, cx),
                                 _ => {}
                             })
@@ -2309,6 +2649,8 @@ impl NativeEditor {
                             .into_any_element()
                     };
                     let id = item.id();
+                    let row_dir = item.directory();
+                    let view = cx.entity().downgrade();
                     panel = panel.child(
                         Button::new(id)
                             .ghost()
@@ -2340,7 +2682,27 @@ impl NativeEditor {
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.activate_tree_row(&item, window, cx);
-                            })),
+                            }))
+                            .context_menu(move |menu, _, _| {
+                                let create_view = view.clone();
+                                let refresh_view = view.clone();
+                                let dir = row_dir.clone();
+                                menu.item(PopupMenuItem::new("New file").on_click(
+                                    move |_, window, cx| {
+                                        let _ = create_view.update(cx, |this, cx| {
+                                            this.open_new_file_dialog(&dir, window, cx);
+                                        });
+                                    },
+                                ))
+                                .item(
+                                    PopupMenuItem::new("Refresh files").on_click(
+                                        move |_, _, cx| {
+                                            let _ = refresh_view
+                                                .update(cx, |this, cx| this.refresh_files(cx));
+                                        },
+                                    ),
+                                )
+                            }),
                     );
                 }
             }
@@ -2370,10 +2732,12 @@ impl NativeEditor {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
+        let sidebar_view = cx.entity().downgrade();
         Some(
             v_flex()
                 .debug_selector(|| "native-sidebar".into())
                 .id("native-sidebar")
+                .test_support()
                 .track_focus(&self.sidebar_focus)
                 .w(px(260.))
                 .h_full()
@@ -2402,6 +2766,16 @@ impl NativeEditor {
                                 .child(project_name),
                         )
                         .child(
+                            Button::new("native-new-file")
+                                .icon(IconName::Plus)
+                                .small()
+                                .ghost()
+                                .accessibility_label("New file")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_new_file_dialog("", window, cx)
+                                })),
+                        )
+                        .child(
                             Button::new("native-open-file")
                                 .icon(IconName::Search)
                                 .small()
@@ -2424,6 +2798,22 @@ impl NativeEditor {
                         ),
                 )
                 .child(panel)
+                .context_menu(move |menu, _, _| {
+                    let create_view = sidebar_view.clone();
+                    let refresh_view = sidebar_view.clone();
+                    menu.item(
+                        PopupMenuItem::new("New file").on_click(move |_, window, cx| {
+                            let _ = create_view.update(cx, |this, cx| {
+                                this.open_new_file_dialog("", window, cx);
+                            });
+                        }),
+                    )
+                    .item(
+                        PopupMenuItem::new("Refresh files").on_click(move |_, _, cx| {
+                            let _ = refresh_view.update(cx, |this, cx| this.refresh_files(cx));
+                        }),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -5006,5 +5396,226 @@ mod tests {
             assert_eq!(view.editor.read(cx).value().as_ref(), "agent\n");
             assert!(!view.dirty);
         });
+    }
+
+    #[gpui_kit::test]
+    fn disk_poll_and_activation_reload_new_files_into_tree_and_finder(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let watched = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("existing.rs"), "fn existing() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update(test_cx, |view, cx| {
+            view.file_changes = project::FileChanges::new(watched.path());
+            assert!(view.file_changes.is_watching());
+            view.file_changes.take_changed();
+            let generation = view.index_generation;
+            view.refresh_files_if_changed(cx);
+            assert_eq!(view.index_generation, generation, "idle ticks do not rescan");
+        });
+        fs::write(dir.path().join("created_by_agent.rs"), "fn agent() {}\n").unwrap();
+        view.update(test_cx, |view, _| view.file_changes.mark_changed());
+        test_cx
+            .background_executor
+            .advance_clock(DISK_POLL_INTERVAL);
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-tree-file-created_by_agent.rs").visible());
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            assert!(
+                view.files
+                    .iter()
+                    .any(|file| file.label == "created_by_agent.rs")
+            );
+            view.open_file_finder(window, cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            assert!(
+                view.file_matches
+                    .iter()
+                    .any(|file| file.label == "created_by_agent.rs")
+            );
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.close_file_finder(window, cx);
+        });
+
+        fs::write(
+            dir.path().join("created_in_terminal.rs"),
+            "fn terminal() {}\n",
+        )
+        .unwrap();
+        view.update_in(test_cx, |view, window, cx| {
+            let generation = view.index_generation;
+            view.activate(window, cx);
+            assert_eq!(
+                view.index_generation, generation,
+                "idle tab activation must not force a full rescan"
+            );
+            view.file_changes.mark_changed();
+            view.activate(window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("native-tree-file-created_in_terminal.rs")
+                    .visible()
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_context_menu_creates_and_opens_new_files(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let existing = dir.path().join("src/existing.rs");
+        fs::write(&existing, "fn existing() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.right_click("native-sidebar", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.new_file_query.read(cx).value().as_ref(), "");
+        });
+        test_cx.update(|window, cx| {
+            window.input("root_note.txt", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        let root_note = dir.path().join("root_note.txt").canonicalize().unwrap();
+        assert!(root_note.is_file());
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.path.as_ref(), Some(&root_note));
+            assert!(view.files.iter().any(|file| file.label == "root_note.txt"));
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-tree-file-root_note.txt").visible());
+            window.right_click("native-tree-dir-src", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.new_file_query.read(cx).value().as_ref(), "src/");
+        });
+        test_cx.update(|window, cx| {
+            window.input("nested/module.rs", cx);
+            window.click("confirm-new-file", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        let nested_module = dir
+            .path()
+            .join("src/nested/module.rs")
+            .canonicalize()
+            .unwrap();
+        assert!(nested_module.is_file());
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.path.as_ref(), Some(&nested_module));
+            assert!(view.expanded_dirs.contains("src"));
+            assert!(view.expanded_dirs.contains("src/nested"));
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find("native-tree-file-src/nested/module.rs")
+                    .visible()
+            );
+            window.right_click("native-tree-file-src/existing.rs", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.press("down", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.new_file_query.read(cx).value().as_ref(), "src/");
+        });
+        test_cx.update(|window, cx| {
+            window.input("sibling.rs", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        let sibling = dir.path().join("src/sibling.rs").canonicalize().unwrap();
+        assert!(sibling.is_file());
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.path.as_ref(), Some(&sibling));
+        });
+
+        test_cx.update(|window, cx| {
+            window.click("native-new-file", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.input("from_header.txt", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        assert!(dir.path().join("from_header.txt").is_file());
+
+        fs::write(dir.path().join(".gitignore"), "*.ignored\n").unwrap();
+        view.update_in(test_cx, |view, window, cx| {
+            view.create_file("local.ignored", window, cx).unwrap();
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-tree-file-local.ignored").visible());
+        });
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), dir.path().join("linked")).unwrap();
+            view.update_in(test_cx, |view, window, cx| {
+                assert!(view.create_file("linked/escape.txt", window, cx).is_err());
+            });
+            assert!(!outside.path().join("escape.txt").exists());
+        }
+
+        view.update_in(test_cx, |view, window, cx| {
+            assert!(view.create_file("", window, cx).is_err());
+            assert!(view.create_file("src/", window, cx).is_err());
+            assert!(view.create_file("src/existing.rs", window, cx).is_err());
+            assert!(view.create_file("../outside.txt", window, cx).is_err());
+            assert!(view.create_file("/tmp/outside.txt", window, cx).is_err());
+            assert!(view.create_file(".git/config", window, cx).is_err());
+            assert!(view.create_file(".GIT/config", window, cx).is_err());
+            assert!(view.create_file(".git./config", window, cx).is_err());
+        });
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "fn existing() {}\n");
     }
 }
