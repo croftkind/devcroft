@@ -994,7 +994,8 @@ impl NativeEditor {
                                 .primary()
                                 .label("Create")
                                 .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
                                 }),
                         ),
                 )
@@ -5414,7 +5415,10 @@ mod tests {
             view.file_changes.take_changed();
             let generation = view.index_generation;
             view.refresh_files_if_changed(cx);
-            assert_eq!(view.index_generation, generation, "idle ticks do not rescan");
+            assert_eq!(
+                view.index_generation, generation,
+                "idle ticks do not rescan"
+            );
         });
         fs::write(dir.path().join("created_by_agent.rs"), "fn agent() {}\n").unwrap();
         view.update(test_cx, |view, _| view.file_changes.mark_changed());
@@ -5424,7 +5428,11 @@ mod tests {
         test_cx.run_until_parked();
         test_cx.update(|window, cx| {
             window.render_frame(cx);
-            assert!(window.find("native-tree-file-created_by_agent.rs").visible());
+            assert!(
+                window
+                    .find("native-tree-file-created_by_agent.rs")
+                    .visible()
+            );
         });
         view.update_in(test_cx, |view, window, cx| {
             assert!(

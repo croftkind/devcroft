@@ -5,6 +5,8 @@
 
 # Local design explorations and generated previews
 /output/
+/dist/
+__pycache__/
 
 # macOS
 .DS_Store

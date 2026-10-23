@@ -1,0 +1,26 @@
+# cargo-packager owns native package metadata, icons, bundle layout and signing.
+# scripts/release/package.sh stages the existing combined app/CLI and launcher.
+name = "devcroft"
+product-name = "Devcroft"
+version = "0.1.0"
+identifier = "com.devcroft.desktop"
+description = "Desktop workspace for agent-assisted development"
+homepage = "https://github.com/hossainemruz/devcroft"
+authors = ["Emruz Hossain"]
+publisher = "Emruz Hossain"
+category = "DeveloperTool"
+license-file = "LICENSE"
+icons = ["packaging/icon.png"]
+binaries-dir = "target/package-input"
+out-dir = "dist/packages"
+binaries = [{ path = "devcroft-app", main = true }, { path = "devcroft" }]
+
+[macos]
+minimum-system-version = "13.0"
+# Ad-hoc signing permits Apple Silicon execution; this is not notarization.
+signing-identity = "-"
+
+[deb]
+section = "devel"
+desktop-template = "packaging/devcroft.desktop.hbs"
+depends = ["libc6 (>= 2.39)", "libasound2t64", "libfontconfig1", "libfreetype6", "libwayland-client0", "libxkbcommon0", "libxkbcommon-x11-0", "libxcb1", "libx11-xcb1", "libvulkan1"]

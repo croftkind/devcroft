@@ -54,6 +54,48 @@ impl HomeView {
             .w_full()
             .flex_1()
             .gap_6()
+            .when_some(
+                self.available_release.as_ref().filter(|release| {
+                    self.dismissed_release.as_ref() != Some(&release.tag)
+                }),
+                |view, release| {
+                    let url = release.url();
+                    let download_url = url.clone();
+                    let system_package = crate::releases::uses_system_package();
+                    let tag = release.tag.clone();
+                    view.child(
+                        v_flex()
+                            .gap_2()
+                            .p_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(cx.theme().primary.opacity(0.3))
+                            .bg(cx.theme().primary.opacity(0.06))
+                            .child(div().font_semibold().child(format!(
+                                "Devcroft {} is available", release.tag
+                            )))
+                            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                                .child(format!("You’re running v{}. Install the update, then restart Devcroft.", env!("CARGO_PKG_VERSION"))))
+                            .child(h_flex().gap_2().flex_wrap()
+                                .child(Button::new("release-notes").label("Release notes").small()
+                                    .on_click(move |_, _, cx| cx.open_url(&url)))
+                                .child(Button::new("copy-update-command").label(if system_package { "Download update" } else { "Copy update command" }).small().primary()
+                                    .on_click(move |_, window, cx| {
+                                        if system_package {
+                                            cx.open_url(&download_url);
+                                        } else {
+                                            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(crate::releases::update_command().into()));
+                                            window.push_notification("Update command copied. Run it in your terminal, then restart Devcroft.", cx);
+                                        }
+                                    }))
+                                .child(Button::new("dismiss-release").label("Dismiss").small().ghost()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.dismissed_release = Some(tag.clone());
+                                        cx.notify();
+                                    }))))
+                    )
+                },
+            )
             .when_some(self.error.clone(), |view, error| {
                 view.child(
                     div()

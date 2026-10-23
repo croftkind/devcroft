@@ -1,0 +1,3 @@
+#!/bin/sh
+# Desktop entry point; the adjacent executable also serves the headless CLI.
+exec "$(dirname "$0")/devcroft" app "$@"

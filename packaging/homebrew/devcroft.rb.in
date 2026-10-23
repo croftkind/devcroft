@@ -1,0 +1,17 @@
+cask "devcroft" do
+  arch arm: "aarch64", intel: "x86_64"
+
+  version "@VERSION@"
+  sha256 arm:   "@ARM_SHA256@",
+         intel: "@INTEL_SHA256@"
+
+  url "https://github.com/hossainemruz/devcroft/releases/download/v#{version}/devcroft-v#{version}-#{arch}-apple-darwin.tar.gz"
+  name "Devcroft"
+  desc "Desktop workspace for agent-assisted development"
+  homepage "https://github.com/hossainemruz/devcroft"
+
+  depends_on macos: :ventura
+
+  app "Devcroft.app"
+  binary "#{appdir}/Devcroft.app/Contents/MacOS/devcroft", target: "devcroft"
+end

@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    branches: ['releases/v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize publishing, including different release branches; never cancel an upload.
+concurrency:
+  group: devcroft-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    if: github.event_name != 'push' || github.event.deleted == false
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release branch
+        id: version
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+        run: |
+          test "$GITHUB_REF_TYPE" = branch
+          python3 scripts/release/prepare.py "$RELEASE_BRANCH"
+      - name: Test release tooling
+        run: |
+          python3 -m unittest discover -s scripts/release -p 'test_*.py'
+          bash -n scripts/install.sh scripts/release/package.sh packaging/devcroft-app
+          shellcheck scripts/install.sh scripts/release/package.sh packaging/devcroft-app
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang libclang-dev pkg-config \
+            libasound2-dev libfontconfig1-dev libfreetype6-dev libssl-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libx11-xcb-dev libvulkan-dev libzstd-dev
+      - uses: jdx/mise-action@v3
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+      - name: Stamp branch version
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+        run: python3 scripts/release/prepare.py "$RELEASE_BRANCH" --stamp
+      - name: Check formatting and test
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked
+      - name: Build release binary
+        run: cargo build --release --locked
+      - name: Package and smoke test
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          test "$(target/release/devcroft --version)" = "devcroft $RELEASE_VERSION"
+          scripts/release/package.sh "$RELEASE_VERSION" "$RELEASE_TARGET"
+      - name: Verify Linux system package
+        if: runner.os == 'Linux'
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          package="dist/devcroft-v${RELEASE_VERSION}-${RELEASE_TARGET}.deb"
+          test "$(dpkg-deb -f "$package" Version)" = "$RELEASE_VERSION"
+          test "$(dpkg-deb -f "$package" Package)" = devcroft
+          test "$(dpkg-deb -f "$package" Architecture)" = amd64
+          dpkg-deb -x "$package" "$RUNNER_TEMP/devcroft-deb"
+          test "$("$RUNNER_TEMP/devcroft-deb/usr/bin/devcroft" --version)" = "devcroft $RELEASE_VERSION"
+          test -x "$RUNNER_TEMP/devcroft-deb/usr/bin/devcroft-app"
+          test -f "$RUNNER_TEMP/devcroft-deb/usr/share/applications/devcroft-app.desktop"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Tag and publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: python3 scripts/release/publish.py "$RELEASE_TAG" "$GITHUB_SHA" "$GITHUB_REPOSITORY"
+
+  homebrew:
+    needs: [validate, publish]
+    if: vars.HOMEBREW_TAP != ''
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download published checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir dist
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update stable cask
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          python3 scripts/release/homebrew.py "$RELEASE_TAG" dist/SHA256SUMS homebrew-tap/Casks/devcroft.rb
+          cd homebrew-tap
+          if git diff --quiet --exit-code -- Casks/devcroft.rb && ! test -n "$(git ls-files --others --exclude-standard Casks/devcroft.rb)"; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Casks/devcroft.rb
+          git commit -m "Update Devcroft to $RELEASE_TAG"
+          git push

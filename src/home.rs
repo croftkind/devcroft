@@ -276,6 +276,8 @@ pub(crate) struct HomeView {
     tracker: SyncTracker,
     data: Dashboard,
     error: Option<String>,
+    available_release: Option<crate::releases::Release>,
+    dismissed_release: Option<String>,
     projects: Vec<RecentRepository>,
     /// Every portable record joined with its device binding (linked,
     /// unlinked, and missing-checkout alike) for the Projects page.
@@ -414,6 +416,8 @@ impl HomeView {
             tracker,
             data: Dashboard::default(),
             error: None,
+            available_release: None,
+            dismissed_release: None,
             projects: Vec::new(),
             all_projects: Vec::new(),
             project_errors: Vec::new(),
@@ -439,6 +443,31 @@ impl HomeView {
             agent_icon_tiles: std::rc::Rc::new(agent_icon_tiles),
         };
         view.reload(cx);
+        cx.spawn(async move |this, cx| {
+            loop {
+                let release = cx
+                    .background_spawn(async { crate::releases::check() })
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        // A failed check keeps a previously discovered update visible.
+                        if let Some(release) = release
+                            && this.available_release.as_ref() != Some(&release)
+                        {
+                            this.available_release = Some(release);
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_secs(6 * 60 * 60))
+                    .await;
+            }
+        })
+        .detach();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(PROJECT_GIT_INTERVAL).await;
@@ -2367,6 +2396,52 @@ fn project_navigation(key: &str, index: usize, count: usize, columns: usize) -> 
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[gpui_kit::test]
+    fn release_notice_copies_command_and_dismisses_only_that_version(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+
+        cx.update(gpui_kit::init);
+        let home = cx.new(|cx| HomeView::new(None, SyncTracker::default(), cx));
+        let view = home.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+        home.update(cx, |home, cx| {
+            home.available_release = Some(crate::releases::Release {
+                tag: "v1.2.3".into(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("release-notes").visible());
+            window.click("copy-update-command", cx);
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(crate::releases::update_command())
+            );
+            window.click("dismiss-release", cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("release-notes").is_none());
+        });
+        home.update(cx, |home, cx| {
+            home.available_release = Some(crate::releases::Release {
+                tag: "v1.2.4".into(),
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("release-notes").visible());
+        });
+    }
 
     #[gpui_kit::test]
     fn all_spaces_includes_every_home_list_and_keeps_concrete_creation_defaults(

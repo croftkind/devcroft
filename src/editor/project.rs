@@ -148,7 +148,10 @@ fn affects_project(
             if let Some(first) = components.next() {
                 let is_nested = components.next().is_some();
                 if gitignore
-                    .matched(Path::new(first.as_os_str()), is_nested || is_dir_event || path.is_dir())
+                    .matched(
+                        Path::new(first.as_os_str()),
+                        is_nested || is_dir_event || path.is_dir(),
+                    )
                     .is_ignore()
                 {
                     return false;
@@ -605,7 +608,9 @@ mod tests {
             ));
         }
         assert!(
-            !gitignore.matched(Path::new("ignored.txt"), false).is_ignore(),
+            !gitignore
+                .matched(Path::new("ignored.txt"), false)
+                .is_ignore(),
             "Access(Open) on .gitignore must not rebuild the matcher"
         );
         assert!(affects_project(
@@ -616,7 +621,9 @@ mod tests {
             &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(".gitignore"))
         ));
         assert!(
-            gitignore.matched(Path::new("ignored.txt"), false).is_ignore(),
+            gitignore
+                .matched(Path::new("ignored.txt"), false)
+                .is_ignore(),
             "non-access event on .gitignore rebuilds the matcher"
         );
         for ignored in [

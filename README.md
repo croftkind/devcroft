@@ -4,11 +4,28 @@
 
 Devcroft is a GPUI based desktop app for personal development workflow. It focuses on keeping development workflow same no matter which harness you use. Vim like keyboard navigation let you fly between projects with ease.
 
-> Status: pre-release (0.1.0). Build from source; there are no packaged binaries yet because the release pipeline is still coming.
-
 ## Quickstart
 
-Requirements: [mise](https://mise.jdx.dev/) (manages the pinned Rust and Zig toolchains) Git (`git` on the application PATH), and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
+Install or update the latest release with the same command (available after the first release is published):
+
+```sh
+curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/install.sh | bash
+```
+
+macOS users can alternatively install through our Homebrew tap once it is enabled:
+
+```sh
+brew install --cask hossainemruz/tap/devcroft
+brew upgrade --cask devcroft
+```
+
+Packages support Linux x86-64 (Ubuntu 24.04 or compatible) and macOS 13+ (Intel and Apple Silicon). The installer verifies checksums, installs the desktop app and CLI, and preserves your app data. Add `~/.local/bin` to your PATH for the CLI. Restart Devcroft after updating. Home shows a notice when a newer stable release is available. See [installation, platform requirements, and publishing releases](docs/releases.md).
+
+You need Git (`git` on the application PATH) and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
+
+### Build from source
+
+Install [mise](https://mise.jdx.dev/) to manage the pinned Rust and Zig toolchains:
 
 ```sh
 mise install
