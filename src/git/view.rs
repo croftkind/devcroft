@@ -227,6 +227,7 @@ impl GitView {
         .detach();
         cx.observe(&history.branch_name, |_, _, cx| cx.notify())
             .detach();
+        cx.observe(&history.viewer, |_, _, cx| cx.notify()).detach();
         let focus_handle = cx.focus_handle();
         let branch_picker_focus = cx.focus_handle();
         let tab_focus = focus_handle.clone();

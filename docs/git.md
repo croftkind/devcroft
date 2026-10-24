@@ -18,10 +18,12 @@ pinned first. Hover the picker to see the full checkout path and upstream.
 
 Use **Tab / Shift+Tab** to move through modes, lists, inputs, and action
 buttons. **Enter / Space** activates a focused button, including a file or
-branch. In the history commit list, **Up / Down**, **Home / End**, and
-**Enter / Space** select a commit. In a focused diff, **Up / Down** scroll a
+branch. In History, **Up / Down** move through commits and their expanded files,
+**Home / End** reach the first or last visible row, **Enter / Space** toggle a
+commit or select a file, and **Left / Right** collapse or expand a commit.
+**Left** from a file returns to its commit. In a focused diff, **Up / Down** scroll a
 line, **Page Up / Page Down** scroll a page, and **Home / End** reach its ends.
-The history changed-file list uses the same selection keys. Commit and merge editors keep their normal typing, clipboard, search, and
+Commit and merge editors keep their normal typing, clipboard, search, and
 undo/redo shortcuts. Escape first dismisses an editor's search when open;
 otherwise **Escape** dismisses the active popover or dialog. Use **Back** (or
 `Cmd/Ctrl+J`, then `b`) to return to the previous view; navigation mode can also
@@ -47,8 +49,8 @@ both paths. **Show more** exposes further files in large sections.
 
 Non-conflict Changes and History diffs support **Unified** and **Split**
 layouts, **Wrap** for long lines, and **Previous change / Next change**. These
-controls share a single compact file header in Changes, alongside the path,
-line counts, and editor button. Hover the path for the full comparison details.
+controls share a single compact file header alongside the path and line counts;
+Changes also includes an editor button. Hover the path for the full comparison details.
 The up/down arrows jump between changes.
 Display choices remain through refreshes and when selecting another file. Drag over source text or select lines from the gutter,
 then use `Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff
@@ -100,17 +102,22 @@ Failures show bounded command output and preserve the repository operation.
 
 **History** loads at most 100 commits per page; **Load more** adds another
 page. Filtering searches only loaded metadata. Choose HEAD or a branch scope.
-Rows show graph lanes, commit id, subject, author, time, and ref decorations.
-Select a commit for its summary and body; **Details** expands the full commit id,
-author, committer, and parents. Changed files sit beside the diff. Select a file for its
-immutable parent-to-commit diff. Root commits compare to an empty tree;
-merge commits explicitly compare to the first parent. Oversized metadata is
-truncated with a notice.
+Compact rows show the subject, graph lanes, commit id, author, and relative time;
+hover for the full timestamp and ref decorations. Click a commit to expand its
+changed files directly below it in the same sidebar. Opening another commit
+closes the previous accordion and selects its first file. Click the open commit
+again to collapse its files while retaining the current diff.
+
+The two-line commit header shows the summary and metadata. **Commit details**
+(the info button) expands the body, full commit id, author, committer, parents,
+and comparison base. Select a file for its immutable parent-to-commit diff.
+Root commits compare to an empty tree; merge commits compare to the first parent.
+Oversized metadata is truncated with a notice in the details.
 
 History uses the same diff display and source-copy controls as Changes.
 
-**Copy commit id**, **Create branch here**, and confirmed **Check out commit**
-are available. Checking out a commit enters detached HEAD. Create or switch
+**Copy commit id** sits beside the details button. The **Commit actions** menu
+offers **Create branch here** and confirmed **Check out commit**. Checking out a commit enters detached HEAD. Create or switch
 to a branch before committing work you intend to keep.
 
 ## Conflicts and recovery
