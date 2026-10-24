@@ -1170,16 +1170,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.attention_only = false;
+        let was_attention_only = std::mem::take(&mut self.attention_only);
         if self.command_open {
             // Same shortcut again closes; the other shortcut switches the
             // open bar to its view instead of closing it.
-            if self.palette_mode == mode {
+            if self.palette_mode == mode && !was_attention_only {
                 self.close_command_palette(window, cx);
             } else {
                 self.palette_mode = mode;
+
                 self.palette_has_query = false;
                 self.reload_recent_repositories();
+                self.acknowledge_project_completions();
                 self.command_state.update(cx, |state, cx| {
                     state.set_query("", window, cx);
                 });
@@ -1198,6 +1200,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_command_palette_filtered(mode, false, window, cx);
+    }
+
+    fn open_command_palette_filtered(
+        &mut self,
+        mode: PaletteMode,
+        attention_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.command_open {
             return;
         }
@@ -1206,13 +1218,15 @@ impl Workspace {
         // trap owns the keyboard from here, so the HUD must not stay behind it.
         self.close_navigation(cx);
         self.command_open = true;
-        self.attention_only = false;
+
+        self.attention_only = attention_only;
         self.palette_mode = mode;
         self.palette_has_query = false;
         self.sync_tutorial_palette(cx);
         // A few small JSON reads per opening — not per render — so the
         // switcher always reflects recent adds and switches.
         self.reload_recent_repositories();
+        self.acknowledge_project_completions();
         self.command_state.update(cx, |state, cx| {
             state.set_query("", window, cx);
         });
@@ -1245,6 +1259,7 @@ impl Workspace {
             return;
         }
         self.command_open = false;
+
         self.command_origin_focus = None;
         self.sync_tutorial_palette(cx);
         self.focus_active_pane(window, cx);
@@ -2298,6 +2313,26 @@ impl Workspace {
                         .is_none_or(|space| self.active_space.matches(&space))
             })
             .count()
+    }
+
+    fn completion_count(&self) -> usize {
+        self.agent_activity
+            .snapshot()
+            .unread_completions()
+            .filter(|checkout| self.completion_in_active_space(checkout))
+            .count()
+    }
+
+    fn completion_in_active_space(&self, checkout: &Path) -> bool {
+        self.session_space(checkout)
+            .is_none_or(|space| self.active_space.matches(&space))
+    }
+
+    fn acknowledge_project_completions(&self) {
+        if self.command_open && self.palette_mode == PaletteMode::Projects && !self.attention_only {
+            self.agent_activity
+                .acknowledge_completions(|checkout| self.completion_in_active_space(checkout));
+        }
     }
 
     /// Re-read the portable catalog. Best effort: a read failure keeps the
@@ -4098,6 +4133,12 @@ impl Render for Workspace {
             || is_todos
             || is_reading;
         let attention_count = self.attention_count();
+        let completion_count = self.completion_count();
+        let completion_label = if completion_count == 1 {
+            "1 agent finished · Open projects".to_owned()
+        } else {
+            format!("{completion_count} agents finished · Open projects")
+        };
         let attention_label = if attention_count == 1 {
             "⚠ 1 agent needs attention".to_owned()
         } else {
@@ -4108,13 +4149,8 @@ impl Render for Workspace {
         // cannot overlap the workspace tabs.
         let command_width = 280.;
         let palette_width = 380.;
-        let centered_min_width = if self.home_visible {
-            960.
-        } else if attention_count > 0 {
-            1400.
-        } else {
-            1280.
-        };
+        let centered_min_width = if self.home_visible { 960. } else { 1280. }
+            + 120. * (usize::from(attention_count > 0) + usize::from(completion_count > 0)) as f32;
         let center_command = window.viewport_size().width >= px(centered_min_width);
         let command_left = (window.viewport_size().width - px(command_width)) / 2.;
         let git_status =
@@ -4358,6 +4394,82 @@ impl Render for Workspace {
                             })
                             .when(!center_command, |bar| bar.flex_1().justify_center())
                             .gap_1()
+                            .when(completion_count > 0 || attention_count > 0, |bar| {
+                                bar.child(
+                                    h_flex()
+                                        .flex_none()
+                                        .items_center()
+                                        .gap_1()
+                                        // Keep the command field centered as badges appear.
+                                        // Narrow windows reserve their width in normal flow.
+                                        .when(center_command, |status| {
+                                            status
+                                                .absolute()
+                                                .top_0()
+                                                .h_full()
+                                                .right(gpui_kit::relative(1.))
+                                                .pr_1()
+                                        })
+                                        .when(completion_count > 0, |bar| {
+                                            bar.child(
+                                                Button::new("agent-completion-trigger")
+                                                    .ghost()
+                                                    .small()
+                                                    .accessibility_label(completion_label.clone())
+                                                    .tooltip(completion_label.clone())
+                                                    .h(px(28.))
+                                                    .px_2()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(rgb(0x14532d))
+                                                    .bg(rgb(0x0c2116))
+                                                    .text_xs()
+                                                    .text_color(rgb(0x4ade80))
+                                                    .icon(IconName::CircleCheck)
+                                                    .label(completion_count.to_string())
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.toggle_command_palette(
+                                                                PaletteMode::Projects,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                        })
+                                        .when(attention_count > 0, |bar| {
+                                            bar.child(
+                                                Button::new("agent-attention-trigger")
+                                                    .ghost()
+                                                    .small()
+                                                    .accessibility_label(attention_label.clone())
+                                                    .tooltip(attention_label.clone())
+                                                    .h(px(28.))
+                                                    .px_2()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(rgb(0x713f12))
+                                                    .bg(rgb(0x211609))
+                                                    .text_xs()
+                                                    .text_color(rgb(0xf59e0b))
+                                                    .icon(IconName::TriangleAlert)
+                                                    .label(attention_count.to_string())
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.open_command_palette_filtered(
+                                                                PaletteMode::Projects,
+                                                                true,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                        }),
+                                )
+                            })
                             .child(
                                 div()
                                     .relative()
@@ -4461,35 +4573,7 @@ impl Render for Workspace {
                                         )
                                     }),
                             )
-                            .child(self.render_navigation_indicator())
-                            .when(attention_count > 0, |bar| {
-                                bar.child(
-                                    Button::new("agent-attention-trigger")
-                                        .ghost()
-                                        .small()
-                                        .accessibility_label(attention_label.clone())
-                                        .tooltip(attention_label.clone())
-                                        .h(px(28.))
-                                        .px_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(0x713f12))
-                                        .bg(rgb(0x211609))
-                                        .text_xs()
-                                        .text_color(rgb(0xf59e0b))
-                                        .icon(IconName::TriangleAlert)
-                                        .label(attention_count.to_string())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.open_command_palette(
-                                                PaletteMode::Projects,
-                                                window,
-                                                cx,
-                                            );
-                                            this.attention_only = true;
-                                            cx.notify();
-                                        })),
-                                )
-                            }),
+                            .child(self.render_navigation_indicator()),
                     )
                     .when(self.home_visible && !is_home_page, |header| {
                         let status = self.portable_git_poll.status();
@@ -4629,6 +4713,177 @@ mod tests {
     use super::*;
     use gpui_kit::component::Root;
     use std::path::PathBuf;
+
+    fn finish_codex_turn(launch: &crate::agent_activity::PreparedAgentLaunch) {
+        use crate::agent_activity::TerminalObservation;
+        launch.observe(TerminalObservation {
+            title: "Codex".into(),
+            screen: "Working (1s • esc to interrupt)".into(),
+        });
+        launch.observe(TerminalObservation {
+            title: "Codex".into(),
+            screen: "Done".into(),
+        });
+    }
+
+    #[gpui_kit::test]
+    fn completion_indicator_clears_on_projects_and_returns_for_later_turns(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        let launch = workspace.update(test_cx, |workspace, _| {
+            workspace
+                .agent_activity
+                .start(&workspace.working_directory, AgentKind::Codex)
+        });
+        finish_codex_turn(&launch);
+        let working_launch = workspace.update(test_cx, |workspace, _| {
+            let launch = workspace
+                .agent_activity
+                .start(&workspace.working_directory, AgentKind::Codex);
+            launch.observe(crate::agent_activity::TerminalObservation {
+                title: "Codex".into(),
+                screen: "Working (1s • esc to interrupt)".into(),
+            });
+            launch
+        });
+        test_cx.run_until_parked();
+        workspace.read_with(test_cx, |workspace, _| {
+            assert_eq!(workspace.completion_count(), 1);
+        });
+        // The rendered badge opens Projects and immediately acknowledges it.
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("agent-completion-trigger", cx);
+        });
+        test_cx.run_until_parked();
+        workspace.read_with(test_cx, |workspace, _| {
+            assert!(workspace.command_open);
+            assert_eq!(workspace.palette_mode, PaletteMode::Projects);
+            assert_eq!(workspace.completion_count(), 0);
+            assert_eq!(
+                workspace
+                    .agent_activity
+                    .snapshot()
+                    .for_checkout(&workspace.working_directory)
+                    .unwrap()
+                    .state,
+                ActivityState::Working
+            );
+            assert_eq!(
+                workspace
+                    .agent_activity
+                    .snapshot()
+                    .for_launch(launch.id())
+                    .unwrap()
+                    .state,
+                ActivityState::Finished
+            );
+        });
+        // A completion arriving while Projects is visible is already seen.
+        finish_codex_turn(&launch);
+        test_cx.run_until_parked();
+        assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 0);
+        test_cx.simulate_keystrokes("escape");
+        workspace.read_with(test_cx, |workspace, _| {
+            workspace
+                .agent_activity
+                .set_visible_launch(Some(launch.id()));
+        });
+        finish_codex_turn(&launch);
+        test_cx.run_until_parked();
+        assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 1);
+        // Commands alone keeps the badge. Cmd/Ctrl+P switches to Projects.
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        });
+        assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 1);
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        });
+        assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 0);
+        test_cx.simulate_keystrokes("escape");
+        finish_codex_turn(&launch);
+        test_cx.run_until_parked();
+        // The attention-only list does not show finished agents.
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |w, cx| {
+                w.open_command_palette_filtered(PaletteMode::Projects, true, window, cx);
+                assert_eq!(w.completion_count(), 1);
+            });
+        });
+        test_cx.run_until_parked();
+        assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 1);
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-p"
+        } else {
+            "ctrl-p"
+        });
+        workspace.read_with(test_cx, |w, _| {
+            assert!(w.command_open);
+            assert!(!w.attention_only);
+            assert_eq!(w.completion_count(), 0);
+        });
+        drop(working_launch);
+    }
+
+    #[gpui_kit::test]
+    fn completion_indicator_acknowledges_only_the_active_space(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let (_, test_cx) =
+            cx.add_window_view(move |window, cx| Workspace::new(window, cx, directory.path()));
+        test_cx.update(|window, cx| {
+            let workspace = window.root::<Workspace>().unwrap().unwrap();
+            workspace.update(cx, |w, cx| {
+                let first = w.working_directory.clone();
+                let other = first.join("other");
+                w.session_projects = [(&first, "Personal"), (&other, "Work")]
+                    .into_iter()
+                    .map(|(checkout, space)| RecentRepository {
+                        key: space.to_owned(),
+                        display_name: None,
+                        checkout_path: checkout.to_owned(),
+                        last_opened_at: None,
+                        description: None,
+                        space: space.to_owned(),
+                        owner: None,
+                        name: None,
+                    })
+                    .collect();
+                let first_launch = w.agent_activity.start(&first, AgentKind::Codex);
+                let other_launch = w.agent_activity.start(&other, AgentKind::Codex);
+                for launch in [&first_launch, &other_launch] {
+                    finish_codex_turn(launch);
+                }
+                w.active_space = SpaceSelection::Named("Personal".into());
+                assert_eq!(w.completion_count(), 1);
+                w.open_command_palette(PaletteMode::Projects, window, cx);
+                assert_eq!(w.completion_count(), 0);
+                w.active_space = SpaceSelection::Named("Work".into());
+                assert_eq!(w.completion_count(), 1);
+                w.acknowledge_project_completions();
+                assert_eq!(w.completion_count(), 0);
+            });
+        });
+    }
 
     #[gpui_kit::test]
     fn git_header_tabs_switch_modes_and_preserve_workspace_tab(cx: &mut gpui_kit::TestAppContext) {

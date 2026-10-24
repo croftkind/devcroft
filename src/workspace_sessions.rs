@@ -286,6 +286,7 @@ impl Workspace {
     }
 
     pub(super) fn publish_sessions(&mut self, cx: &mut Context<Self>) {
+        self.acknowledge_project_completions();
         self.session_snapshot = self.session_catalog.snapshot();
         self.remember_agent_pane(cx);
         let accounts = crate::agent_accounts::Accounts::load(self.data_root.as_ref());

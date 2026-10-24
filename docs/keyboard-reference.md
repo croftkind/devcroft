@@ -5,6 +5,12 @@ and inputs behave as usual. **Navigation** is keyboard-driven navigation in
 which nothing can edit: every keystroke is either a navigation command or
 consumed before reaching a terminal or input.
 
+A green checkmark in the top bar counts agents that finished work in the active
+space since you last opened Projects. Open `Cmd+P` on macOS (`Ctrl+P` elsewhere)
+or click the indicator to see their statuses and clear the count. The count is
+per agent, including multiple agents in the same checkout. The project palette
+shows the existing agent status for each checkout.
+
 Toggle with `Cmd+J` on macOS (`Ctrl+J` on Linux/Windows). The top bar shows a
 a keyboard badge with `⌘J` on macOS (`Ctrl+J` elsewhere) right after the command
 bar. It becomes an amber `Navigation` badge while the mode owns the keyboard,

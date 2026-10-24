@@ -60,6 +60,7 @@ pub(crate) struct AgentActivity {
 pub(crate) struct ActivitySnapshot {
     activities: HashMap<PathBuf, AgentActivity>,
     launches: HashMap<u64, (PathBuf, AgentActivity)>,
+    unread_completions: Vec<PathBuf>,
 }
 
 impl ActivitySnapshot {
@@ -76,6 +77,11 @@ impl ActivitySnapshot {
         self.launches
             .values()
             .map(|(checkout, activity)| (checkout.as_path(), activity))
+    }
+
+    /// One entry per agent with a completion not yet seen in Projects.
+    pub(crate) fn unread_completions(&self) -> impl Iterator<Item = &Path> {
+        self.unread_completions.iter().map(PathBuf::as_path)
     }
 
     #[cfg(test)]
@@ -127,6 +133,8 @@ struct ActivityRecord {
     terminal_blocked: bool,
     observed_work: bool,
     unseen_completion: bool,
+    /// Topbar notification, acknowledged independently of terminal visibility.
+    unread_completion: bool,
     visible: bool,
     observation_available: bool,
     structured_status_available: bool,
@@ -136,6 +144,11 @@ struct ActivityRecord {
 
 impl ActivityRecord {
     const MAX_RESOLVED_REQUESTS: usize = 256;
+
+    fn mark_completion(&mut self, completed: bool) {
+        self.unseen_completion |= completed && !self.visible;
+        self.unread_completion |= completed;
+    }
 
     fn remember_resolved(&mut self, key: String) {
         if self.resolved_requests.insert(key.clone()) {
@@ -254,6 +267,7 @@ impl AgentActivityStore {
                     terminal_blocked: false,
                     observed_work: false,
                     unseen_completion: false,
+                    unread_completion: false,
                     visible: false,
                     observation_available: agent != AgentKind::Omp,
                     structured_status_available: false,
@@ -321,7 +335,11 @@ impl AgentActivityStore {
         let inner = self.inner.lock();
         let mut activities: HashMap<PathBuf, AgentActivity> = HashMap::new();
         let mut launches = HashMap::new();
+        let mut unread_completions = Vec::new();
         for ((checkout, generation), record) in &inner.records {
+            if record.unread_completion {
+                unread_completions.push(checkout.clone());
+            }
             let activity = record.projected();
             launches.insert(*generation, (checkout.clone(), activity.clone()));
             let priority = |state| match state {
@@ -342,6 +360,25 @@ impl AgentActivityStore {
         ActivitySnapshot {
             activities,
             launches,
+            unread_completions,
+        }
+    }
+
+    /// Acknowledge only checkouts represented by the current Projects view.
+    /// Keep per-agent Finished status until the terminal result is viewed.
+    pub(crate) fn acknowledge_completions(&self, mut includes: impl FnMut(&Path) -> bool) {
+        let mut changed = false;
+        {
+            let mut inner = self.inner.lock();
+            for ((checkout, _), record) in &mut inner.records {
+                if record.unread_completion && includes(checkout) {
+                    record.unread_completion = false;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.notify();
         }
     }
 
@@ -385,9 +422,9 @@ impl AgentActivityStore {
             if record.generation != generation {
                 return;
             }
-            let before = record.projected();
+            let before = (record.projected(), record.unread_completion);
             mutate(record);
-            before != record.projected()
+            before != (record.projected(), record.unread_completion)
         };
         if changed {
             self.notify();
@@ -590,7 +627,7 @@ impl ActivityEmitter {
                 record.observation_available = true;
                 record.working_sessions.clear();
                 record.base = BaseState::Idle;
-                record.unseen_completion |= completed && !record.visible;
+                record.mark_completion(completed);
                 record.detail = detail;
             });
     }
@@ -607,7 +644,7 @@ impl ActivityEmitter {
                 if record.working_sessions.is_empty() {
                     let completed = record.observed_work && record.base == BaseState::Working;
                     record.base = BaseState::Idle;
-                    record.unseen_completion |= completed && !record.visible;
+                    record.mark_completion(completed);
                     record.detail = detail;
                 } else {
                     record.base = BaseState::Working;
@@ -630,7 +667,7 @@ impl ActivityEmitter {
                 record.working_sessions = working_sessions;
                 if record.working_sessions.is_empty() {
                     record.base = BaseState::Idle;
-                    record.unseen_completion |= completed && !record.visible;
+                    record.mark_completion(completed);
                 } else {
                     record.base = BaseState::Working;
                     record.observed_work = true;
@@ -778,7 +815,7 @@ impl ActivityEmitter {
                         } else {
                             BaseState::Idle
                         };
-                        record.unseen_completion |= completed && !record.visible;
+                        record.mark_completion(completed);
                         record.detail = detail;
                     }
                     TerminalEvidence::Interrupted(detail) => {
@@ -941,6 +978,85 @@ mod tests {
             store.snapshot().for_checkout(&checkout).unwrap().state,
             ActivityState::Idle
         );
+    }
+
+    #[test]
+    fn completion_notifications_count_agents_and_preserve_finished_status() {
+        let (store, checkout) = store();
+        let first = store.start(&checkout, AgentKind::Codex);
+        let second = store.start(&checkout, AgentKind::Claude);
+        for launch in [&first, &second] {
+            launch.emitter().working(None);
+            launch.emitter().idle(None);
+            launch.emitter().idle(None);
+        }
+        assert_eq!(store.snapshot().unread_completions().count(), 2);
+        store.acknowledge_completions(|_| true);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        assert_eq!(
+            store.snapshot().for_checkout(&checkout).unwrap().state,
+            ActivityState::Finished
+        );
+        // A redraw of the same result cannot re-notify; a later turn can.
+        first.emitter().idle(None);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        first.emitter().working(None);
+        first.emitter().idle(None);
+        store.set_visible_checkout(Some(&checkout));
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
+    }
+
+    #[test]
+    fn completion_notifications_include_visible_turns_and_filter_acknowledgements() {
+        let (store, checkout) = store();
+        let other_checkout = checkout.join("other");
+        let visible = store.start(&checkout, AgentKind::Codex);
+        let background = store.start(&other_checkout, AgentKind::Opencode);
+        store.set_visible_checkout(Some(&checkout));
+        visible.emitter().working(None);
+        visible.emitter().idle(None);
+        assert_eq!(
+            store.snapshot().for_checkout(&checkout).unwrap().state,
+            ActivityState::Idle
+        );
+        background.emitter().session_working("parent", None);
+        background.emitter().session_working("child", None);
+        background.emitter().session_idle("child", None);
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
+        background
+            .emitter()
+            .reconcile_sessions(HashSet::new(), "Done".into());
+        assert_eq!(store.snapshot().unread_completions().count(), 2);
+        store.acknowledge_completions(|path| path == checkout);
+        assert_eq!(
+            store.snapshot().unread_completions().collect::<Vec<_>>(),
+            vec![other_checkout.as_path()]
+        );
+    }
+
+    #[test]
+    fn completion_notifications_require_confirmed_successful_work() {
+        let (store, checkout) = store();
+        let launch = store.start(&checkout, AgentKind::Codex);
+        let emitter = launch.emitter();
+        emitter.terminal_evidence(TerminalEvidence::Idle(None));
+        emitter.terminal_evidence(TerminalEvidence::Working(None));
+        emitter.terminal_evidence(TerminalEvidence::Ready(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        emitter.terminal_evidence(TerminalEvidence::Interrupted("Canceled".into()));
+        emitter.terminal_evidence(TerminalEvidence::Idle(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        emitter.working(None);
+        emitter.failed("Failed".into());
+        emitter.idle(None);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        emitter.terminal_evidence(TerminalEvidence::Working(None));
+        emitter.terminal_evidence(TerminalEvidence::Idle(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
+        store.acknowledge_completions(|_| true);
+        emitter.session_working("next", None);
+        emitter.session_idle("next", None);
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
     }
 
     #[test]
