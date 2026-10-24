@@ -39,6 +39,13 @@ pub(crate) fn is_supported_sync_interval(minutes: u64) -> bool {
 /// deliberately no `dataDirectory` field.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct DeviceState {
+    /// Only fresh installations receive `Some(false)`. Missing means a legacy
+    /// installation and must never send existing users through setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) onboarding_complete: Option<bool>,
+    /// Unapplied setup choices, kept on this device across restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) onboarding_draft: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +225,7 @@ impl DeviceStore {
         }
         let state = DeviceState {
             editor_choice: Some(EditorChoice::BuiltIn.id().to_owned()),
+            onboarding_complete: Some(false),
             ..DeviceState::default()
         };
         let mut temp = tempfile::NamedTempFile::new_in(root.root())?;
@@ -377,6 +385,7 @@ mod tests {
             let store = DeviceStore::new(&root);
             store.seed_fresh_install(&root).unwrap();
             assert!(!root.device_path().exists());
+            assert_eq!(store.load().unwrap().onboarding_complete, None);
             assert_eq!(
                 store.load().unwrap().editor_choice_or_default(),
                 EditorChoice::Neovim
@@ -391,6 +400,7 @@ mod tests {
         super::super::ensure_dirs(root.root()).unwrap();
         let store = DeviceStore::new(&root);
         store.seed_fresh_install(&root).unwrap();
+        assert_eq!(store.load().unwrap().onboarding_complete, Some(false));
         store
             .update(|state| state.theme = Some("light".into()))
             .unwrap();

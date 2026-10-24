@@ -12,7 +12,11 @@ gpui_kit::assets::icon_assets!(
         Keyboard,
         Braces,
         Diff,
-        Trash
+        Trash,
+        Monitor,
+        CloudSync,
+        Moon,
+        Sun
     ]
 );
 
@@ -49,6 +53,10 @@ mod tests {
             IconName::Braces,
             IconName::Diff,
             IconName::Trash,
+            IconName::Monitor,
+            IconName::CloudSync,
+            IconName::Moon,
+            IconName::Sun,
             IconName::Search,
             IconName::ChevronLeft,
             IconName::TriangleAlert,

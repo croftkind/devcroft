@@ -12,6 +12,16 @@ run = "cargo build"
 description = "Run Devcroft GUI"
 run = "cargo run -- app"
 
+[tasks."app:fresh"]
+description = "Run Devcroft with clean temporary state to test onboarding"
+run = '''
+set -eu
+devcroft_fresh_data="$(mktemp -d "${TMPDIR:-/tmp}/devcroft-onboarding.XXXXXX")"
+trap 'rm -rf -- "$devcroft_fresh_data"' EXIT
+printf 'Temporary app data: %s\n' "$devcroft_fresh_data"
+DEVCROFT_DATA_DIR="$devcroft_fresh_data" cargo run -- app
+'''
+
 [tasks.install]
 description = "Install Devcroft as a desktop app, replacing the old Electron install (Linux + macOS)"
 usage = 'flag "--debug" help="Install a debug build instead of release"'

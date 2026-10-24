@@ -142,6 +142,57 @@ pub(crate) fn set_origin(root: &DataRoot, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Adopt an existing backup during first-run setup. Clone and validate before
+/// touching local data. Keep the previous tree outside portable/ for recovery;
+/// a marker inside the adopted Git directory makes retries idempotent.
+pub(crate) fn restore_onboarding_backup(root: &DataRoot, url: &str) -> Result<()> {
+    anyhow::ensure!(
+        super::DeviceStore::new(root).load()?.onboarding_complete == Some(false),
+        "Backup restore is only available during fresh-install setup"
+    );
+    let portable = root.portable_dir();
+    let marker = "devcroft-onboarding-source";
+    if std::fs::read_to_string(portable.join(".git").join(marker))
+        .ok()
+        .as_deref()
+        == Some(url)
+    {
+        return Ok(());
+    }
+    let staging = tempfile::Builder::new()
+        .prefix("onboarding-clone-")
+        .tempdir_in(root.root())?;
+    run_git_in(staging.path(), &["clone", "--", url, "portable"])
+        .context("Could not read the backup. Check its URL, network access, and Git credentials")?;
+    let cloned = staging.path().join("portable");
+    let descriptor = cloned.join("workspace.json");
+    let metadata = std::fs::symlink_metadata(&descriptor)
+        .context("This repository is not a Devcroft backup: workspace.json is missing")?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= 1_048_576,
+        "This repository does not contain a valid Devcroft workspace.json"
+    );
+    let workspace: WorkspaceDoc = serde_json::from_slice(&std::fs::read(&descriptor)?)
+        .context("The backup's workspace.json is not valid")?;
+    anyhow::ensure!(
+        workspace.format_version.is_some(),
+        "This repository is not a Devcroft backup: workspace format is missing"
+    );
+    std::fs::write(cloned.join(".git").join(marker), url)?;
+    let _gate = super::store_lock::portable_gate(root, true)?;
+    let backup = tempfile::Builder::new()
+        .prefix("onboarding-backup-")
+        .tempdir_in(root.root())?
+        .keep();
+    let previous = backup.join("portable");
+    std::fs::rename(&portable, &previous).context("Preserving local setup data before restore")?;
+    if let Err(error) = std::fs::rename(&cloned, &portable) {
+        std::fs::rename(&previous, &portable).context("Could not restore the original setup directory; it is retained in the onboarding-backup directory")?;
+        return Err(error).context("Adopting the cloned backup; original setup data was restored");
+    }
+    Ok(())
+}
+
 /// Remove the `origin` remote. Idempotent: a missing `origin` is success and
 /// reports `false`, so a Remove action stays honest about what changed.
 pub(crate) fn clear_origin(root: &DataRoot) -> Result<bool> {
@@ -311,6 +362,87 @@ mod tests {
     use super::*;
     use crate::data::DataRoot;
     use std::process::Command;
+
+    #[test]
+    fn onboarding_restore_validates_backup_and_preserves_original_data() {
+        let (source_dir, source) = fresh_root();
+        ensure_portable_init(&source, &InitOptions::default()).unwrap();
+        configure_identity(&source.portable_dir());
+        std::fs::write(source.portable_dir().join("notes.txt"), "from other device").unwrap();
+        git(&source.portable_dir(), &["add", "."]);
+        git(&source.portable_dir(), &["commit", "-m", "backup"]);
+        let (_target_dir, target) = fresh_root();
+        super::super::ensure_dirs(target.root()).unwrap();
+        super::super::DeviceStore::new(&target)
+            .seed_fresh_install(&target)
+            .unwrap();
+        ensure_portable_init(&target, &InitOptions::default()).unwrap();
+        std::fs::write(target.portable_dir().join("local.txt"), "keep me").unwrap();
+        let url = source.portable_dir().to_string_lossy().into_owned();
+        restore_onboarding_backup(&target, &url).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.portable_dir().join("notes.txt")).unwrap(),
+            "from other device"
+        );
+        let backup = std::fs::read_dir(target.root())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("onboarding-backup-")
+            })
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(backup.path().join("portable/local.txt")).unwrap(),
+            "keep me"
+        );
+        std::fs::write(
+            target.portable_dir().join("notes.txt"),
+            "local change after restore",
+        )
+        .unwrap();
+        drop(source_dir);
+        restore_onboarding_backup(&target, &url).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.portable_dir().join("notes.txt")).unwrap(),
+            "local change after restore"
+        );
+    }
+
+    #[test]
+    fn onboarding_restore_rejects_non_backups_and_completed_installations() {
+        let (_source_dir, source) = fresh_root();
+        ensure_portable_init(&source, &InitOptions::default()).unwrap();
+        configure_identity(&source.portable_dir());
+        std::fs::remove_file(source.portable_dir().join("workspace.json")).unwrap();
+        std::fs::write(source.portable_dir().join("README"), "ordinary repository").unwrap();
+        git(&source.portable_dir(), &["add", "."]);
+        git(&source.portable_dir(), &["commit", "-m", "project"]);
+        let (_target_dir, target) = fresh_root();
+        super::super::ensure_dirs(target.root()).unwrap();
+        let store = super::super::DeviceStore::new(&target);
+        store.seed_fresh_install(&target).unwrap();
+        ensure_portable_init(&target, &InitOptions::default()).unwrap();
+        let original = std::fs::read(target.portable_dir().join("workspace.json")).unwrap();
+        let url = source.portable_dir().to_string_lossy().into_owned();
+        assert!(restore_onboarding_backup(&target, &url).is_err());
+        assert_eq!(
+            std::fs::read(target.portable_dir().join("workspace.json")).unwrap(),
+            original
+        );
+        assert_eq!(store.load().unwrap().onboarding_complete, Some(false));
+        store
+            .update(|state| state.onboarding_complete = Some(true))
+            .unwrap();
+        assert!(
+            restore_onboarding_backup(&target, &url)
+                .unwrap_err()
+                .to_string()
+                .contains("fresh-install")
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")

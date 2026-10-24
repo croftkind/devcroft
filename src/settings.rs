@@ -15,7 +15,6 @@
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
-use gpui_kit::base::Radio;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -28,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled,
-    WeakEntity, Window, div, px, rgb,
+    WeakEntity, Window, div, px,
 };
 
 use std::{collections::HashMap, rc::Rc};
@@ -55,6 +54,7 @@ use crate::metrics::{
     DEFAULT_APP_FONT_SIZE, MAX_APP_FONT_SIZE, MIN_APP_FONT_SIZE, clamp_app_font_size,
     review_font_size, set_app_font_size,
 };
+use crate::selection_card;
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1475,8 +1475,7 @@ impl SettingsView {
                         .child(Button::new("check-neovim").small().label("Refresh").ghost().disabled(self.neovim_checking)
                             .on_click(cx.listener(|this, _, _, cx| this.check_neovim(cx)))))
                     .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Choose how project files open. Existing sessions and unsaved drafts are preserved.")))
-                .child(gpui_kit::base::RadioGroup::new("default-editor-cards")
-                    .axis(gpui_kit::Axis::Horizontal).flex().flex_row().items_stretch().gap_3().w_full()
+                .child(selection_card::group("default-editor-cards")
                     .children([EditorChoice::BuiltIn, EditorChoice::Neovim].into_iter().enumerate().map(|(index, choice)| {
                         let selected = self.editor_choice == choice;
                         let unavailable = choice == EditorChoice::Neovim && (self.neovim_checking || !self.neovim_available);
@@ -1492,17 +1491,9 @@ impl SettingsView {
                             EditorChoice::BuiltIn => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Devcroft, &tiles, crate::editor_icons::ICON_PX),
                             EditorChoice::Neovim => crate::editor_icons::editor_icon(crate::editor_icons::EditorIcon::Neovim, &tiles, crate::editor_icons::ICON_PX),
                         };
-                        Radio::new(format!("default-editor-{}", choice.id()))
+                        selection_card::radio(format!("default-editor-{}", choice.id()), selected, unavailable, cx)
                             .accessibility_label(format!("Default editor: {title}{}", if unavailable { " (unavailable)" } else { "" }))
                             .track_focus(&focus).set_position(index + 1, 2)
-                            .checked(selected).disabled(unavailable)
-                            .flex().flex_row().items_start().gap_2()
-                            .flex_1().min_w_0().px_3().py_2()
-                            .focus(|style| style.border_color(rgb(0x9acfff)))
-                            .child(div().size(px(16.)).mt(px(1.)).flex_shrink_0().rounded_full().border_1()
-                                .border_color(rgb(if unavailable { 0x4b5057 } else if selected { 0x61afef } else { 0x737983 }))
-                                .flex().items_center().justify_center()
-                                .when(selected, |circle| circle.child(div().size(px(7.)).rounded_full().bg(rgb(if unavailable { 0x737983 } else { 0x61afef })))))
                             .when(!unavailable, |radio| radio
                                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                     focus.focus(window, cx);
@@ -1524,11 +1515,7 @@ impl SettingsView {
                                         cx.stop_propagation();
                                     }
                                 })))
-                            .child(v_flex().gap_1().flex_1().min_w_0()
-                                .child(h_flex().items_center().gap_2()
-                                    .child(icon)
-                                    .child(div().text_sm().font_semibold().text_color(cx.theme().foreground).child(title)))
-                                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(description))
+                            .child(selection_card::content(icon, title, description, cx)
                                 .when(choice == EditorChoice::Neovim, |card| {
                                     let status = if self.neovim_checking {
                                         "Checking for Neovim…".to_owned()
@@ -1549,10 +1536,6 @@ impl SettingsView {
                                     card.child(div().text_xs().text_color(status_color).child(status))
                                 }))
                             .on_change(move |_, _, window, cx| { let _ = view.update(cx, |this, cx| this.set_editor_choice(choice, window, cx)); })
-                            .map(|radio| v_flex().flex_1().min_w_0().rounded_md().border_1()
-                                .border_color(if selected { cx.theme().ring } else { cx.theme().border })
-                                .bg(if selected { cx.theme().accent } else { cx.theme().background })
-                                .child(radio))
                     }))))
             .when_some(self.editor_error.clone(), |view, error| view.child(div().text_sm().text_color(cx.theme().danger).child(error)))
             .child(self.language_servers.clone())

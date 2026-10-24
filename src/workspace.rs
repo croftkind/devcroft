@@ -249,6 +249,8 @@ pub(crate) struct Workspace {
     /// Strong entity handles keep hidden PTYs and their output tasks alive.
     inactive_repositories: HashMap<PathBuf, RepositoryTabs>,
     settings: Entity<SettingsView>,
+    onboarding: Option<Entity<crate::onboarding::OnboardingView>>,
+    onboarding_reference: Option<crate::markdown_references::Reference>,
     /// Tool dialogs opened from the command bar's Tools section: one
     /// long-lived view per tool, created on first open. Reopening shows
     /// exactly what was left there, and a close-time save flush can still
@@ -810,6 +812,26 @@ impl Workspace {
         .detach();
         let mut agent_icon_tiles = AgentIconTiles::new();
         agent_icons::ensure_tiles(AgentKind::ALL, &mut agent_icon_tiles, cx);
+        let onboarding = data_root
+            .as_ref()
+            .filter(|_| {
+                stored
+                    .as_ref()
+                    .is_some_and(|state| state.onboarding_complete == Some(false))
+            })
+            .map(|root| {
+                cx.new(|cx| crate::onboarding::OnboardingView::new(root.clone(), window, cx))
+            });
+        if let Some(view) = &onboarding {
+            cx.subscribe_in(
+                view,
+                window,
+                |this, _, _: &crate::onboarding::SetupComplete, window, cx| {
+                    this.complete_onboarding(window, cx);
+                },
+            )
+            .detach();
+        }
         Self {
             relationships,
             relationships_visible: false,
@@ -835,6 +857,8 @@ impl Workspace {
             enabled_agents,
             inactive_repositories: HashMap::new(),
             settings,
+            onboarding,
+            onboarding_reference: None,
             tool_views: HashMap::new(),
             project_name: project_name.into(),
             git_poll: GitPoll::default(),
@@ -1249,11 +1273,47 @@ impl Workspace {
             .update(cx, |view, cx| view.set_navigation_open(open, cx));
     }
 
-    /// Open Settings as a modal dialog (fixed height, scrollable body — see
-    /// the dialog component's scrollable pattern). The [`SettingsView`]
-    /// entity outlives the dialog, so the selected section and pending edits
-    /// survive close/reopen. Esc, backdrop click, and the close button all
-    /// dismiss via the dialog layer; nothing here tracks open state.
+    /// Apply completed first-run choices to the existing Home window.
+    fn complete_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self
+            .data_root
+            .as_ref()
+            .and_then(|root| DeviceStore::new(root).load().ok())
+        else {
+            return;
+        };
+        self.onboarding = None;
+        self.active_space = state
+            .active_space
+            .as_deref()
+            .unwrap_or(crate::data::DEFAULT_SPACE)
+            .into();
+        self.set_enabled_agents(
+            state.enabled_agents_or_default(),
+            state.default_agent_or_default(),
+            cx,
+        );
+        self.set_editor_choice(state.editor_choice_or_default(), window, cx);
+        gpui_kit::component::Theme::change(
+            crate::theme_mode_from_name(state.theme.as_deref().unwrap_or("dark")),
+            Some(window),
+            cx,
+        );
+        crate::apply_focus_theme(cx);
+        self.reload_spaces(cx);
+        self.home.update(cx, |view, cx| view.reload(cx));
+        self.settings
+            .update(cx, |view, cx| view.refresh_from_disk(window, cx));
+        self.last_sync_started = Instant::now();
+        self.home.read(cx).focus_handle.clone().focus(window, cx);
+        if let Some(reference) = self.onboarding_reference.take() {
+            self.open_reference(reference, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Open Settings as a modal dialog. The long-lived view preserves its
+    /// selected section and pending edits across reopenings.
     fn open_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.git_header_busy && !self.can_leave_git(window, cx) {
             return;
@@ -2461,6 +2521,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.onboarding.is_some() {
+            self.onboarding_reference = Some(reference);
+            return;
+        }
         if !self.can_leave_git(window, cx) {
             return;
         }
@@ -2636,6 +2700,9 @@ impl Workspace {
     /// Settings edits re-arm the schedule within one poll. `None` (or zero)
     /// means Off.
     fn auto_sync_interval_minutes(&self) -> Option<u64> {
+        if self.onboarding.is_some() {
+            return None;
+        }
         self.data_root
             .as_ref()
             .and_then(|root| DeviceStore::new(root).load().ok())
@@ -3636,6 +3703,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.onboarding.is_some() {
+            return;
+        }
         // Quit stays live everywhere, including navigation mode and held-key
         // repeats: close the HUD (if open) and let the keystroke continue to
         // normal dispatch, which quits via the global OS-primary binding.
@@ -3972,6 +4042,12 @@ fn activity_state_color(state: ActivityState) -> u32 {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(onboarding) = &self.onboarding {
+            return div()
+                .size_full()
+                .child(onboarding.clone())
+                .into_any_element();
+        }
         if !self.home_visible && !self.relationships_visible {
             self.ensure_git_view(window, cx);
         }
@@ -4541,6 +4617,7 @@ impl Render for Workspace {
             .when(self.navigation_open, |this| {
                 this.child(deferred(self.render_navigation_hud(window, cx)))
             })
+            .into_any_element()
         // Dialogs, sheets, notifications, menus and tooltips are hosted
         // by the component `Root` automatically (registered by
         // `gpui_kit::init`), above this content.

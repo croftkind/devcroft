@@ -23,6 +23,25 @@ Packages support Linux x86-64 (Ubuntu 24.04 or compatible) and macOS 13+ (Intel 
 
 You need Git (`git` on the application PATH) and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
 
+On a fresh installation, setup starts with **Sync & backup**: keep data local,
+connect a new private Git repository, or choose **Existing repository** to connect
+another device. A fresh setup then asks for a space, agent harnesses and account
+isolation, editor and appearance, and an optional first repository. Repository
+details use a collapsible accordion for the key, owner, name, clone URL,
+description, and tags; Git detection fills the defaults.
+
+Connecting another device skips space creation and the first repository step.
+Your saved spaces, repositories, and isolation profiles are restored when you
+finish; link their local checkouts from Home. Agent harnesses, default agent,
+editor, and appearance are configured for this device. Restore validates the
+backup before adoption and keeps original setup files locally for recovery.
+
+Automatic sync can run every 2, 5, 15, or 30 minutes. For a new backup, verify access
+with **Settings → Sync → Sync now** after setup. Setup does not install or
+authenticate agent CLIs. Choices stay in a local draft until you finish, and
+closing the app resumes setup next time. **Use defaults** opens a review of the
+default choices. Existing installations keep their settings.
+
 ### Build from source
 
 Install [mise](https://mise.jdx.dev/) to manage the pinned Rust and Zig toolchains:
@@ -32,6 +51,10 @@ mise install
 mise run build
 mise run app
 ```
+
+To test onboarding with a clean installation, run `mise run app:fresh`. Each run
+uses a new temporary data directory, which is removed when the app exits. Your
+regular app data stays in its existing directory.
 
 Install as the **Devcroft** desktop app:
 

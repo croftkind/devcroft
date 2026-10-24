@@ -35,7 +35,7 @@ pub(crate) use device::{
 pub(crate) use portable::{
     CheckoutOutcome, InitOptions, InitOutcome, WorkspaceDoc, checkout_branch, clear_origin,
     current_branch_name, current_upstream, ensure_portable_init, get_origin, list_local_branches,
-    load_workspace, set_origin,
+    load_workspace, restore_onboarding_backup, set_origin,
 };
 pub(crate) use repositories::{
     CheckoutInspection, CreatedRepository, LinkedRepository, NewRepositoryInput, RecentRepository,
@@ -274,9 +274,9 @@ fn render_git_args(args: &[&str]) -> String {
     args.iter()
         .map(|arg| {
             if arg.contains(' ') {
-                format!("\"{arg}\"")
+                format!("\"{}\"", sanitize_git_message(arg))
             } else {
-                (*arg).to_owned()
+                sanitize_git_message(arg)
             }
         })
         .collect::<Vec<_>>()
@@ -320,6 +320,17 @@ pub(crate) fn sanitize_git_message(message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn onboarding_git_command_errors_redact_credentials_in_arguments() {
+        let rendered = super::render_git_args(&[
+            "clone",
+            "https://user:secret-token@example.com/backup.git",
+            "portable",
+        ]);
+        assert!(!rendered.contains("secret-token"));
+        assert!(!rendered.contains("user:"));
+        assert!(rendered.contains("example.com/backup.git"));
+    }
     use super::*;
     use serde_json::json;
 

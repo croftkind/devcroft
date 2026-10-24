@@ -4,9 +4,9 @@
 //!
 //! The view is created fresh for every dialog opening (unlike Settings,
 //! whose edits survive reopenings): a half-filled add form going stale
-//! behind the dialog would be worse than re-harvesting. `Browse` fills only
-//! empty fields from the checkout — explicit edits are never overwritten,
-//! so clearing a field and re-browsing re-harvests just that field.
+//! behind the dialog would be worse than re-harvesting. `Browse` refreshes
+//! detected defaults while preserving explicit edits. Clearing a field and
+//! re-browsing re-harvests that field.
 //!
 //! Why a dialog plus the OS picker instead of the sheet file-browser
 //! example from gpui-kit docs: the dialog layer is already rendered by
@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{WindowExt as _, h_flex, v_flex};
@@ -28,6 +28,8 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, PathPromptOptions, Render, Styled, Window, div, rgb,
 };
+
+use crate::repository_form::{RepositoryDraft, RepositoryForm};
 
 use crate::command_palette::{
     PaletteMode, ToggleActionsPalette, ToggleProjectsPalette, palette_mode_for_shortcut,
@@ -56,18 +58,12 @@ pub(crate) struct AddRepositoryView {
     mode: RepositoryDialogMode,
     data_root: Option<DataRoot>,
     checkout_path: Option<PathBuf>,
-    key: Entity<InputState>,
-    display_name: Entity<InputState>,
-    owner: Entity<InputState>,
-    name: Entity<InputState>,
-    description: Entity<InputState>,
+    form: RepositoryForm,
+    detected: Option<RepositoryDraft>,
     /// Isolation profile for Create/Edit, chosen from the catalog; new
     /// repositories default to the active space.
     space: String,
     spaces: Vec<String>,
-    tags: Entity<InputState>,
-    clone_url: Entity<InputState>,
-    base_branch: Entity<InputState>,
     revision: String,
     busy: bool,
     error: Option<String>,
@@ -84,9 +80,7 @@ impl AddRepositoryView {
         spaces: Vec<String>,
         default_space: String,
     ) -> Self {
-        let mut input = |placeholder: &str, cx: &mut Context<Self>| {
-            cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
-        };
+        let form = RepositoryForm::new(&RepositoryDraft::default(), window, cx);
         Self {
             workspace: None,
             original_space: None,
@@ -94,16 +88,10 @@ impl AddRepositoryView {
             mode: RepositoryDialogMode::Create,
             data_root,
             checkout_path: None,
-            key: input("e.g. hossainemruz-devcroft", cx),
-            display_name: input("e.g. Devcroft", cx),
-            owner: input("e.g. hossainemruz", cx),
-            name: input("e.g. devcroft", cx),
-            description: input("What is this repository for?", cx),
+            form,
+            detected: None,
             space: default_space,
             spaces,
-            tags: input("Comma-separated, e.g. rust, desktop", cx),
-            clone_url: input("e.g. git@github.com:hossainemruz/devcroft.git", cx),
-            base_branch: input("e.g. main", cx),
             revision: String::new(),
             busy: false,
             error: None,
@@ -146,13 +134,13 @@ impl AddRepositoryView {
             }
         };
         prefill(
-            &view.display_name,
+            &view.form.display_name,
             metadata.display_name.as_deref().unwrap_or(""),
         );
-        prefill(&view.owner, metadata.owner.as_deref().unwrap_or(""));
-        prefill(&view.name, metadata.name.as_deref().unwrap_or(""));
+        prefill(&view.form.owner, metadata.owner.as_deref().unwrap_or(""));
+        prefill(&view.form.name, metadata.name.as_deref().unwrap_or(""));
         prefill(
-            &view.description,
+            &view.form.description,
             metadata.description.as_deref().unwrap_or(""),
         );
         view.space = metadata
@@ -161,12 +149,15 @@ impl AddRepositoryView {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(view.space);
         prefill(
-            &view.tags,
+            &view.form.tags,
             &metadata.tags.clone().unwrap_or_default().join(", "),
         );
-        prefill(&view.clone_url, metadata.clone_url.as_deref().unwrap_or(""));
         prefill(
-            &view.base_branch,
+            &view.form.clone_url,
+            metadata.clone_url.as_deref().unwrap_or(""),
+        );
+        prefill(
+            &view.form.base_branch,
             metadata.base_branch.as_deref().unwrap_or(""),
         );
         view.mode = RepositoryDialogMode::Edit { key };
@@ -181,50 +172,9 @@ impl AddRepositoryView {
         self.workspace = Some(workspace);
     }
 
-    /// Pure form snapshot for validation: whitespace-only counts as absent.
-    /// Unit-testable without a window. Eight arguments because the form has
-    /// eight metadata fields mapping 1:1 onto [`NewRepositoryInput`].
-    #[allow(clippy::too_many_arguments)]
-    fn snapshot(
-        display_name: &str,
-        owner: &str,
-        name: &str,
-        description: &str,
-        space: &str,
-        tags: &str,
-        clone_url: &str,
-        base_branch: &str,
-    ) -> NewRepositoryInput {
-        let present = |value: &str| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_owned())
-        };
-        NewRepositoryInput {
-            display_name: present(display_name),
-            owner: present(owner),
-            name: present(name),
-            description: present(description),
-            space: present(space),
-            tags: tags.split(',').map(str::to_owned).collect(),
-            clone_url: present(clone_url),
-            base_branch: present(base_branch),
-        }
-    }
-
     fn values(&self, cx: &App) -> (String, NewRepositoryInput) {
-        let text = |state: &Entity<InputState>| state.read(cx).value().to_string();
-        let key = text(&self.key).trim().to_owned();
-        let input = Self::snapshot(
-            &text(&self.display_name),
-            &text(&self.owner),
-            &text(&self.name),
-            &text(&self.description),
-            &self.space,
-            &text(&self.tags),
-            &text(&self.clone_url),
-            &text(&self.base_branch),
-        );
-        (key, input)
+        let draft = self.form.snapshot(cx);
+        (draft.key.trim().to_owned(), draft.input(&self.space))
     }
 
     /// Open the native directory picker, then harvest the checkout on a
@@ -292,45 +242,18 @@ impl AddRepositoryView {
         match inspection {
             Ok(inspection) => {
                 self.error = None;
-                self.fill_if_empty(&self.key, &inspection.suggested_key, window, cx);
-                self.fill_if_empty(
-                    &self.owner,
-                    inspection.owner.as_deref().unwrap_or(""),
+                self.detected = Some(self.form.apply_inspection(
+                    &inspection,
+                    self.detected.as_ref(),
                     window,
                     cx,
-                );
-                self.fill_if_empty(&self.name, &inspection.name, window, cx);
-                self.fill_if_empty(
-                    &self.clone_url,
-                    inspection.clone_url.as_deref().unwrap_or(""),
-                    window,
-                    cx,
-                );
-                self.fill_if_empty(&self.base_branch, &inspection.base_branch, window, cx);
+                ));
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
             }
         }
         cx.notify();
-    }
-
-    /// `set_value` needs a window, so harvested fills go through here
-    /// rather than the async completion directly.
-    fn fill_if_empty(
-        &self,
-        state: &Entity<InputState>,
-        value: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if value.is_empty() {
-            return;
-        }
-        let empty = state.read(cx).value().trim().is_empty();
-        if empty {
-            state.update(cx, |state, cx| state.set_value(value, window, cx));
-        }
     }
 
     /// Validate, then persist off the main thread. Create writes the record
@@ -468,15 +391,7 @@ impl AddRepositoryView {
     }
 
     fn field(&self, label: &str, state: &Entity<InputState>) -> impl IntoElement {
-        v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x858989))
-                    .child(label.to_owned()),
-            )
-            .child(Input::new(state))
+        RepositoryForm::field(label, state)
     }
 
     /// Space picker for the metadata form: the catalog's spaces, plus the
@@ -590,7 +505,7 @@ impl AddRepositoryView {
         v_flex()
             .gap_3()
             .w_full()
-            .child(self.field("Display name", &self.display_name))
+            .child(self.field("Display name", &self.form.display_name))
             .child(
                 h_flex()
                     .gap_3()
@@ -598,16 +513,16 @@ impl AddRepositoryView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(self.field("Owner", &self.owner)),
+                            .child(self.field("Owner", &self.form.owner)),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(self.field("Name", &self.name)),
+                            .child(self.field("Name", &self.form.name)),
                     ),
             )
-            .child(self.field("Description", &self.description))
+            .child(self.field("Description", &self.form.description))
             .child(
                 h_flex()
                     .gap_3()
@@ -616,11 +531,11 @@ impl AddRepositoryView {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(self.field("Tags (comma-separated)", &self.tags)),
+                            .child(self.field("Tags (comma-separated)", &self.form.tags)),
                     ),
             )
-            .child(self.field("Clone URL", &self.clone_url))
-            .child(self.field("Base branch", &self.base_branch))
+            .child(self.field("Clone URL", &self.form.clone_url))
+            .child(self.field("Base branch", &self.form.base_branch))
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -678,7 +593,7 @@ impl Render for AddRepositoryView {
             RepositoryDialogMode::Create => {
                 body = body
                     .child(self.render_checkout(cx))
-                    .child(self.field("Repository key (required, lowercase)", &self.key))
+                    .child(self.field("Repository key (required, lowercase)", &self.form.key))
                     .child(self.render_metadata_fields(cx));
             }
             RepositoryDialogMode::Link { key } => {
@@ -713,36 +628,5 @@ impl Render for AddRepositoryView {
             )
             .child(self.render_footer(cx))
             .on_key_down(cx.listener(Self::on_key_down))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AddRepositoryView;
-
-    #[test]
-    fn snapshot_trims_and_splits_tags() {
-        let input = AddRepositoryView::snapshot(
-            "  Display  ",
-            "",
-            "name",
-            "   ",
-            "personal",
-            "rust, desktop ,,rust",
-            "  https://example.com/o/r.git ",
-            "",
-        );
-        assert_eq!(input.display_name.as_deref(), Some("Display"));
-        assert!(input.owner.is_none());
-        assert_eq!(input.name.as_deref(), Some("name"));
-        assert!(input.description.is_none());
-        assert_eq!(input.space.as_deref(), Some("personal"));
-        assert_eq!(
-            input.clone_url.as_deref(),
-            Some("https://example.com/o/r.git")
-        );
-        assert!(input.base_branch.is_none());
-        // Raw split here; `clean_tags` dedups at create time.
-        assert_eq!(input.tags, vec!["rust", " desktop ", "", "rust"]);
     }
 }
