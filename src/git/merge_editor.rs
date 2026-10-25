@@ -688,7 +688,7 @@ mod tests {
         test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
             "cmd-shift-z"
         } else {
-            "ctrl-shift-z"
+            "ctrl-y"
         });
         editor.read_with(test_cx, |view, cx| {
             assert_eq!(view.output(cx), "prefix\nবাংলা\nincoming\nsuffix\n")

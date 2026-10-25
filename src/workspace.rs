@@ -424,6 +424,21 @@ impl Workspace {
         cx: &mut Context<Self>,
         working_directory: &Path,
     ) -> Self {
+        Self::new_with_onboarding(window, cx, working_directory, true)
+    }
+
+    /// Keep unrelated workspace behavior tests independent of first-run setup.
+    #[cfg(test)]
+    fn new_for_test(window: &mut Window, cx: &mut Context<Self>, working_directory: &Path) -> Self {
+        Self::new_with_onboarding(window, cx, working_directory, false)
+    }
+
+    fn new_with_onboarding(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        working_directory: &Path,
+        allow_onboarding: bool,
+    ) -> Self {
         let project_name = working_directory
             .file_name()
             .and_then(|name| name.to_str())
@@ -815,9 +830,10 @@ impl Workspace {
         let onboarding = data_root
             .as_ref()
             .filter(|_| {
-                stored
-                    .as_ref()
-                    .is_some_and(|state| state.onboarding_complete == Some(false))
+                allow_onboarding
+                    && stored
+                        .as_ref()
+                        .is_some_and(|state| state.onboarding_complete == Some(false))
             })
             .map(|root| {
                 cx.new(|cx| crate::onboarding::OnboardingView::new(root.clone(), window, cx))
@@ -4739,7 +4755,7 @@ mod tests {
         let holder = Rc::new(RefCell::new(None));
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, &root));
             *slot.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -4848,8 +4864,9 @@ mod tests {
     fn completion_indicator_acknowledges_only_the_active_space(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);
         let directory = tempfile::tempdir().unwrap();
-        let (_, test_cx) =
-            cx.add_window_view(move |window, cx| Workspace::new(window, cx, directory.path()));
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            Workspace::new_for_test(window, cx, directory.path())
+        });
         test_cx.update(|window, cx| {
             let workspace = window.root::<Workspace>().unwrap().unwrap();
             workspace.update(cx, |w, cx| {
@@ -4922,7 +4939,7 @@ mod tests {
         let holder = Rc::new(RefCell::new(None));
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, &root));
             workspace.update(cx, |workspace, cx| {
                 workspace.home_visible = false;
                 workspace.active_tab = WorkspaceTab::Resources;
@@ -4982,7 +4999,7 @@ mod tests {
         let holder = Rc::new(RefCell::new(None));
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, &root));
             *slot.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -5046,7 +5063,7 @@ mod tests {
         let holder = Rc::new(RefCell::new(None));
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, &root));
             *slot.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -5158,7 +5175,7 @@ mod tests {
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(|window, cx| {
             let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(window, cx, &root);
+                let mut workspace = Workspace::new_for_test(window, cx, &root);
                 workspace.home_visible = false;
                 workspace.active_tab = WorkspaceTab::Editor;
                 workspace.editor_instance = Some(EditorChoice::BuiltIn);
@@ -5360,7 +5377,7 @@ mod tests {
         let holder = Rc::new(RefCell::new(None));
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(|window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, &root));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, &root));
             *slot.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -5448,7 +5465,7 @@ mod tests {
         let slot = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
             let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(window, cx, &root);
+                let mut workspace = Workspace::new_for_test(window, cx, &root);
                 workspace.open_git_page(window, cx);
                 workspace
             });
@@ -5505,7 +5522,7 @@ mod tests {
         let captured = holder.clone();
         let (_, test_cx) = cx.add_window_view(move |window, cx| {
             let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(window, cx, &root);
+                let mut workspace = Workspace::new_for_test(window, cx, &root);
                 workspace.home_visible = false;
                 workspace.active_tab = WorkspaceTab::Editor;
                 workspace.editor_instance = Some(EditorChoice::BuiltIn);
@@ -5664,7 +5681,7 @@ mod tests {
         let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
         let holder_for_window = holder.clone();
         let (_root, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, directory.path()));
             *holder_for_window.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -5854,7 +5871,7 @@ mod tests {
         let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
         let holder_for_window = holder.clone();
         let (_root, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, directory.path()));
             *holder_for_window.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -5935,7 +5952,7 @@ mod tests {
         let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
         let holder_for_window = holder.clone();
         let (_root, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, directory.path()));
             *holder_for_window.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -6055,7 +6072,7 @@ mod tests {
         let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
         let holder_for_window = holder.clone();
         let (_root, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, directory.path()));
             *holder_for_window.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
@@ -6155,7 +6172,7 @@ mod tests {
         let holder: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
         let holder_for_window = holder.clone();
         let (_root, test_cx) = cx.add_window_view(move |window, cx| {
-            let workspace = cx.new(|cx| Workspace::new(window, cx, directory.path()));
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, directory.path()));
             *holder_for_window.borrow_mut() = Some(workspace.clone());
             Root::new(workspace, window, cx)
         });
