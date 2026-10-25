@@ -195,29 +195,20 @@ pub(crate) fn fetch(url: &str) -> Result<Status> {
 /// this, macOS users with a working terminal `gh` still see "Could not
 /// start GitHub CLI".
 pub(crate) fn resolve_gh() -> Result<PathBuf> {
+    let home = env::var_os("HOME").filter(|home| !home.is_empty());
     resolve_gh_from(
         env::var_os("PATH").as_deref(),
-        env::var_os("HOME").as_deref(),
+        well_known_candidates(home.as_deref().map(Path::new)),
         || login_shell_lookup(SHELL_LOOKUP_TIMEOUT),
     )
 }
 
 fn resolve_gh_from(
     path_var: Option<&OsStr>,
-    home: Option<&OsStr>,
+    known_candidates: impl IntoIterator<Item = PathBuf>,
     shell_lookup: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<PathBuf> {
-    let home_path;
-    let home = match home {
-        Some(home) if !home.is_empty() => {
-            home_path = PathBuf::from(home);
-            Some(home_path.as_path())
-        }
-        _ => None,
-    };
-    if let Some(found) =
-        find_on_path(path_var).or_else(|| first_executable(well_known_candidates(home)))
-    {
+    if let Some(found) = find_on_path(path_var).or_else(|| first_executable(known_candidates)) {
         return Ok(found);
     }
     if let Some(found) = shell_lookup() {
@@ -589,41 +580,40 @@ mod tests {
         let path_dir = tempfile::tempdir().unwrap();
         let other_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
+        let empty_dir = tempfile::tempdir().unwrap();
         let path_gh = fake_gh(path_dir.path(), true);
         let _other_gh = fake_gh(other_dir.path(), true);
         let shim_dir = home_dir.path().join(".local/share/mise/shims");
         std::fs::create_dir_all(&shim_dir).unwrap();
         let shim_gh = fake_gh(&shim_dir, true);
+        let known_candidates = well_known_candidates(Some(home_dir.path()));
 
         // Inherited PATH wins.
         let path_var = std::env::join_paths([path_dir.path(), other_dir.path()]).unwrap();
-        let found = resolve_gh_from(
-            Some(path_var.as_os_str()),
-            Some(home_dir.path().as_os_str()),
-            || panic!("shell lookup must not run when PATH already resolves gh"),
-        )
+        let found = resolve_gh_from(Some(path_var.as_os_str()), known_candidates.clone(), || {
+            panic!("shell lookup must not run when PATH already resolves gh")
+        })
         .unwrap();
         assert_eq!(found, path_gh);
 
         // Mise shim covers GUI launches whose PATH lacks user tooling.
-        let found = resolve_gh_from(
-            Some(OsStr::new("/nonexistent")),
-            Some(home_dir.path().as_os_str()),
-            || panic!("shell lookup must not run when a known location resolves gh"),
-        )
+        let found = resolve_gh_from(Some(empty_dir.path().as_os_str()), known_candidates, || {
+            panic!("shell lookup must not run when a known location resolves gh")
+        })
         .unwrap();
         assert_eq!(found, shim_gh);
 
         // Login-shell fallback for install locations we do not know about.
+        // Exclude known candidates so the host's gh cannot preempt fallback.
         let shell_gh = path_gh.clone();
-        let found = resolve_gh_from(Some(OsStr::new("/nonexistent")), None, || {
+        let found = resolve_gh_from(Some(empty_dir.path().as_os_str()), [], || {
             Some(shell_gh.clone())
         })
         .unwrap();
         assert_eq!(found, path_gh);
 
         // Total miss stays actionable and keeps the auth hint.
-        let error = resolve_gh_from(Some(OsStr::new("/nonexistent")), None, || None).unwrap_err();
+        let error = resolve_gh_from(Some(empty_dir.path().as_os_str()), [], || None).unwrap_err();
         assert!(error.to_string().contains("gh not found"));
         assert!(error.to_string().contains("gh auth login"));
     }
