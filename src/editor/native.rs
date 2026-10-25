@@ -133,7 +133,26 @@ pub(crate) struct NativeEditor {
     navigating_history: bool,
     journal_path: Option<PathBuf>,
     journal_lock: Arc<Mutex<()>>,
+    journal_generation: Arc<AtomicU64>,
     journal_digest: Option<u64>,
+}
+
+struct JournalWrite {
+    path: PathBuf,
+    journal: Journal,
+    lock: Arc<Mutex<()>>,
+    generation: Arc<AtomicU64>,
+    expected_generation: u64,
+}
+
+impl JournalWrite {
+    fn write(self) -> Result<()> {
+        let _guard = self.lock.lock().expect("draft journal lock poisoned");
+        if self.generation.load(Ordering::Acquire) == self.expected_generation {
+            drafts::write(&self.path, &self.journal)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -480,13 +499,8 @@ impl NativeEditor {
                     }
                 }
                 let write = view.update(cx, |this, cx| this.journal_if_changed(cx));
-                if let Ok(Some((path, journal, lock))) = write {
-                    let result = cx
-                        .background_spawn(async move {
-                            let _guard = lock.lock().expect("draft journal lock poisoned");
-                            drafts::write(&path, &journal)
-                        })
-                        .await;
+                if let Ok(Some(write)) = write {
+                    let result = cx.background_spawn(async move { write.write() }).await;
                     if let Err(error) = result {
                         let _ = view.update(cx, |this, cx| {
                             this.journal_digest = None;
@@ -501,10 +515,9 @@ impl NativeEditor {
         cx.on_app_quit(|this, cx| {
             let snapshot = this.journal_path.clone().map(|path| {
                 let journal = this.draft_snapshot(cx);
-                let lock = Arc::clone(&this.journal_lock);
+                let write = this.prepare_journal_write(path, journal);
                 cx.background_spawn(async move {
-                    let _guard = lock.lock().expect("draft journal lock poisoned");
-                    let _ = drafts::write(&path, &journal);
+                    let _ = write.write();
                 })
             });
             async move {
@@ -517,11 +530,7 @@ impl NativeEditor {
         cx.on_release(|this, cx| {
             if let Some(path) = this.journal_path.as_ref() {
                 let journal = this.draft_snapshot(cx);
-                let _guard = this
-                    .journal_lock
-                    .lock()
-                    .expect("draft journal lock poisoned");
-                let _ = drafts::write(path, &journal);
+                let _ = this.prepare_journal_write(path.clone(), journal).write();
             }
         })
         .detach();
@@ -596,6 +605,7 @@ impl NativeEditor {
             navigating_history: false,
             journal_path,
             journal_lock: Arc::new(Mutex::new(())),
+            journal_generation: Arc::new(AtomicU64::new(0)),
             journal_digest: None,
         }
     }
@@ -1151,6 +1161,119 @@ impl NativeEditor {
         Ok(())
     }
 
+    fn open_delete_file_dialog(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = path.strip_prefix(&self.canonical_root).unwrap_or(path);
+        let dirty = if self.path.as_deref() == Some(path) {
+            self.dirty
+        } else {
+            self.inactive_documents
+                .get(path)
+                .is_some_and(|document| document.dirty)
+        };
+        let mut message = format!(
+            "\"{}\" will be permanently deleted from disk. This cannot be undone.",
+            label.display()
+        );
+        if dirty {
+            message.push_str(" Its unsaved changes will also be discarded.");
+        }
+        // Restore focus to a persistent handle when the menu/dialog dismisses.
+        if self.path.is_some() {
+            self.editor_focus(cx).focus(window, cx);
+        } else {
+            self.sidebar_focus.focus(window, cx);
+        }
+        let view = cx.entity().downgrade();
+        let path = path.to_owned();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            let path = path.clone();
+            dialog
+                .title("Delete file?")
+                .w(px(420.))
+                .child(message.clone())
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("cancel-delete-file")
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("confirm-delete-file")
+                                .danger()
+                                .label("Delete")
+                                .on_click(|_, window, cx| {
+                                    window
+                                        .dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                                }),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    let result = view.update(cx, |this, cx| this.delete_file(&path, window, cx));
+                    if let Ok(Err(error)) = result {
+                        window.push_notification(format!("Could not delete file: {error:#}"), cx);
+                    }
+                    false
+                })
+        });
+    }
+
+    fn delete_file(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        remove_checkout_file(&self.canonical_root, path)?;
+        // Only discard the buffer after filesystem removal succeeds.
+        window.close_dialog(cx);
+        if self.close_pending.as_deref() == Some(path) {
+            self.close_pending = None;
+        }
+        if self
+            .pending_open
+            .as_ref()
+            .is_some_and(|(pending, _)| pending == path)
+        {
+            self.pending_open = None;
+            self.pending_lsp_position = None;
+        }
+        self.back_locations.retain(|location| location.path != path);
+        self.forward_locations
+            .retain(|location| location.path != path);
+        self.created_files.remove(path);
+        self.files.retain(|file| file.path != path);
+        if self.tree_cursor.as_deref().is_some_and(|cursor| {
+            path.strip_prefix(&self.canonical_root).ok() == Some(Path::new(cursor))
+        }) {
+            self.tree_cursor = None;
+        }
+        self.error = None;
+        self.finish_close(path, window, cx);
+        if let Err(error) = self.persist_recovery_drafts(cx) {
+            self.error = Some(format!(
+                "File deleted, but could not update recovery drafts: {error:#}"
+            ));
+        }
+        self.finder = None;
+        if self.browser != BrowserMode::Buffers {
+            self.reset_finder_results();
+        }
+        // Supersede any scan started before deletion, even in buffer mode.
+        self.refresh_files_in_background(cx);
+        if self.path.is_none() {
+            self.sidebar_focus.focus(window, cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
     fn compare_with_disk(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.path.as_ref() else {
             return;
@@ -1278,7 +1401,30 @@ impl NativeEditor {
         }
     }
 
-    fn journal_if_changed(&mut self, cx: &App) -> Option<(PathBuf, Journal, Arc<Mutex<()>>)> {
+    fn prepare_journal_write(&self, path: PathBuf, journal: Journal) -> JournalWrite {
+        JournalWrite {
+            path,
+            journal,
+            lock: Arc::clone(&self.journal_lock),
+            generation: Arc::clone(&self.journal_generation),
+            expected_generation: self.journal_generation.fetch_add(1, Ordering::AcqRel) + 1,
+        }
+    }
+
+    fn persist_recovery_drafts(&mut self, cx: &App) -> Result<()> {
+        if let Some(path) = self.journal_path.clone() {
+            let journal = self.draft_snapshot(cx);
+            self.journal_digest = None;
+            let digest = content_hash(&serde_json::to_vec(&journal)?);
+            // Force a new generation even when a matching snapshot was queued
+            // by the poll but has not reached disk yet.
+            self.prepare_journal_write(path, journal).write()?;
+            self.journal_digest = Some(digest);
+        }
+        Ok(())
+    }
+
+    fn journal_if_changed(&mut self, cx: &App) -> Option<JournalWrite> {
         let path = self.journal_path.clone()?;
         let journal = self.draft_snapshot(cx);
         let digest = content_hash(&serde_json::to_vec(&journal).ok()?);
@@ -1286,7 +1432,7 @@ impl NativeEditor {
             return None;
         }
         self.journal_digest = Some(digest);
-        Some((path, journal, Arc::clone(&self.journal_lock)))
+        Some(self.prepare_journal_write(path, journal))
     }
 
     fn subscribe_changes(&self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
@@ -2525,6 +2671,7 @@ impl NativeEditor {
                     ("Save", 3, dirty),
                     ("Save as", 4, has_file),
                     ("Discard changes", 5, dirty),
+                    ("Delete file", 15, has_file),
                     ("Find file", 6, true),
                     ("Search project", 7, true),
                     ("Show file tree", 8, true),
@@ -2554,6 +2701,11 @@ impl NativeEditor {
                                 14 => {
                                     let dir = this.active_file_directory();
                                     this.open_new_file_dialog(&dir, window, cx);
+                                }
+                                15 => {
+                                    if let Some(path) = this.path.clone() {
+                                        this.open_delete_file_dialog(&path, window, cx);
+                                    }
                                 }
                                 10 => this.restart_language_server(window, cx),
                                 _ => {}
@@ -2651,6 +2803,7 @@ impl NativeEditor {
                     };
                     let id = item.id();
                     let row_dir = item.directory();
+                    let row_file = item.file.clone();
                     let view = cx.entity().downgrade();
                     panel = panel.child(
                         Button::new(id)
@@ -2684,25 +2837,35 @@ impl NativeEditor {
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.activate_tree_row(&item, window, cx);
                             }))
-                            .context_menu(move |menu, _, _| {
+                            .context_menu(move |mut menu, _, _| {
                                 let create_view = view.clone();
                                 let refresh_view = view.clone();
                                 let dir = row_dir.clone();
-                                menu.item(PopupMenuItem::new("New file").on_click(
-                                    move |_, window, cx| {
-                                        let _ = create_view.update(cx, |this, cx| {
-                                            this.open_new_file_dialog(&dir, window, cx);
-                                        });
-                                    },
-                                ))
-                                .item(
-                                    PopupMenuItem::new("Refresh files").on_click(
+                                menu = menu
+                                    .item(PopupMenuItem::new("New file").on_click(
+                                        move |_, window, cx| {
+                                            let _ = create_view.update(cx, |this, cx| {
+                                                this.open_new_file_dialog(&dir, window, cx);
+                                            });
+                                        },
+                                    ))
+                                    .item(PopupMenuItem::new("Refresh files").on_click(
                                         move |_, _, cx| {
                                             let _ = refresh_view
                                                 .update(cx, |this, cx| this.refresh_files(cx));
                                         },
-                                    ),
-                                )
+                                    ));
+                                if let Some(path) = row_file.clone() {
+                                    let delete_view = view.clone();
+                                    menu = menu.item(PopupMenuItem::new("Delete file").on_click(
+                                        move |_, window, cx| {
+                                            let _ = delete_view.update(cx, |this, cx| {
+                                                this.open_delete_file_dialog(&path, window, cx);
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu
                             }),
                     );
                 }
@@ -2875,6 +3038,46 @@ fn content_hash(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Validate the path again at confirmation time, without following symlinks.
+fn remove_checkout_file(canonical_root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(canonical_root)
+        .context("Choose a file inside this checkout.")?;
+    if relative.as_os_str().is_empty() {
+        bail!("Choose a regular file.");
+    }
+    let mut current = canonical_root.to_owned();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            bail!("Choose a file inside this checkout.");
+        };
+        if project::is_git_component(part) {
+            bail!("Cannot delete files inside .git.");
+        }
+        current.push(part);
+        if fs::symlink_metadata(&current)?.file_type().is_symlink() {
+            bail!("Cannot delete files through symbolic links.");
+        }
+    }
+    let canonical = path.canonicalize().context("Could not resolve file")?;
+    if !canonical.starts_with(canonical_root) {
+        bail!("Choose a file inside this checkout.");
+    }
+    if let Ok(repo) = gix::discover(canonical_root) {
+        for git_dir in [repo.git_dir(), repo.common_dir()] {
+            if let Ok(canonical_git) = git_dir.canonicalize()
+                && canonical.starts_with(canonical_git)
+            {
+                bail!("Cannot delete files inside .git.");
+            }
+        }
+    }
+    if !fs::symlink_metadata(path)?.is_file() {
+        bail!("Choose a regular file.");
+    }
+    fs::remove_file(path).with_context(|| format!("Could not remove {}", path.display()))
 }
 
 pub(crate) fn save_if_unchanged(path: &Path, original: &[u8], replacement: &[u8]) -> Result<()> {
@@ -5477,6 +5680,243 @@ mod tests {
                     .find("native-tree-file-created_in_terminal.rs")
                     .visible()
             );
+        });
+    }
+
+    #[test]
+    fn file_deletion_rejects_non_checkout_files_and_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("keep.txt");
+        fs::write(&outside_file, "keep").unwrap();
+        assert!(remove_checkout_file(&root, &outside_file).is_err());
+        assert!(remove_checkout_file(&root, &root).is_err());
+        fs::create_dir(root.join("folder")).unwrap();
+        assert!(remove_checkout_file(&root, &root.join("folder")).is_err());
+        assert!(remove_checkout_file(&root, &root.join("folder/../keep.txt")).is_err());
+        for (index, git_name) in [".git", ".GIT", ".git."].into_iter().enumerate() {
+            let git_dir = root.join(format!("case-{index}")).join(git_name);
+            fs::create_dir_all(&git_dir).unwrap();
+            let metadata_file = git_dir.join("config");
+            fs::write(&metadata_file, "keep").unwrap();
+            assert!(remove_checkout_file(&root, &metadata_file).is_err());
+            assert!(metadata_file.is_file());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link = root.join("link.txt");
+            symlink(&outside_file, &link).unwrap();
+            assert!(remove_checkout_file(&root, &link).is_err());
+            symlink(outside.path(), root.join("linked")).unwrap();
+            assert!(remove_checkout_file(&root, &root.join("linked/keep.txt")).is_err());
+            let inside = root.join("keep.txt");
+            fs::write(&inside, "keep").unwrap();
+            symlink(&inside, root.join("inside-link.txt")).unwrap();
+            assert!(remove_checkout_file(&root, &root.join("inside-link.txt")).is_err());
+            assert!(inside.is_file());
+        }
+        assert_eq!(fs::read_to_string(outside_file).unwrap(), "keep");
+        let target = root.join("delete.bin");
+        fs::write(&target, [0, 1, 2]).unwrap();
+        remove_checkout_file(&root, &target).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[gpui_kit::test]
+    fn file_deletion_confirmation_preserves_dirty_draft_until_confirmed(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("delete.txt");
+        fs::write(&file, "saved\n").unwrap();
+        let file = file.canonicalize().unwrap();
+        let recovery = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (view, test_cx) = test_editor_with_data(cx, &root, Some(recovery.path().to_owned()));
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor
+                .update(cx, |editor, cx| editor.set_value("draft\n", window, cx));
+            view.dirty = true;
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.right_click("native-tree-file-delete.txt", cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.press("down", cx);
+            window.press("down", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+            window.render_frame(cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            assert!(window.find("confirm-delete-file").visible());
+            window.click("cancel-delete-file", cx);
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.path.as_ref(), Some(&file));
+            assert!(view.dirty);
+            assert_eq!(view.editor.read(cx).value().as_ref(), "draft\n");
+            assert_eq!(view.draft_snapshot(cx).drafts.len(), 1);
+        });
+        assert_eq!(fs::read_to_string(&file).unwrap(), "saved\n");
+        let stale_write = view.update_in(test_cx, |view, _, cx| {
+            view.journal_if_changed(cx).unwrap().write().unwrap();
+            let path = view.journal_path.clone().unwrap();
+            assert_eq!(drafts::read(&path, &root).len(), 1);
+            // Simulate a poll write queued before deletion, but run afterward.
+            view.prepare_journal_write(path, view.draft_snapshot(cx))
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_delete_file_dialog(&file, window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.press("escape", cx));
+        test_cx.run_until_parked();
+        assert!(file.is_file());
+        view.update_in(test_cx, |view, window, cx| {
+            assert!(view.dirty);
+            view.open_delete_file_dialog(&file, window, cx);
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("confirm-delete-file", cx);
+        });
+        test_cx.run_until_parked();
+        assert!(!file.exists());
+        stale_write.write().unwrap();
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.path.is_none());
+            assert!(view.tabs.is_empty());
+            assert!(!view.dirty);
+            assert!(view.inactive_documents.is_empty());
+            assert!(view.files.iter().all(|entry| entry.path != file));
+            assert!(view.draft_snapshot(cx).drafts.is_empty());
+            assert!(drafts::read(view.journal_path.as_ref().unwrap(), &root).is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn file_deletion_cleans_inactive_buffers_and_preserves_buffers_on_failure(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("inactive.txt"), "inactive\n").unwrap();
+        fs::write(dir.path().join("active.txt"), "active\n").unwrap();
+        let inactive = dir.path().join("inactive.txt").canonicalize().unwrap();
+        let active = dir.path().join("active.txt").canonicalize().unwrap();
+        let recovery = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (view, test_cx) = test_editor_with_data(cx, &root, Some(recovery.path().to_owned()));
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&inactive, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("inactive draft\n", window, cx)
+            });
+            view.dirty = true;
+        });
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&active, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("active draft\n", window, cx)
+            });
+            view.dirty = true;
+            view.created_files.insert(inactive.clone());
+            view.close_pending = Some(inactive.clone());
+            view.forward_locations.push(HistoryLocation {
+                path: inactive.clone(),
+                position: Position::new(0, 0),
+            });
+        });
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.pending_open = Some((inactive.clone(), None));
+            view.open_buffer_finder(window, cx);
+            view.delete_file(&inactive, window, cx).unwrap();
+        });
+        test_cx.run_until_parked();
+        assert!(!inactive.exists());
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.path.as_ref(), Some(&active));
+            assert_eq!(view.tabs, vec![active.clone()]);
+            assert!(view.dirty);
+            assert_eq!(view.editor.read(cx).value().as_ref(), "active draft\n");
+            assert!(!view.inactive_documents.contains_key(&inactive));
+            assert!(!view.created_files.contains(&inactive));
+            assert!(view.close_pending.is_none());
+            assert!(view.pending_open.is_none());
+            assert!(
+                view.back_locations
+                    .iter()
+                    .all(|entry| entry.path != inactive)
+            );
+            assert!(
+                view.forward_locations
+                    .iter()
+                    .all(|entry| entry.path != inactive)
+            );
+            assert!(view.files.iter().all(|entry| entry.path != inactive));
+            assert!(view.file_matches.iter().all(|entry| entry.path != inactive));
+            let drafts = view.draft_snapshot(cx).drafts;
+            assert_eq!(drafts.len(), 1);
+            assert_eq!(drafts[0].path, active);
+            let recovered = drafts::read(view.journal_path.as_ref().unwrap(), &root);
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].path, active);
+        });
+        // A stale menu target can become a directory before confirmation.
+        fs::remove_file(&active).unwrap();
+        fs::create_dir(&active).unwrap();
+        view.update_in(test_cx, |view, window, cx| {
+            assert!(view.delete_file(&active, window, cx).is_err());
+            assert_eq!(view.path.as_ref(), Some(&active));
+            assert!(view.dirty);
+            assert_eq!(view.editor.read(cx).value().as_ref(), "active draft\n");
+        });
+        assert!(active.is_dir());
+    }
+
+    #[gpui_kit::test]
+    fn file_deletion_flushes_recovery_even_when_matching_clean_snapshot_is_queued(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("delete.txt");
+        fs::write(&file, "saved\n").unwrap();
+        let recovery = tempfile::tempdir().unwrap();
+        let (view, test_cx) = test_editor_with_data(cx, &root, Some(recovery.path().to_owned()));
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.editor
+                .update(cx, |editor, cx| editor.set_value("draft\n", window, cx));
+            view.dirty = true;
+            view.persist_recovery_drafts(cx).unwrap();
+            let path = view.journal_path.clone().unwrap();
+            assert_eq!(drafts::read(&path, &root).len(), 1);
+            view.discard(window, cx);
+            let queued_clean_write = view.journal_if_changed(cx).unwrap();
+            view.delete_file(&file, window, cx).unwrap();
+            assert!(!file.exists());
+            assert!(drafts::read(&path, &root).is_empty());
+            queued_clean_write.write().unwrap();
+            assert!(drafts::read(&path, &root).is_empty());
         });
     }
 
