@@ -1003,6 +1003,8 @@ impl Workspace {
     }
 
     fn sync_activity_visibility(&self, window: &Window, cx: &App) {
+        self.agent_activity
+            .set_foreground_checkout(self.foreground_checkout());
         let visible = if self.git_page_origin.is_none()
             && !self.git_header_busy
             && !self.home_visible
@@ -1018,6 +1020,10 @@ impl Workspace {
             None
         };
         self.agent_activity.set_visible_launch(visible);
+    }
+
+    fn foreground_checkout(&self) -> Option<&Path> {
+        (!self.home_visible).then_some(self.working_directory.as_path())
     }
 
     /// Jump straight to the Agent tab. An open command bar
@@ -2335,7 +2341,10 @@ impl Workspace {
         self.agent_activity
             .snapshot()
             .unread_completions()
-            .filter(|checkout| self.completion_in_active_space(checkout))
+            .filter(|checkout| {
+                self.foreground_checkout() != Some(*checkout)
+                    && self.completion_in_active_space(checkout)
+            })
             .count()
     }
 
@@ -4814,11 +4823,6 @@ mod tests {
         test_cx.run_until_parked();
         assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 0);
         test_cx.simulate_keystrokes("escape");
-        workspace.read_with(test_cx, |workspace, _| {
-            workspace
-                .agent_activity
-                .set_visible_launch(Some(launch.id()));
-        });
         finish_codex_turn(&launch);
         test_cx.run_until_parked();
         assert_eq!(workspace.read_with(test_cx, |w, _| w.completion_count()), 1);
@@ -4898,6 +4902,68 @@ mod tests {
                 assert_eq!(w.completion_count(), 1);
                 w.acknowledge_project_completions();
                 assert_eq!(w.completion_count(), 0);
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn completion_indicator_only_counts_other_repository_workspaces(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            Workspace::new_for_test(window, cx, directory.path())
+        });
+        test_cx.update(|window, cx| {
+            let workspace = window.root::<Workspace>().unwrap().unwrap();
+            workspace.update(cx, |w, cx| {
+                let current = w.working_directory.clone();
+                let other = current.join("other");
+                let first = w.agent_activity.start(&current, AgentKind::Codex);
+                let second = w.agent_activity.start(&current, AgentKind::Codex);
+                let background = w.agent_activity.start(&other, AgentKind::Codex);
+                finish_codex_turn(&first);
+                finish_codex_turn(&second);
+                finish_codex_turn(&background);
+                assert_eq!(w.completion_count(), 3);
+
+                w.home_visible = false;
+                // The current checkout is excluded immediately, before the
+                // next visibility synchronization acknowledges its records.
+                assert_eq!(w.completion_count(), 1);
+                for tab in WorkspaceTab::ALL {
+                    w.active_tab = tab;
+                    w.sync_activity_visibility(window, cx);
+                    finish_codex_turn(&first);
+                    assert_eq!(w.completion_count(), 1);
+                    assert_eq!(w.agent_activity.snapshot().unread_completions().count(), 1);
+                }
+
+                w.home_visible = true;
+                w.sync_activity_visibility(window, cx);
+                assert_eq!(w.completion_count(), 1);
+                // A later turn completed while Home is open is background work.
+                finish_codex_turn(&first);
+                assert_eq!(w.completion_count(), 2);
+                w.working_directory = other;
+                w.home_visible = false;
+                w.sync_activity_visibility(window, cx);
+                assert_eq!(w.completion_count(), 1);
+                w.working_directory = current;
+                w.sync_activity_visibility(window, cx);
+                assert_eq!(w.completion_count(), 0);
+                w.home_visible = true;
+                w.sync_activity_visibility(window, cx);
+                // Leaving the repository or repainting idle cannot resurrect
+                // a completion that was acknowledged by visiting it.
+                first.observe(crate::agent_activity::TerminalObservation {
+                    title: "Codex".into(),
+                    screen: "Done".into(),
+                });
+                assert_eq!(w.completion_count(), 0);
+                finish_codex_turn(&first);
+                assert_eq!(w.completion_count(), 1);
             });
         });
     }

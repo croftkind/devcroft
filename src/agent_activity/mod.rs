@@ -79,7 +79,7 @@ impl ActivitySnapshot {
             .map(|(checkout, activity)| (checkout.as_path(), activity))
     }
 
-    /// One entry per agent with a completion not yet seen in Projects.
+    /// One entry per agent with a background completion not yet acknowledged.
     pub(crate) fn unread_completions(&self) -> impl Iterator<Item = &Path> {
         self.unread_completions.iter().map(PathBuf::as_path)
     }
@@ -109,6 +109,7 @@ pub(crate) struct AgentActivityStore {
 #[derive(Default)]
 struct StoreInner {
     next_generation: u64,
+    foreground_checkout: Option<PathBuf>,
     records: HashMap<(PathBuf, u64), ActivityRecord>,
 }
 
@@ -133,8 +134,9 @@ struct ActivityRecord {
     terminal_blocked: bool,
     observed_work: bool,
     unseen_completion: bool,
-    /// Topbar notification, acknowledged independently of terminal visibility.
+    /// Topbar notification, acknowledged by visiting the repository or Projects.
     unread_completion: bool,
+    foreground: bool,
     visible: bool,
     observation_available: bool,
     structured_status_available: bool,
@@ -146,8 +148,14 @@ impl ActivityRecord {
     const MAX_RESOLVED_REQUESTS: usize = 256;
 
     fn mark_completion(&mut self, completed: bool) {
+        let completed = completed && !self.terminal_blocked && self.pending_requests.is_empty();
         self.unseen_completion |= completed && !self.visible;
-        self.unread_completion |= completed;
+        self.unread_completion |= completed && !self.foreground && !self.visible;
+    }
+
+    fn clear_completion(&mut self) {
+        self.unseen_completion = false;
+        self.unread_completion = false;
     }
 
     fn remember_resolved(&mut self, key: String) {
@@ -253,6 +261,7 @@ impl AgentActivityStore {
             let mut inner = self.inner.lock();
             inner.next_generation = inner.next_generation.wrapping_add(1).max(1);
             let generation = inner.next_generation;
+            let foreground = inner.foreground_checkout.as_deref() == Some(checkout.as_path());
             inner.records.insert(
                 (checkout.clone(), generation),
                 ActivityRecord {
@@ -268,6 +277,7 @@ impl AgentActivityStore {
                     observed_work: false,
                     unseen_completion: false,
                     unread_completion: false,
+                    foreground,
                     visible: false,
                     observation_available: agent != AgentKind::Omp,
                     structured_status_available: false,
@@ -364,7 +374,7 @@ impl AgentActivityStore {
         }
     }
 
-    /// Acknowledge only checkouts represented by the current Projects view.
+    /// Acknowledge only checkouts represented by the current view.
     /// Keep per-agent Finished status until the terminal result is viewed.
     pub(crate) fn acknowledge_completions(&self, mut includes: impl FnMut(&Path) -> bool) {
         let mut changed = false;
@@ -374,6 +384,26 @@ impl AgentActivityStore {
                 if record.unread_completion && includes(checkout) {
                     record.unread_completion = false;
                     changed = true;
+                }
+            }
+        }
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// Repository visibility covers every workspace tab, independently of
+    /// whether a particular agent's terminal result is in the live viewport.
+    pub(crate) fn set_foreground_checkout(&self, checkout: Option<&Path>) {
+        let mut changed = false;
+        {
+            let mut inner = self.inner.lock();
+            inner.foreground_checkout = checkout.map(Path::to_owned);
+            for ((path, _), record) in &mut inner.records {
+                record.foreground = checkout == Some(path.as_path());
+                if record.foreground {
+                    changed |= record.unread_completion;
+                    record.unread_completion = false;
                 }
             }
         }
@@ -400,12 +430,12 @@ impl AgentActivityStore {
         {
             let mut inner = self.inner.lock();
             for ((_, id), record) in &mut inner.records {
-                let before = record.projected();
+                let before = (record.projected(), record.unread_completion);
                 record.visible = launch == Some(*id);
                 if record.visible {
-                    record.unseen_completion = false;
+                    record.clear_completion();
                 }
-                changed |= before != record.projected();
+                changed |= before != (record.projected(), record.unread_completion);
             }
         }
         if changed {
@@ -594,7 +624,7 @@ impl ActivityEmitter {
                 record.observation_available = true;
                 record.base = BaseState::Working;
                 record.observed_work = true;
-                record.unseen_completion = false;
+                record.clear_completion();
                 record.detail = detail;
             });
     }
@@ -611,7 +641,7 @@ impl ActivityEmitter {
                 record.working_sessions.insert(session);
                 record.base = BaseState::Working;
                 record.observed_work = true;
-                record.unseen_completion = false;
+                record.clear_completion();
                 record.detail = detail;
             });
     }
@@ -671,7 +701,7 @@ impl ActivityEmitter {
                 } else {
                     record.base = BaseState::Working;
                     record.observed_work = true;
-                    record.unseen_completion = false;
+                    record.clear_completion();
                 }
                 record.detail = Some(detail);
             });
@@ -686,7 +716,7 @@ impl ActivityEmitter {
                 }
                 record.observation_available = true;
                 record.pending_requests.insert(key);
-                record.unseen_completion = false;
+                record.clear_completion();
                 record.detail = Some("Waiting for input".to_owned());
             });
     }
@@ -745,7 +775,7 @@ impl ActivityEmitter {
                 record.base = BaseState::Idle;
                 record.working_sessions.clear();
                 record.observed_work = false;
-                record.unseen_completion = false;
+                record.clear_completion();
                 record.terminal_blocked = false;
                 record.detail = Some(detail);
             });
@@ -758,7 +788,7 @@ impl ActivityEmitter {
                 record.working_sessions.clear();
                 record.pending_requests.clear();
                 record.terminal_blocked = false;
-                record.unseen_completion = false;
+                record.clear_completion();
                 record.detail = Some(if success {
                     "Agent exited".to_owned()
                 } else {
@@ -778,7 +808,7 @@ impl ActivityEmitter {
                 match evidence {
                     TerminalEvidence::NeedsAttention(detail) => {
                         record.terminal_blocked = true;
-                        record.unseen_completion = false;
+                        record.clear_completion();
                         record.detail = Some(detail);
                     }
                     TerminalEvidence::Working(detail) => {
@@ -791,7 +821,7 @@ impl ActivityEmitter {
                         record.terminal_blocked = false;
                         record.base = BaseState::Working;
                         record.observed_work = true;
-                        record.unseen_completion = false;
+                        record.clear_completion();
                         record.detail = detail;
                     }
                     TerminalEvidence::Idle(detail) | TerminalEvidence::Ready(detail) => {
@@ -802,6 +832,12 @@ impl ActivityEmitter {
                         }
                         if !record.working_sessions.is_empty() {
                             return;
+                        }
+                        // Dismissing a request can restore the prompt without
+                        // completing a turn. Require resumed work before a
+                        // later idle frame can confirm a successful result.
+                        if record.terminal_blocked || !record.pending_requests.is_empty() {
+                            record.observed_work = false;
                         }
                         record.resolve_all_pending();
                         record.working_sessions.clear();
@@ -824,7 +860,7 @@ impl ActivityEmitter {
                         record.terminal_blocked = false;
                         record.base = BaseState::Idle;
                         record.observed_work = false;
-                        record.unseen_completion = false;
+                        record.clear_completion();
                         record.detail = Some(detail);
                     }
                 }
@@ -1002,12 +1038,13 @@ mod tests {
         assert_eq!(store.snapshot().unread_completions().count(), 0);
         first.emitter().working(None);
         first.emitter().idle(None);
-        store.set_visible_checkout(Some(&checkout));
         assert_eq!(store.snapshot().unread_completions().count(), 1);
+        store.set_visible_launch(Some(first.id()));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
     }
 
     #[test]
-    fn completion_notifications_include_visible_turns_and_filter_acknowledgements() {
+    fn completion_notifications_exclude_visible_turns_and_filter_acknowledgements() {
         let (store, checkout) = store();
         let other_checkout = checkout.join("other");
         let visible = store.start(&checkout, AgentKind::Codex);
@@ -1022,16 +1059,137 @@ mod tests {
         background.emitter().session_working("parent", None);
         background.emitter().session_working("child", None);
         background.emitter().session_idle("child", None);
-        assert_eq!(store.snapshot().unread_completions().count(), 1);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
         background
             .emitter()
             .reconcile_sessions(HashSet::new(), "Done".into());
-        assert_eq!(store.snapshot().unread_completions().count(), 2);
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
         store.acknowledge_completions(|path| path == checkout);
         assert_eq!(
             store.snapshot().unread_completions().collect::<Vec<_>>(),
             vec![other_checkout.as_path()]
         );
+        store.acknowledge_completions(|path| path == other_checkout);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+    }
+
+    #[test]
+    fn foreground_repository_acknowledges_all_agents_and_suppresses_later_notifications() {
+        let (store, checkout) = store();
+        let first = store.start(&checkout, AgentKind::Codex);
+        first.emitter().working(None);
+        first.emitter().idle(None);
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
+
+        // Entering the repository acknowledges the topbar notification even
+        // when an editor or a different agent session is in the live viewport.
+        store.set_foreground_checkout(Some(&checkout));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        assert_eq!(
+            store.snapshot().for_launch(first.id()).unwrap().state,
+            ActivityState::Finished
+        );
+        let second = store.start(&checkout, AgentKind::Codex);
+        first.emitter().session_working("turn", None);
+        first.emitter().session_idle("turn", None);
+        second
+            .emitter()
+            .terminal_evidence(TerminalEvidence::Working(None));
+        second
+            .emitter()
+            .terminal_evidence(TerminalEvidence::Idle(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+
+        store.set_foreground_checkout(None);
+        first.emitter().session_idle("turn", None);
+        second
+            .emitter()
+            .terminal_evidence(TerminalEvidence::Idle(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        first.emitter().session_working("next", None);
+        first
+            .emitter()
+            .reconcile_sessions(HashSet::new(), "Done".into());
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
+    }
+
+    #[test]
+    fn new_work_and_unsuccessful_turns_clear_stale_completion_notifications() {
+        let (store, checkout) = store();
+        let launch = store.start(&checkout, AgentKind::Codex);
+        let emitter = launch.emitter();
+        let finish = || {
+            emitter.working(None);
+            emitter.idle(None);
+            assert_eq!(store.snapshot().unread_completions().count(), 1);
+        };
+        finish();
+        emitter.terminal_evidence(TerminalEvidence::Working(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        finish();
+        emitter.session_working("next", None);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        finish();
+        emitter.reconcile_sessions(HashSet::from(["next".into()]), "Working".into());
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        finish();
+        emitter.failed("Failed".into());
+        emitter.idle(None);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        finish();
+        emitter.terminal_evidence(TerminalEvidence::Interrupted("Canceled".into()));
+        emitter.terminal_evidence(TerminalEvidence::Idle(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        finish();
+        emitter.exited(true);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+    }
+
+    #[test]
+    fn idle_while_waiting_for_input_does_not_notify_completion() {
+        let (store, checkout) = store();
+        let launch = store.start(&checkout, AgentKind::Codex);
+        let emitter = launch.emitter();
+        emitter.session_working("turn", None);
+        emitter.request_opened("turn", "question");
+        emitter.session_idle("turn", None);
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+        assert_eq!(store.snapshot().attention_count(), 1);
+        emitter.request_resolved("turn", "question");
+        assert_eq!(
+            store.snapshot().for_launch(launch.id()).unwrap().state,
+            ActivityState::Idle
+        );
+        emitter.session_working("turn", None);
+        emitter.session_idle("turn", None);
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
+        emitter.request_opened("turn", "next-question");
+        assert_eq!(store.snapshot().unread_completions().count(), 0);
+    }
+
+    #[test]
+    fn dismissing_a_terminal_request_does_not_finish_the_turn() {
+        let (store, checkout) = store();
+        let launch = store.start(&checkout, AgentKind::Codex);
+        let emitter = launch.emitter();
+        for ready_first in [false, true] {
+            emitter.terminal_evidence(TerminalEvidence::Working(None));
+            emitter.terminal_evidence(TerminalEvidence::NeedsAttention("Confirm?".into()));
+            if ready_first {
+                emitter.terminal_evidence(TerminalEvidence::Ready(None));
+            }
+            emitter.terminal_evidence(TerminalEvidence::Idle(None));
+            assert_eq!(store.snapshot().unread_completions().count(), 0);
+            assert_eq!(
+                store.snapshot().for_launch(launch.id()).unwrap().state,
+                ActivityState::Idle
+            );
+        }
+        emitter.terminal_evidence(TerminalEvidence::Working(None));
+        emitter.terminal_evidence(TerminalEvidence::NeedsAttention("Confirm?".into()));
+        emitter.terminal_evidence(TerminalEvidence::Working(None));
+        emitter.terminal_evidence(TerminalEvidence::Idle(None));
+        assert_eq!(store.snapshot().unread_completions().count(), 1);
     }
 
     #[test]
