@@ -12,14 +12,12 @@ ROOT = Path(__file__).resolve().parents[2]
 def render(tag, checksums):
     if not re.fullmatch("v" + VERSION, tag):
         raise ValueError("Expected tag vX.Y.Z")
-    replacements = {"VERSION": tag[1:]}
-    for arch, key in (("aarch64", "ARM_SHA256"), ("x86_64", "INTEL_SHA256")):
-        name = f"devcroft-{tag}-{arch}-apple-darwin.tar.gz"
-        matches = [line.split()[0] for line in checksums.splitlines()
-                   if len(line.split()) == 2 and line.split()[1] == name]
-        if len(matches) != 1 or not re.fullmatch(r"[a-f0-9]{64}", matches[0]):
-            raise ValueError(f"Missing, duplicate or invalid checksum for {name}")
-        replacements[key] = matches[0]
+    name = f"devcroft-{tag}-aarch64-apple-darwin.tar.gz"
+    matches = [line.split()[0] for line in checksums.splitlines()
+               if len(line.split()) == 2 and line.split()[1] == name]
+    if len(matches) != 1 or not re.fullmatch(r"[a-f0-9]{64}", matches[0]):
+        raise ValueError(f"Missing, duplicate or invalid checksum for {name}")
+    replacements = {"VERSION": tag[1:], "ARM_SHA256": matches[0]}
     result = (ROOT / "packaging/homebrew/devcroft.rb.in").read_text()
     for key, value in replacements.items():
         result = result.replace(f"@{key}@", value)

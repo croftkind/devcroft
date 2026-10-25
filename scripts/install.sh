@@ -19,9 +19,9 @@ case "$(uname -s)/$(uname -m)" in
     if [[ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" == 1 ]]; then
       target=aarch64-apple-darwin
     else
-      target=x86_64-apple-darwin
+      fail 'macOS packages require Apple Silicon'
     fi ;;
-  *) fail 'Supported platforms: Linux x86-64, macOS Intel and Apple Silicon' ;;
+  *) fail 'Supported platforms: Linux x86-64, macOS Apple Silicon' ;;
 esac
 if command -v sha256sum >/dev/null; then
   checksum() { sha256sum "$1" | cut -d ' ' -f 1; }

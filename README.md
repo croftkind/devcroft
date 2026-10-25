@@ -19,7 +19,7 @@ brew install --cask hossainemruz/tap/devcroft
 brew upgrade --cask devcroft
 ```
 
-Packages support Linux x86-64 (Ubuntu 24.04 or compatible) and macOS 13+ (Intel and Apple Silicon). The installer verifies checksums, installs the desktop app and CLI, and preserves your app data. Add `~/.local/bin` to your PATH for the CLI. Restart Devcroft after updating. Home shows a notice when a newer stable release is available. See [installation, platform requirements, and publishing releases](docs/releases.md).
+Packages support Linux x86-64 (Ubuntu 24.04 or compatible) and macOS 13+ on Apple Silicon. The installer verifies checksums, installs the desktop app and CLI, and preserves your app data. Add `~/.local/bin` to your PATH for the CLI. Restart Devcroft after updating. Home shows a notice when a newer stable release is available. See [installation, platform requirements, and publishing releases](docs/releases.md).
 
 You need Git (`git` on the application PATH) and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
 

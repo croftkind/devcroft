@@ -7,7 +7,7 @@ target="${2:?target required}"
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
 case "$target" in
   x86_64-unknown-linux-gnu) format=deb ;;
-  aarch64-apple-darwin|x86_64-apple-darwin) format=app ;;
+  aarch64-apple-darwin) format=app ;;
   *) echo "Unsupported target: $target" >&2; exit 1 ;;
 esac
 root="$(cd "$(dirname "$0")/../.." && pwd)"

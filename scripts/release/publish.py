@@ -10,7 +10,7 @@ import sys
 
 from prepare import VERSION
 
-TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-apple-darwin")
+TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")
 
 
 def run(*args):
@@ -23,6 +23,20 @@ def api(repo, endpoint):
     )
     if result.returncode:
         if "(HTTP 404)" in result.stderr:
+            return None
+        raise RuntimeError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def read_release(repo, tag):
+    # REST's releases/tags endpoint only finds published releases. The CLI
+    # also looks up drafts by their pending tag, including on upload retries.
+    result = subprocess.run(
+        ["gh", "release", "view", tag, "--repo", repo, "--json", "isDraft,assets"],
+        text=True, capture_output=True,
+    )
+    if result.returncode:
+        if result.stderr.strip() == "release not found":
             return None
         raise RuntimeError(result.stderr)
     return json.loads(result.stdout)
@@ -44,8 +58,8 @@ def publish(tag, commit, repo, root):
         run("git", "fetch", "origin", f"refs/tags/{tag}")
         if run("git", "rev-parse", "FETCH_HEAD^{commit}") != commit:
             raise ValueError(f"{tag} already points to another commit; use a new release branch")
-    release = api(repo, f"releases/tags/{tag}")
-    if release and not release["draft"]:
+    release = read_release(repo, tag)
+    if release and not release["isDraft"]:
         if not existing:
             raise ValueError("Published release is missing its tag; refusing to recreate it")
         print(f"{tag} is already published; leaving its assets unchanged")
@@ -69,13 +83,19 @@ def publish(tag, commit, repo, root):
         run("gh", "release", "create", tag, "--repo", repo, "--verify-tag", "--draft",
             "--title", f"Devcroft {tag}", "--generate-notes", "--notes-file",
             str(root / "scripts/release/notes.md"))
+    elif any(asset["name"] == f"devcroft-{tag}-x86_64-apple-darwin.tar.gz" for asset in release["assets"]):
+        # Drafts from earlier runs may still contain the retired Intel package.
+        run("gh", "release", "delete-asset", tag,
+            f"devcroft-{tag}-x86_64-apple-darwin.tar.gz", "--repo", repo, "--yes")
     # Retrying a failed draft upload is safe. Published releases never reach here.
     run("gh", "release", "upload", tag, "--repo", repo, "--clobber", *map(str, assets))
-    uploaded = api(repo, f"releases/tags/{tag}")
+    uploaded = read_release(repo, tag)
+    if uploaded is None:
+        raise ValueError("Uploaded draft could not be found; release remains unpublished")
     expected = {path.name: path.stat().st_size for path in assets}
     actual = {asset["name"]: asset["size"] for asset in uploaded["assets"]}
-    if any(actual.get(name) != size for name, size in expected.items()):
-        raise ValueError("Draft assets are incomplete; release remains unpublished")
+    if actual != expected:
+        raise ValueError("Draft assets are incomplete or unexpected; release remains unpublished")
     # An older maintenance release must not replace a newer release as Latest.
     latest = api(repo, "releases/latest")
     latest_tag = latest["tag_name"] if latest else ""

@@ -11,7 +11,7 @@ brew install --cask hossainemruz/tap/devcroft
 brew upgrade --cask devcroft
 ```
 
-The cask selects the native Apple Silicon or Intel archive, verifies its checksum, installs `Devcroft.app` and links the same executable as `devcroft` on Homebrew's PATH. The desktop launcher invokes `devcroft app`; the CLI remains usable without a running desktop. No separate CLI build or Homebrew bottles are needed. Use Homebrew for subsequent upgrades and removal (`brew uninstall --cask devcroft`). App data is preserved.
+The cask requires Apple Silicon, verifies the archive's checksum, installs `Devcroft.app` and links the same executable as `devcroft` on Homebrew's PATH. The desktop launcher invokes `devcroft app`; the CLI remains usable without a running desktop. No separate CLI build or Homebrew bottles are needed. Use Homebrew for subsequent upgrades and removal (`brew uninstall --cask devcroft`). App data is preserved.
 
 When switching from a source or shell installation, quit Devcroft and move the existing `Devcroft.app` aside before the first Homebrew install. Remove the old `~/.local/bin/devcroft` symlink if it points to that bundle, so it does not shadow Homebrew's CLI. Keep the application data directory.
 
@@ -26,7 +26,7 @@ curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/ins
 The same command installs a fresh copy or replaces an existing install. It downloads the installer from the latest stable GitHub release, resolves that release's version, downloads the matching architecture archive and `SHA256SUMS`, checks its SHA-256 hash, and verifies the executable version before replacing the app. No Rust/Zig compiler, source checkout, GitHub login, or sudo is needed. You need Bash, curl, tar, and either `sha256sum` or `shasum`.
 
 - Linux x86-64: installs `~/.local/bin/devcroft`, a launcher under `${XDG_DATA_HOME:-~/.local/share}/applications`, and the app icon. Uses Ubuntu 24.04's glibc baseline (2.39+); Alpine/musl and older glibc distributions are unsupported. A working Vulkan driver and the fontconfig, ALSA, X11/Wayland, and xkbcommon libraries are required. On Ubuntu 24.04, install `libasound2t64 libfontconfig1 libfreetype6 libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 libxcb1 libx11-xcb1 libvulkan1 mesa-vulkan-drivers` if missing.
-- macOS 13+ Intel/Apple Silicon: installs `/Applications/Devcroft.app`, falling back to `~/Applications` if `/Applications` is not writable. Links `~/.local/bin/devcroft` to the combined app/CLI executable inside the bundle. Rosetta terminals select the native Apple Silicon package. Bundles are ad-hoc signed, not notarized; manually downloaded apps may require **System Settings → Privacy & Security → Open Anyway**. The installer does not disable Gatekeeper.
+- macOS 13+ on Apple Silicon: installs `/Applications/Devcroft.app`, falling back to `~/Applications` if `/Applications` is not writable. Links `~/.local/bin/devcroft` to the combined app/CLI executable inside the bundle. Rosetta terminals select the native Apple Silicon package. Intel Macs are unsupported. Bundles are ad-hoc signed, not notarized; manually downloaded apps may require **System Settings → Privacy & Security → Open Anyway**. The installer does not disable Gatekeeper.
 
 Add `~/.local/bin` to your PATH for CLI use, then launch **Devcroft** from your desktop launcher or run `devcroft app`. Quit and reopen the app after updating. App settings, sessions, and repository records stay in their existing data directory.
 
@@ -62,16 +62,18 @@ The branch name is the release version. Only `releases/vX.Y.Z` is accepted, with
 The workflow:
 
 1. Validates the branch and tests release tooling.
-2. Builds and tests on Ubuntu 24.04 x86-64, macOS 15 Apple Silicon, and macOS 15 Intel using the toolchains pinned in `mise.toml` and dependencies in `Cargo.lock`. Installs cargo-packager 0.11.8 with its locked dependencies.
+2. Builds and tests on Ubuntu 24.04 x86-64 and macOS 15 Apple Silicon using the toolchains pinned in `mise.toml` and dependencies in `Cargo.lock`. Installs cargo-packager 0.11.8 with its locked dependencies.
 3. Stamps `Cargo.toml`, `Packager.toml`, and the root package in `Cargo.lock` in each CI checkout with the branch version. Thus `devcroft --version`, internal version metadata, archive names and the macOS app version agree (cargo-packager uses a timestamp for the internal bundle build number). This does not commit or push a version bump. Source builds use the version in `Cargo.toml`; to reproduce a release from its tag, first run `python3 scripts/release/prepare.py releases/v1.2.3 --stamp`.
 4. Uses `Packager.toml` to build native macOS `.app` bundles and a Linux `.deb`, including icons, metadata, launchers and ad-hoc macOS signatures. The small packaging helper assembles `.tar.gz` files for the shell installer and Homebrew.
 5. After every build passes, creates the annotated `v1.2.3` tag at the triggering commit. Existing tags must already point to that commit; they are never moved.
-6. Uploads all three archives, the Linux `.deb`, `install.sh`, and `SHA256SUMS` to a draft release, verifies the uploaded file set/sizes, then publishes it with generated notes. An older maintenance version does not replace a newer stable release as Latest.
+6. Uploads both archives, the Linux `.deb`, `install.sh`, and `SHA256SUMS` to a draft release, verifies the uploaded file set/sizes, then publishes it with generated notes. An older maintenance version does not replace a newer stable release as Latest.
 7. When `HOMEBREW_TAP` is configured, downloads the **published** checksums and updates `Casks/devcroft.rb` in the tap. Reruns use published checksums, not newly rebuilt archives, and older maintenance releases cannot downgrade the tap.
 
 GitHub Actions needs permission to write repository contents for the publish job. The workflow uses `GITHUB_TOKEN`; publishing the release needs no personal access token or Apple signing secrets. Updating a separate Homebrew tap uses the scoped credential described below. Repository rules must permit the workflow to create release tags. Protect release branches as appropriate: a pushed release branch is an instruction to publish.
 
 A failed build leaves no public release. A failed upload can leave a tag and draft release; rerun the same commit to finish. Rerunning an already published tag is a no-op. Pushing a different commit to the same release branch after tagging fails; use a new version branch for changes. Releases are serialized so two publishes cannot race to replace Latest. Do not force-push or reuse released versions.
+
+When resuming a draft created by older tooling, the publisher removes its retired Intel macOS archive. The uploaded assets must exactly match the supported packages, installer, and checksums before the draft is published.
 
 ## Enable the Homebrew tap
 

@@ -1,6 +1,7 @@
 """Offline tests for release identity, immutable publishing, and real installer paths."""
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -23,6 +24,14 @@ class ReleaseTests(unittest.TestCase):
         for branch in ("main", "releases/v1.2", "releases/v01.2.3", "releases/v1.2.3-rc.1", "releases/v1.2.3/more", "releases/v1.2.3\n"):
             with self.assertRaises(ValueError):
                 branch_version(branch)
+
+    def test_package_rejects_intel_macos(self):
+        result = subprocess.run(
+            ["bash", str(ROOT / "scripts/release/package.sh"), "1.2.3", "x86_64-apple-darwin"],
+            text=True, capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported target: x86_64-apple-darwin", result.stderr)
 
     def test_stamp_changes_only_root_package(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -56,7 +65,7 @@ class ReleaseTests(unittest.TestCase):
             with patch.object(publish, "run", side_effect=["remote tag", "", "wrong commit"]):
                 with self.assertRaisesRegex(ValueError, "another commit"):
                     publish.publish("v1.2.3", "abc", "owner/repo", root)
-            with patch.object(publish, "run", side_effect=["remote tag", "", "abc"]) as run, patch.object(publish, "api", return_value={"draft": False}):
+            with patch.object(publish, "run", side_effect=["remote tag", "", "abc"]) as run, patch.object(publish, "read_release", return_value={"isDraft": False}):
                 publish.publish("v1.2.3", "abc", "owner/repo", root)
                 self.assertEqual(run.call_count, 3)  # only read-only Git operations
 
@@ -70,42 +79,113 @@ class ReleaseTests(unittest.TestCase):
                 (root / "dist" / f"devcroft-v1.2.3-{target}.tar.gz").write_bytes(b"archive")
             (root / "dist/devcroft-v1.2.3-x86_64-unknown-linux-gnu.deb").write_bytes(b"deb")
 
-            def api(repo, endpoint):
-                if endpoint == "releases/latest":
-                    return {"tag_name": "v2.0.0"}
-                return {"draft": True, "assets": [
+            def read_release(repo, tag):
+                return {"isDraft": True, "assets": [
                     {"name": p.name, "size": p.stat().st_size}
                     for p in (root / "dist").iterdir()
                 ]}
 
-            with patch.object(publish, "run", return_value="") as run, patch.object(publish, "api", side_effect=api):
+            with patch.object(publish, "run", return_value="") as run, patch.object(publish, "read_release", side_effect=read_release), patch.object(publish, "api", return_value={"tag_name": "v2.0.0"}):
                 publish.publish("v1.2.3", "abc", "owner/repo", root)
                 self.assertIn("--latest=false", run.call_args.args)
                 self.assertIn("--draft=false", run.call_args.args)
-            with patch.object(publish, "run", return_value="") as run, patch.object(publish, "api", return_value={"draft": True, "assets": []}):
-                with self.assertRaisesRegex(ValueError, "incomplete"):
+            extra_assets = read_release("owner/repo", "v1.2.3")
+            extra_assets["assets"].append({"name": "unexpected.zip", "size": 42})
+            for uploaded, message in ((None, "could not be found"), ({"isDraft": True, "assets": []}, "incomplete"), (extra_assets, "unexpected")):
+                with self.subTest(uploaded=uploaded), patch.object(publish, "run", return_value="") as run, patch.object(publish, "read_release", side_effect=[{"isDraft": True, "assets": []}, uploaded]), patch.object(publish, "api", return_value=None):
+                    with self.assertRaisesRegex(ValueError, message):
+                        publish.publish("v1.2.3", "abc", "owner/repo", root)
+                    self.assertFalse(any("--draft=false" in call.args for call in run.call_args_list))
+
+    def test_release_lookup_distinguishes_missing_release_from_request_errors(self):
+        result = subprocess.CompletedProcess([], 1, "", "release not found\n")
+        with patch.object(publish.subprocess, "run", return_value=result):
+            self.assertIsNone(publish.read_release("owner/repo", "v1.2.3"))
+        for message in ("HTTP 403: Resource not accessible", "authentication failed", "connection refused"):
+            with self.subTest(message=message), patch.object(publish.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", message)):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    publish.read_release("owner/repo", "v1.2.3")
+
+    def test_publish_finds_drafts_and_resumes_existing_tags(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "dist").mkdir()
+                (root / "scripts").mkdir()
+                (root / "scripts/install.sh").write_text("installer")
+                for target in publish.TARGETS:
+                    (root / "dist" / f"devcroft-v1.2.3-{target}.tar.gz").write_bytes(b"archive")
+                (root / "dist/devcroft-v1.2.3-x86_64-unknown-linux-gnu.deb").write_bytes(b"deb")
+                state = {"draft": resume, "verified": False, "uploaded": False, "assets": {}}
+                if resume:
+                    retired = root / "devcroft-v1.2.3-x86_64-apple-darwin.tar.gz"
+                    retired.write_bytes(b"old Intel archive")
+                    state["assets"][retired.name] = retired
+
+                def run(*args):
+                    if args[:2] == ("git", "ls-remote"):
+                        return "remote tag" if resume else ""
+                    if args[:2] == ("git", "rev-parse"):
+                        return "abc"
+                    if args[:3] == ("gh", "release", "create"):
+                        self.assertFalse(state["draft"], "must reuse an existing draft")
+                        state["draft"] = True
+                    if args[:3] == ("gh", "release", "upload"):
+                        self.assertTrue(state["draft"])
+                        # --clobber replaces matching names, preserving other assets.
+                        for path in args[args.index("--clobber") + 1:]:
+                            state["assets"][Path(path).name] = Path(path)
+                        state["uploaded"] = True
+                    if args[:3] == ("gh", "release", "delete-asset"):
+                        self.assertTrue(state["draft"])
+                        del state["assets"][args[4]]
+                    if args[:3] == ("gh", "release", "edit"):
+                        self.assertTrue(state["verified"], "must verify assets before publishing")
+                    return ""
+
+                def lookup(args, **kwargs):
+                    # REST tag lookup cannot find a draft, even after upload.
+                    if args[:2] == ["gh", "api"] or not state["draft"]:
+                        message = "gh: Not Found (HTTP 404)" if args[1] == "api" else "release not found"
+                        return subprocess.CompletedProcess(args, 1, "", message)
+                    self.assertEqual(args[:3], ["gh", "release", "view"])
+                    state["verified"] = state["uploaded"]
+                    return subprocess.CompletedProcess(args, 0, json.dumps({
+                        "isDraft": True,
+                        "assets": [{"name": path.name, "size": path.stat().st_size}
+                                   for path in state["assets"].values()],
+                    }), "")
+
+                with patch.object(publish, "run", side_effect=run) as commands, patch.object(publish.subprocess, "run", side_effect=lookup):
                     publish.publish("v1.2.3", "abc", "owner/repo", root)
-                self.assertFalse(any("--draft=false" in call.args for call in run.call_args_list))
+                self.assertEqual(len(state["assets"]), 5)
+                self.assertTrue(any("--draft=false" in call.args for call in commands.call_args_list))
+                if resume:
+                    self.assertFalse(any(call.args[:2] == ("git", "push") for call in commands.call_args_list))
+                    self.assertFalse(any(call.args[:3] == ("gh", "release", "create") for call in commands.call_args_list))
 
 
 class HomebrewTests(unittest.TestCase):
     def checksums(self, tag="v1.2.3"):
-        return (f"{'a' * 64}  devcroft-{tag}-aarch64-apple-darwin.tar.gz\n"
-                f"{'b' * 64}  devcroft-{tag}-x86_64-apple-darwin.tar.gz\n")
+        return f"{'a' * 64}  devcroft-{tag}-aarch64-apple-darwin.tar.gz\n"
 
-    def test_cask_uses_exact_architecture_checksums_and_cli_path(self):
+    def test_cask_requires_apple_silicon_checksum_and_links_cli(self):
         cask = homebrew.render("v1.2.3", self.checksums())
         self.assertIn('version "1.2.3"', cask)
-        self.assertIn(f'arm:   "{"a" * 64}"', cask)
-        self.assertIn(f'intel: "{"b" * 64}"', cask)
+        self.assertIn(f'sha256 "{"a" * 64}"', cask)
+        self.assertIn("depends_on arch: :arm64", cask)
+        self.assertIn("-aarch64-apple-darwin.tar.gz", cask)
         self.assertIn('Contents/MacOS/devcroft", target: "devcroft"', cask)
         self.assertNotIn("@VERSION@", cask)
+        self.assertNotIn("x86_64", cask)
         with self.assertRaises(ValueError):
             homebrew.render("v1.2.3", self.checksums() + self.checksums())
         with self.assertRaises(ValueError):
             homebrew.render("v1.2.4", self.checksums())
         with self.assertRaises(ValueError):
             homebrew.render('v1.2.3"', self.checksums())
+        with self.assertRaises(ValueError):
+            homebrew.render("v1.2.3", f"{'b' * 64}  devcroft-v1.2.3-x86_64-apple-darwin.tar.gz\n")
 
     def test_tap_rerun_and_maintenance_release_never_downgrade(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +294,24 @@ else:
         self.install("--version", "v1.2.4")
         self.assertEqual(subprocess.check_output([binary], text=True).strip(), "devcroft 1.2.4")
         self.assertFalse(list(self.app_dir.glob(".devcroft-install.*")))
+
+    def test_macos_rosetta_installs_native_apple_silicon_package(self):
+        self.env.update(FIXTURE_OS="Darwin", FIXTURE_ARCH="x86_64")
+        self.tool("sysctl", "#!/bin/sh\necho 1\n")
+        self.archive("aarch64-apple-darwin")
+        self.install()
+        binary = self.bin_dir / "devcroft"
+        self.assertTrue(binary.is_symlink())
+        self.assertEqual(subprocess.check_output([binary], text=True).strip(), "devcroft 1.2.3")
+
+    def test_macos_intel_is_rejected_before_downloading(self):
+        self.env.update(FIXTURE_OS="Darwin", FIXTURE_ARCH="x86_64")
+        self.tool("curl", "#!/bin/sh\necho 'unexpected download' >&2\nexit 99\n")
+        result = self.install(success=False)
+        self.assertIn("macOS packages require Apple Silicon", result.stderr)
+        self.assertNotIn("unexpected download", result.stderr)
+        self.assertFalse(self.bin_dir.exists())
+        self.assertFalse(self.app_dir.exists())
 
     def test_reject_unsupported_platform_and_bad_version(self):
         self.env["FIXTURE_ARCH"] = "aarch64"
