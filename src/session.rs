@@ -46,6 +46,7 @@ pub(crate) struct CellStyle {
     pub(crate) background: u32,
     pub(crate) bold: bool,
     pub(crate) italic: bool,
+    pub(crate) faint: bool,
     pub(crate) underline: bool,
     /// Marks the terminal's cursor cell. The view decides how to paint it
     /// (see [`CursorShape`] and the pane's cursor rendering): a block
@@ -253,6 +254,15 @@ impl TerminalSession {
 
         let grid_size = Arc::new(Mutex::new((INITIAL_COLS, INITIAL_ROWS)));
         let mut terminal = Terminal::new(INITIAL_COLS, INITIAL_ROWS)?;
+        // Match the renderer's defaults and answer OSC 10/11 color queries.
+        // Leaving these unset paints the same colors but sends no report,
+        // so applications cannot derive their input/background colors.
+        terminal.set_default_fg_color(Some(RgbColor {
+            r: 255,
+            g: 255,
+            b: 255,
+        }))?;
+        terminal.set_default_bg_color(Some(RgbColor { r: 0, g: 0, b: 0 }))?;
         crate::terminal_graphics::configure(&mut terminal)?;
         terminal.set_scrollback_max_lines(Some(10_000))?;
         // Ghostty's default cursor blinks (ghostty(5), `cursor-style-blink`:
@@ -800,9 +810,9 @@ impl TerminalSession {
                 grapheme.push(' ');
             }
 
-            // Cells without explicit styling use the terminal defaults,
-            // which avoids color and style lookups for empty regions.
-            let (foreground, background, bold, italic, underline) = if cell.has_styling()? {
+            // Cells without a style ID can still hold packed backgrounds
+            // after an erase. Only their foreground and attributes default.
+            let (foreground, background, bold, italic, faint, underline) = if cell.has_styling()? {
                 let mut foreground = cell
                     .fg_color()?
                     .map(color_value)
@@ -818,9 +828,18 @@ impl TerminalSession {
                 if style.inverse {
                     std::mem::swap(&mut foreground, &mut background);
                 }
-                (foreground, background, bold, italic, underline)
+                (foreground, background, bold, italic, style.faint, underline)
             } else {
-                (default_foreground, default_background, false, false, false)
+                (
+                    default_foreground,
+                    cell.bg_color()?
+                        .map(color_value)
+                        .unwrap_or(default_background),
+                    false,
+                    false,
+                    false,
+                    false,
+                )
             };
 
             let style = CellStyle {
@@ -828,6 +847,7 @@ impl TerminalSession {
                 background,
                 bold,
                 italic,
+                faint,
                 underline,
                 cursor: cursor
                     .is_some_and(|position| position.0 == column && position.1 == row_index),
@@ -898,6 +918,120 @@ fn cursor_shape(style: CursorVisualStyle) -> CursorShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_preserves_faint_colors_and_intensity_resets() {
+        let (mut session, _) = TerminalSession::spawn(
+            WorkspaceTab::Terminal,
+            &std::env::temp_dir(),
+            AgentKind::DEFAULT,
+        )
+        .unwrap();
+        session.feed(b"\x1b[?25lN\x1b[2mF\x1b[22mR\x1b[2mD\x1b[0mZ");
+        let rows = session.snapshot().unwrap().unwrap();
+        let runs: Vec<_> = rows[0]
+            .iter()
+            .take(5)
+            .map(|run| (run.text.trim_end().to_string(), run.style.faint))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![
+                ("N".into(), false),
+                ("F".into(), true),
+                ("R".into(), false),
+                ("D".into(), true),
+                ("Z".into(), false),
+            ]
+        );
+
+        let palette = session.terminal.color_palette().unwrap();
+        for (text, foreground, background, bold, block) in [
+            ("\x1b[2mX", 0xFFFFFF, 0, false, None),
+            (
+                "\x1b[2;31;44mX",
+                color_value(palette.0[1]),
+                color_value(palette.0[4]),
+                false,
+                None,
+            ),
+            (
+                "\x1b[2;38;2;200;160;120;48;2;20;40;60mX",
+                0xC8A078,
+                0x14283C,
+                false,
+                None,
+            ),
+            (
+                "\x1b[2;7;38;2;200;160;120;48;2;20;40;60mX",
+                0x14283C,
+                0xC8A078,
+                false,
+                None,
+            ),
+            ("\x1b[1;2mX", 0xFFFFFF, 0, true, None),
+            ("\x1b[2m▀", 0xFFFFFF, 0, false, Some(BlockKind::Upper)),
+        ] {
+            session.feed(b"\x1b[0m\x1b[2J\x1b[H");
+            session.feed(text.as_bytes());
+            let rows = session.snapshot().unwrap().unwrap();
+            let run = &rows[0][0];
+            assert!(run.style.faint, "{text:?}");
+            assert_eq!(run.style.foreground, foreground, "{text:?}");
+            assert_eq!(run.style.background, background, "{text:?}");
+            assert_eq!(run.style.bold, bold, "{text:?}");
+            assert_eq!(run.block, block, "{text:?}");
+        }
+        // Erased blanks store their background in the cell itself, without
+        // a style ID. Codex uses these fills around its input text.
+        for (sequence, background) in [
+            (b"\x1b[44m\x1b[2K".as_slice(), color_value(palette.0[4])),
+            (b"\x1b[48;2;30;30;30m\x1b[2K".as_slice(), 0x1E1E1E),
+        ] {
+            session.feed(b"\x1b[0m\x1b[H");
+            session.feed(sequence);
+            let rows = session.snapshot().unwrap().unwrap();
+            assert!(rows[0].iter().all(|run| run.style.background == background));
+        }
+        session._child.kill().ok();
+    }
+
+    #[test]
+    fn default_color_queries_match_rendered_colors() {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut session, _) = TerminalSession::spawn(
+            WorkspaceTab::Terminal,
+            &std::env::temp_dir(),
+            AgentKind::DEFAULT,
+        )
+        .unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        *session.writer.lock() = Box::new(Capture(captured.clone()));
+
+        // Codex uses the background report to choose its input-box color.
+        session.feed(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+        let rows = session.snapshot().unwrap().unwrap();
+        let foreground = session.foreground_color();
+        let background = session.background_color();
+        session._child.kill().ok();
+        assert_eq!(foreground, 0xFFFFFF);
+        assert_eq!(background, 0x000000);
+        assert_eq!(rows[0][0].style.foreground, foreground);
+        assert_eq!(rows[0][0].style.background, background);
+        assert_eq!(
+            &*captured.lock(),
+            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\"
+        );
+    }
 
     #[test]
     fn mouse_reporting_and_osc8_links_follow_terminal_modes() {

@@ -15,10 +15,10 @@ use gpui_kit::component::{ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
-    HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent,
-    SharedString, StatefulInteractiveElement, Styled, StyledText, UnderlineStyle, Window, div, px,
-    rgb,
+    HighlightStyle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollEvent, SharedString, StatefulInteractiveElement, Styled, StyledText,
+    UnderlineStyle, Window, div, px, rgb,
 };
 
 use crate::{
@@ -33,7 +33,7 @@ use crate::{
         INITIAL_COLS, INITIAL_ROWS, MAX_SCROLL_LINES_PER_EVENT, TERMINAL_PADDING,
         WORKSPACE_HEADER_HEIGHT, app_font_size, cell_height, cell_width,
     },
-    session::{BlockKind, CursorPresentation, CursorShape, RenderRun, TerminalSession},
+    session::{BlockKind, CellStyle, CursorPresentation, CursorShape, RenderRun, TerminalSession},
     workspace::WorkspaceTab,
 };
 
@@ -929,11 +929,7 @@ impl TerminalPane {
             let start = text.len();
             text.push_str(&run.text);
             let end = text.len();
-            let (foreground, background) = if run.style.cursor && invert_cursor {
-                (run.style.background, run.style.foreground)
-            } else {
-                (run.style.foreground, run.style.background)
-            };
+            let (foreground, background) = cell_colors(run.style, invert_cursor);
             if let Some(kind) = run.block {
                 // The run's text is spaces (see `RenderRun::block`); paint the
                 // fill as an exact grid-aligned rect over them.
@@ -945,24 +941,18 @@ impl TerminalPane {
             }
             highlights.push((
                 start..end,
-                HighlightStyle {
-                    color: Some(rgb(foreground).into()),
-                    font_weight: run.style.bold.then_some(FontWeight::BOLD),
-                    font_style: run.style.italic.then_some(FontStyle::Italic),
-                    background_color: (!separate_background).then(|| rgb(background).into()),
-                    underline: run.style.underline.then_some(UnderlineStyle {
-                        thickness: px(1.),
-                        color: Some(rgb(foreground).into()),
-                        wavy: false,
-                    }),
-                    ..Default::default()
-                },
+                cell_highlight(run.style, foreground, background, separate_background),
             ));
         }
 
         div()
             .id(("terminal-row", index))
-            .relative()
+            .debug_selector(move || format!("terminal-row-{index}"))
+            // Stacking independently rounded row heights accumulates drift
+            // from the fractional grid used by backgrounds and the cursor.
+            .absolute()
+            .left(px(TERMINAL_PADDING))
+            .top(px(TERMINAL_PADDING + index as f32 * cell_height()))
             .w(px(cell_width() * columns as f32))
             .h(px(cell_height()))
             .flex_none()
@@ -983,7 +973,7 @@ impl TerminalPane {
                             .top(px(y))
                             .w(px(width))
                             .h(px(height))
-                            .bg(rgb(color))
+                            .bg(color)
                     }),
             )
             .when_some(link, |this, (start, end)| {
@@ -1027,6 +1017,46 @@ impl TerminalPane {
                 } => this.child(cursor_overlay_element(column, shape, color)),
             })
             .into_any_element()
+    }
+}
+
+/// Faint affects foreground ink only, after any cursor color inversion.
+/// Keeping the background opaque also preserves input boxes and block cursors.
+fn cell_colors(style: CellStyle, invert_cursor: bool) -> (Hsla, Hsla) {
+    let (foreground, background) = if style.cursor && invert_cursor {
+        (style.background, style.foreground)
+    } else {
+        (style.foreground, style.background)
+    };
+    let foreground: Hsla = rgb(foreground).into();
+    (
+        foreground.opacity(if style.faint { 0.5 } else { 1.0 }),
+        rgb(background).into(),
+    )
+}
+
+fn cell_highlight(
+    style: CellStyle,
+    foreground: Hsla,
+    background: Hsla,
+    separate_background: bool,
+) -> HighlightStyle {
+    // GPUI blends highlight colors over inherited text colors. Set an
+    // opaque color first, then fade it, so white-on-white still dims.
+    let mut text_foreground = foreground;
+    text_foreground.a = 1.0;
+    HighlightStyle {
+        color: Some(text_foreground),
+        fade_out: style.faint.then_some(0.5),
+        font_weight: style.bold.then_some(FontWeight::BOLD),
+        font_style: style.italic.then_some(FontStyle::Italic),
+        background_color: (!separate_background).then_some(background),
+        underline: style.underline.then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(foreground),
+            wavy: false,
+        }),
+        ..Default::default()
     }
 }
 
@@ -1712,7 +1742,6 @@ impl Render for TerminalPane {
                     .as_ref()
                     .map(|s| s.graphics.placements.as_slice())
                     .unwrap_or(&[]);
-                let has_images = !placements.is_empty();
                 let default_bg = self.session.as_ref().map_or(0, |s| s.background_color());
                 this.children(
                     placements
@@ -1720,33 +1749,33 @@ impl Render for TerminalPane {
                         .filter(|p| p.layer() == 0)
                         .map(|p| p.element(self.grid_size)),
                 )
-                .when(has_images, |this| {
-                    this.children(self.rows.iter().enumerate().flat_map(|(row_index, row)| {
-                        let invert = cursor_frame.is_some_and(|frame| {
-                            frame.row as usize == row_index
-                                && matches!(frame.paint, CursorPaint::Invert)
-                        });
-                        let mut column = 0;
-                        row.iter().filter_map(move |run| {
-                            let start = column;
-                            column += run.columns;
-                            let bg = if run.style.cursor && invert {
-                                run.style.foreground
-                            } else {
-                                run.style.background
-                            };
-                            (bg != default_bg).then(|| {
-                                div()
-                                    .absolute()
-                                    .left(px(TERMINAL_PADDING + start as f32 * cell_width()))
-                                    .top(px(TERMINAL_PADDING + row_index as f32 * cell_height()))
-                                    .w(px(run.columns as f32 * cell_width()))
-                                    .h(px(cell_height()))
-                                    .bg(rgb(bg))
-                            })
+                // Paint backgrounds on the terminal grid even without images:
+                // shaped text backgrounds do not cover empty/trailing cells.
+                .children(self.rows.iter().enumerate().flat_map(|(row_index, row)| {
+                    let invert = cursor_frame.is_some_and(|frame| {
+                        frame.row as usize == row_index
+                            && matches!(frame.paint, CursorPaint::Invert)
+                    });
+                    let mut column = 0;
+                    row.iter().filter_map(move |run| {
+                        let start = column;
+                        column += run.columns;
+                        let bg = if run.style.cursor && invert {
+                            run.style.foreground
+                        } else {
+                            run.style.background
+                        };
+                        (bg != default_bg).then(|| {
+                            div()
+                                .absolute()
+                                .left(px(TERMINAL_PADDING + start as f32 * cell_width()))
+                                .top(px(TERMINAL_PADDING + row_index as f32 * cell_height()))
+                                .w(px(run.columns as f32 * cell_width()))
+                                .h(px(cell_height()))
+                                .bg(rgb(bg))
                         })
-                    }))
-                })
+                    })
+                }))
                 .children(
                     placements
                         .iter()
@@ -1764,7 +1793,7 @@ impl Render for TerminalPane {
                             .find(|(row, _, _)| *row == row_index)
                             .map(|(_, start, end)| (*start, *end))
                     });
-                    Self::render_row(row, row_index, selection, cursor, link, has_images)
+                    Self::render_row(row, row_index, selection, cursor, link, true)
                 }))
                 .children(
                     placements
@@ -1876,7 +1905,63 @@ fn coalesce_scroll_lines(remainder: &mut f32, delta_pixels_y: f32) -> isize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::CellStyle;
+
+    struct TerminalGridFixture;
+
+    impl Render for TerminalGridFixture {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .relative()
+                .size_full()
+                .p(px(TERMINAL_PADDING))
+                .font_family(TERMINAL_FONT_FAMILY)
+                .child(
+                    div()
+                        .debug_selector(|| "terminal-grid-cursor".into())
+                        .absolute()
+                        .left(px(TERMINAL_PADDING))
+                        .top(px(TERMINAL_PADDING + 39.0 * cell_height()))
+                        .w(px(cell_width()))
+                        .h(px(cell_height())),
+                )
+                .children((0..40).map(|index| {
+                    TerminalPane::render_row(
+                        &test_row("Ask Codex to do anything", 24),
+                        index,
+                        None,
+                        None,
+                        None,
+                        true,
+                    )
+                }))
+        }
+    }
+
+    #[gpui_kit::test]
+    fn terminal_rows_keep_cursor_alignment_at_fractional_heights(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::fonts::register_bundled_fonts(cx).unwrap();
+        });
+        let (_, cx) = cx.add_window_view(|_, _| TerminalGridFixture);
+        let handle = cx.update(|window, _| window.window_handle());
+        cx.simulate_window_resize(handle, gpui_kit::size(px(800.), px(1000.)));
+        for scale in [1.0, 1.5, 2.0] {
+            cx.simulate_scale_factor_change(scale);
+            cx.update(|window, cx| window.render_frame(cx));
+            let row = cx.debug_bounds("terminal-row-39").unwrap();
+            let cursor = cx.debug_bounds("terminal-grid-cursor").unwrap();
+            assert_eq!(
+                row.origin.y, cursor.origin.y,
+                "scale {scale}: text and cursor must share a grid row"
+            );
+            assert_eq!(row.size.height, cursor.size.height);
+        }
+    }
 
     #[test]
     fn terminal_links_join_only_soft_wraps_and_keep_grid_spans() {
@@ -2037,8 +2122,43 @@ mod tests {
             background: 0x090A0A,
             bold: false,
             italic: false,
+            faint: false,
             underline: false,
             cursor: false,
+        }
+    }
+
+    #[test]
+    fn faint_paints_only_foreground_after_cursor_inversion() {
+        for faint in [false, true] {
+            for cursor in [false, true] {
+                for invert in [false, true] {
+                    let style = CellStyle {
+                        faint,
+                        cursor,
+                        ..test_style()
+                    };
+                    let (foreground, background) = cell_colors(style, invert);
+                    let (expected_fg, expected_bg) = if cursor && invert {
+                        (style.background, style.foreground)
+                    } else {
+                        (style.foreground, style.background)
+                    };
+                    let expected_fg: Hsla = rgb(expected_fg).into();
+                    assert_eq!(
+                        foreground,
+                        expected_fg.opacity(if faint { 0.5 } else { 1.0 })
+                    );
+                    assert_eq!(background, Hsla::from(rgb(expected_bg)));
+                    assert_eq!(background.a, 1.0);
+                    let highlight = cell_highlight(style, foreground, background, true);
+                    assert!(highlight.background_color.is_none());
+                    // Exercise GPUI's actual highlight resolution: highlight
+                    // colors blend over inherited text colors before painting.
+                    let text = gpui_kit::TextStyle::default().highlight(highlight);
+                    assert_eq!(text.color.a, if faint { 0.5 } else { 1.0 });
+                }
+            }
         }
     }
 
