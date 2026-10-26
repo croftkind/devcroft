@@ -212,7 +212,7 @@ impl TutorialView {
 }
 
 impl Render for TutorialView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_os = "macos")]
         let native = {
             if self
@@ -225,19 +225,19 @@ impl Render for TutorialView {
             }
             if self.webview.is_none() && self.body.is_some() && self.error.is_none() {
                 let view = cx.entity();
-                window.defer(cx, move |window, cx| {
+                _window.defer(cx, move |window, cx| {
                     view.update(cx, |view, cx| view.build_webview(window, cx));
                 });
             }
             let webview = self.webview.clone().filter(|_| self.error.is_none());
             if let Some(webview) = &webview {
                 let visible = !self.workspace_hidden
-                    && !window.has_active_sheet(cx)
+                    && !_window.has_active_sheet(cx)
                     && (webview.overlays_supported
                         || (!self.menu_open
                             && !self.palette_open
                             && !self.navigation_open
-                            && !window.has_active_dialog(cx)));
+                            && !_window.has_active_dialog(cx)));
                 webview.view.update(cx, |view, _| {
                     if visible && !view.visible() {
                         view.show();

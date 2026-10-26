@@ -5,9 +5,13 @@ use std::{
     ffi::OsString,
     fs,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::{Duration, Instant},
+    time::Duration,
+};
+#[cfg(target_os = "macos")]
+use std::{
+    process::{Command, Stdio},
+    time::Instant,
 };
 
 use super::{
