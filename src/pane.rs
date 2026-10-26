@@ -16,9 +16,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, FontStyle, FontWeight,
     HighlightStyle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledText, UnderlineStyle,
-    Window, div, px, rgb,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, UnderlineStyle, Window, div, px,
+    rgb,
 };
 
 use crate::{
@@ -830,12 +830,7 @@ impl TerminalPane {
         selection_columns_for_row(row, start, end, row_columns)
     }
 
-    fn on_scroll_wheel(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(session) = self.session.as_mut() {
             let error_before = self.error.clone();
             let bounds = self.pane_bounds.unwrap_or_else(|| {
@@ -1683,7 +1678,7 @@ impl Render for TerminalPane {
                 }
             }))
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll))
             .when_some(self.error.clone(), |this, error| {
                 this.child(
                     v_flex()

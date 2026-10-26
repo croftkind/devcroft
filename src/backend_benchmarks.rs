@@ -7,7 +7,7 @@ use std::{fs, path::Path, process::Command, time::Instant};
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    App, AppContext as _, PlatformInput, ScrollDelta, ScrollWheelEvent, TestAppContext,
+    App, AppContext as _, PlatformInput, ScrollDelta, ScrollEvent, TestAppContext,
     VisualTestContext, Window, point, px, size,
 };
 
@@ -56,7 +56,7 @@ fn scroll_frame(window: &mut Window, cx: &mut App, i: usize) {
     // pointer in the reader/review stream, away from sidebar controls.
     let delta = if i % 80 < 40 { -48. } else { 48. };
     window.dispatch_event(
-        PlatformInput::ScrollWheel(ScrollWheelEvent {
+        PlatformInput::Scroll(ScrollEvent {
             position: point(px(800.), px(450.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
             ..Default::default()

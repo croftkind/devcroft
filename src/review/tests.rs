@@ -69,7 +69,7 @@ fn long_file_names_scroll_independently(cx: &mut gpui_kit::TestAppContext) {
         area.right() < px(320.),
         "filename must leave room for status"
     );
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: gpui_kit::point(px(150.), first.center().y),
         delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(-120.), px(0.))),
         ..Default::default()
@@ -88,7 +88,7 @@ fn long_file_names_scroll_independently(cx: &mut gpui_kit::TestAppContext) {
         px(0.),
         "horizontal gestures must not move the file list"
     );
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: gpui_kit::point(px(150.), first.center().y),
         delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(-10_000.), px(0.))),
         ..Default::default()
@@ -105,7 +105,7 @@ fn long_file_names_scroll_independently(cx: &mut gpui_kit::TestAppContext) {
         px(0.),
         "overscrolling horizontally must not move the file list"
     );
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: gpui_kit::point(px(150.), first.center().y),
         delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(10_000.), px(0.))),
         ..Default::default()
@@ -122,7 +122,7 @@ fn long_file_names_scroll_independently(cx: &mut gpui_kit::TestAppContext) {
         px(0.),
         "overscrolling back to the start must not move the file list"
     );
-    cx.simulate_event(gpui_kit::ScrollWheelEvent {
+    cx.simulate_event(gpui_kit::ScrollEvent {
         position: gpui_kit::point(px(150.), first.center().y),
         delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-120.))),
         ..Default::default()

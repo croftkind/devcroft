@@ -870,13 +870,29 @@ impl Render for PreviewView {
                     _ => 16.,
                 }))
             })
-            // HighlightStyle cannot change a span's font, padding, or corner
-            // radius. Keep the source untouched and use a quiet, theme-aware
-            // highlight until the renderer exposes real inline-code styling.
-            .with_inline_code(HighlightStyle {
-                background_color: Some(cx.theme().foreground.opacity(0.10)),
-                ..Default::default()
-            })
+            .with_inline_code_style(
+                div()
+                    .font_family(crate::fonts::TERMINAL_FONT_FAMILY)
+                    .text_size(px(14.))
+                    .text_color(cx.theme().foreground)
+                    .bg(cx.theme().foreground.opacity(0.08))
+                    .px(px(4.))
+                    .rounded(px(4.))
+                    .style()
+                    .clone(),
+            )
+            .with_list_style(
+                StyleRefinement::default().text_color(cx.theme().foreground.opacity(0.7)),
+            )
+            .with_blockquote_style(
+                div()
+                    .border_color(cx.theme().foreground.opacity(0.25))
+                    .bg(cx.theme().foreground.opacity(0.04))
+                    .px_3()
+                    .py_1()
+                    .style()
+                    .clone(),
+            )
             .with_code_block(code_block)
             .with_table(table)
             .with_table_head(table_head)

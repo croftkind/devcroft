@@ -253,21 +253,19 @@ pub(super) fn render(page: &GraphPage, cx: &mut Context<GraphPage>) -> impl Into
                 cx.notify();
             }),
         )
-        .on_scroll_wheel(
-            cx.listener(|page, event: &gpui_kit::ScrollWheelEvent, _, cx| {
-                if page.gesture.is_some() {
-                    return;
-                }
-                let p = local(page, event.position);
-                let delta = event.delta.pixel_delta(px(20.));
-                page.layout_mut()
-                    .viewport
-                    .zoom_at(p, (-f32::from(delta.y) * 0.002).exp());
-                page.schedule_layout_save(cx);
-                cx.stop_propagation();
-                cx.notify();
-            }),
-        )
+        .on_scroll(cx.listener(|page, event: &gpui_kit::ScrollEvent, _, cx| {
+            if page.gesture.is_some() {
+                return;
+            }
+            let p = local(page, event.position);
+            let delta = event.delta.pixel_delta(px(20.));
+            page.layout_mut()
+                .viewport
+                .zoom_at(p, (-f32::from(delta.y) * 0.002).exp());
+            page.schedule_layout_save(cx);
+            cx.stop_propagation();
+            cx.notify();
+        }))
         .child(
             canvas(
                 move |bounds, _, _| bounds_cell.set(bounds),

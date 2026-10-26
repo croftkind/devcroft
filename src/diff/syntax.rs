@@ -147,6 +147,38 @@ pub(crate) fn syntax_by_name(name: &str) -> Option<&'static SyntaxReference> {
     SYNTAXES.find_syntax_by_name(name)
 }
 
+/// Kit supplies one hunk side at a time. Keep its byte offsets across lines
+/// while using the same per-line styles and fresh parser state as Review.
+pub(super) fn highlight_source(
+    language: &str,
+    source: &str,
+    dark: bool,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let Some(syntax) = syntax_by_name(language) else {
+        return Vec::new();
+    };
+    let theme = &THEMES.themes[if dark { DARK_THEME } else { LIGHT_THEME }];
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut offset = 0;
+    let mut highlights = Vec::new();
+    for line in source.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\r', '\n']);
+        let spans = highlight_line(
+            &mut highlighter,
+            &format!("{text}\n"),
+            text.len(),
+            theme.settings.foreground,
+        );
+        highlights.extend(
+            styled_highlights(&spans)
+                .into_iter()
+                .map(|(range, style)| (range.start + offset..range.end + offset, style)),
+        );
+        offset += line.len();
+    }
+    highlights
+}
+
 /// Every bundled syntax's display name, sorted, for a language picker.
 pub(crate) fn syntax_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = SYNTAXES
@@ -181,7 +213,7 @@ fn highlight_with_theme(diff: &ReviewDiff, theme: &Theme) -> PaletteHighlights {
     PaletteHighlights { files }
 }
 
-fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
+pub(super) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
     let path = Path::new(path);
     let file_name = path
         .file_name()
@@ -316,6 +348,51 @@ mod tests {
         assert_eq!(syntax_for_path("foo.py3").unwrap().name, "Python");
         assert!(syntax_for_path("Makefile").is_some());
         assert!(syntax_for_path("notes.unknown-extension").is_none());
+    }
+
+    #[test]
+    fn kit_hunk_offsets_match_review_with_unicode_crlf_and_multiline_syntax() {
+        let source = "/* café\r\n続き */\r\nfn main() { let value = \"日本語\"; }";
+        let (hunks, _) = super::super::model::diff_text("", source);
+        let review = highlight_hunks(&hunks, syntax_by_name("Rust").unwrap());
+        for dark in [false, true] {
+            let actual = highlight_source("Rust", source, dark);
+            let mut expected = Vec::new();
+            let mut offset = 0;
+            for (line, raw) in source.split_inclusive('\n').enumerate() {
+                expected.extend(
+                    styled_highlights(review.document_line(dark, 0, line))
+                        .into_iter()
+                        .map(|(range, style)| (range.start + offset..range.end + offset, style)),
+                );
+                offset += raw.len();
+            }
+            assert_eq!(actual, expected);
+            assert!(actual.iter().any(|(range, _)| {
+                source
+                    .get(range.clone())
+                    .is_some_and(|text| text.contains("日本語"))
+            }));
+            for (range, _) in actual {
+                let text = source.get(range).expect("UTF-8 byte-aligned span");
+                assert!(!text.contains(['\r', '\n']));
+            }
+        }
+        assert_ne!(
+            highlight_source("Rust", source, false),
+            highlight_source("Rust", source, true),
+        );
+    }
+
+    #[test]
+    fn kit_hunks_reset_parser_state_and_unknown_languages_stay_plain() {
+        for dark in [false, true] {
+            let _ = highlight_source("Rust", "/* unfinished comment", dark);
+            let fresh = highlight_source("Rust", "fn clean() {}", dark);
+            assert!(fresh.iter().any(|(range, _)| range == &(0..2)));
+            assert!(highlight_source("unknown-language", "fn clean() {}", dark).is_empty());
+            assert!(highlight_source("Plain Text", "fn clean() {}", dark).is_empty());
+        }
     }
 
     #[test]

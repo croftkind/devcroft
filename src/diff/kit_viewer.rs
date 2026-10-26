@@ -14,7 +14,7 @@ use gpui_kit::{
 
 use super::{
     model::{ChangedFile, FileContent},
-    patch,
+    patch, syntax,
 };
 use crate::{fonts::TERMINAL_FONT_FAMILY, metrics::review_font_size};
 
@@ -35,7 +35,17 @@ impl PreparedKitDiff {
         new: &str,
         modes: [&str; 2],
     ) -> Result<Self, String> {
-        let files = patch::parse_file(&file, old, new, modes)?;
+        let files = patch::parse_file(&file, old, new, modes)?
+            .into_iter()
+            .map(|parsed| {
+                // Resolve exactly as Review does, including aliases Kit's
+                // built-in detector doesn't know and our bundled Swift syntax.
+                let language = syntax::syntax_for_path(parsed.path())
+                    .filter(|syntax| syntax.name != "Plain Text")
+                    .map_or("text", |syntax| syntax.name.as_str());
+                parsed.with_language(language)
+            })
+            .collect();
         Ok(Self { file, files })
     }
 }
@@ -52,6 +62,7 @@ pub(crate) struct KitDiffViewer {
     state: ViewerState,
     wrap: bool,
     external_header: bool,
+    syntax_dark: bool,
 }
 
 impl KitDiffViewer {
@@ -61,11 +72,19 @@ impl KitDiffViewer {
     }
 
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+        let syntax_dark = cx.theme().is_dark();
         Self {
-            diff: cx.new(|cx| DiffState::new([], cx).with_context_lines(None)),
+            diff: cx.new(|cx| {
+                DiffState::new([], cx)
+                    .with_context_lines(None)
+                    .with_syntax_highlighter(move |language, source| {
+                        syntax::highlight_source(language, source, syntax_dark)
+                    })
+            }),
             state: ViewerState::Empty,
             wrap: false,
             external_header: false,
+            syntax_dark,
         }
     }
 
@@ -229,6 +248,16 @@ impl KitDiffViewer {
 
 impl Render for KitDiffViewer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dark = cx.theme().is_dark();
+        if dark != self.syntax_dark {
+            self.syntax_dark = dark;
+            self.diff.update(cx, |diff, cx| {
+                diff.set_syntax_highlighter(
+                    move |language, source| syntax::highlight_source(language, source, dark),
+                    cx,
+                );
+            });
+        }
         let mut content = v_flex().size_full().min_h_0().min_w_0();
         match &self.state {
             ViewerState::Empty => {
@@ -368,6 +397,23 @@ mod tests {
         (holder.borrow().clone().unwrap(), test_cx)
     }
 
+    #[test]
+    fn prepared_files_use_reviews_syntax_detection() {
+        for (path, language) in [
+            ("src/lib.rs", "Rust"),
+            ("script.pyw", "Python"),
+            ("Sources/App.swift", "Swift"),
+            ("Makefile", "Makefile"),
+            ("notes.txt", "text"),
+            ("notes.unknown-extension", "text"),
+        ] {
+            let mut file = prepared("old\n", "new\n").file;
+            file.path = path.into();
+            let diff = PreparedKitDiff::new(file, "old\n", "new\n", ["100644"; 2]).unwrap();
+            assert_eq!(diff.files()[0].language().as_str(), language);
+        }
+    }
+
     #[gpui_kit::test]
     fn git_diff_controls_retain_state_copy_source_and_return_focus(
         cx: &mut gpui_kit::TestAppContext,
@@ -413,6 +459,22 @@ mod tests {
         });
         assert_eq!(selection.side(), selection.end_side());
         assert!(selection.end() > selection.start());
+        for mode in [
+            gpui_kit::component::ThemeMode::Light,
+            gpui_kit::component::ThemeMode::Dark,
+        ] {
+            test_cx.update(|window, cx| {
+                gpui_kit::component::Theme::change(mode, Some(window), cx);
+                window.render_frame(cx);
+            });
+            test_cx.run_until_parked();
+            view.read_with(test_cx, |view, cx| {
+                assert_eq!(view.diff.entity_id(), diff_id);
+                assert_eq!(view.diff.read(cx).selected_lines(), Some(selection.clone()));
+                assert_eq!(view.diff.read(cx).mode(), DiffMode::Unified);
+                assert!(view.wrap);
+            });
+        }
         let source = if selection.side() == DiffSide::Original {
             &old
         } else {

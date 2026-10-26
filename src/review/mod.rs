@@ -924,7 +924,7 @@ impl ReviewView {
                                     .overflow_x_scroll()
                                     .lock_scroll_axis()
                                     .track_scroll(&name_scroll)
-                                    .on_scroll_wheel(|event, _, cx| {
+                                    .on_scroll(|event, _, cx| {
                                         let delta = event.delta.pixel_delta(px(22.5));
                                         if delta.x.abs() > delta.y.abs() {
                                             // Keep horizontal gestures out of the tree's

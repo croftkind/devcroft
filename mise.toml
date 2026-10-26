@@ -1,7 +1,7 @@
 min_version = "2026.8.0"
 
 [tools]
-rust = { version = "1.97.1", profile = "default" }
+rust = { version = "1.98.0", profile = "default" }
 zig = "0.16.0"
 
 [tasks.build]

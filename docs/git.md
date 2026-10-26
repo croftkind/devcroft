@@ -52,6 +52,8 @@ layouts, **Wrap** for long lines, and **Previous change / Next change**. These
 controls share a single compact file header alongside the path and line counts;
 Changes also includes an editor button. Hover the path for the full comparison details.
 The up/down arrows jump between changes.
+Syntax colors match Review and the text comparison tool, including Swift.
+Changing the theme preserves the diff selection and scroll position.
 Display choices remain through refreshes and when selecting another file. Drag over source text or select lines from the gutter,
 then use `Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff
 markers or line numbers. `Shift+Up` / `Shift+Down` extends a line selection.

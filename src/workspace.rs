@@ -5639,7 +5639,7 @@ mod tests {
         });
         test_cx.run_until_parked();
         test_cx.update(|window, cx| window.render_frame(cx));
-        let press = |cx: &mut gpui_kit::VisualTestContext, key: &str| {
+        let press = |cx: &mut gpui_kit::VisualTestContext, key: &'static str| {
             cx.simulate_keystrokes(key);
             cx.simulate_event(KeyUpEvent {
                 keystroke: Keystroke::parse(key).unwrap(),
@@ -5763,7 +5763,7 @@ mod tests {
                     .collect::<Vec<_>>()
             })
         };
-        let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &str| {
+        let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &'static str| {
             test_cx.simulate_event(KeyUpEvent {
                 keystroke: Keystroke::parse(key).unwrap(),
             });
@@ -6151,7 +6151,7 @@ mod tests {
             view.active_space = view.spaces.selection(None, false);
             view.reload_spaces(cx);
         });
-        let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &str| {
+        let release = |test_cx: &mut gpui_kit::VisualTestContext, key: &'static str| {
             test_cx.simulate_event(gpui_kit::KeyUpEvent {
                 keystroke: gpui_kit::Keystroke::parse(key).unwrap(),
             });
@@ -6413,8 +6413,9 @@ mod tests {
 
     #[test]
     fn navigation_tab_maps_to_component_traversal() {
-        let input =
-            |key: &str| Workspace::navigation_input(&gpui_kit::Keystroke::parse(key).unwrap());
+        let input = |key: &'static str| {
+            Workspace::navigation_input(&gpui_kit::Keystroke::parse(key).unwrap())
+        };
         assert_eq!(input("tab"), NavigationInput::Tab);
         assert_eq!(input("shift-tab"), NavigationInput::BackTab);
         assert_eq!(input("space"), NavigationInput::Key(' '));
