@@ -5,9 +5,13 @@ use std::{
     ffi::OsString,
     fs,
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
     sync::{Arc, Mutex, OnceLock, Weak},
-    time::{Duration, Instant},
+    time::Duration,
+};
+#[cfg(target_os = "macos")]
+use std::{
+    process::{Command, Stdio},
+    time::Instant,
 };
 
 use super::{
@@ -809,7 +813,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checkout_lock_survives_dialog_lifetimes_and_serializes_a_blocking_hook() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::{os::unix::fs::PermissionsExt as _, time::Instant};
 
         let temp = setup();
         let root = temp.path();
