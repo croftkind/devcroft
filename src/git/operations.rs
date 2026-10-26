@@ -813,7 +813,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checkout_lock_survives_dialog_lifetimes_and_serializes_a_blocking_hook() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::{os::unix::fs::PermissionsExt as _, time::Instant};
 
         let temp = setup();
         let root = temp.path();
