@@ -39,7 +39,7 @@ impl PreparedKitDiff {
             .into_iter()
             .map(|parsed| {
                 // Resolve exactly as Review does, including aliases Kit's
-                // built-in detector doesn't know and our bundled Swift syntax.
+                // built-in detector doesn't know and our vendored syntaxes.
                 let language = syntax::syntax_for_path(parsed.path())
                     .filter(|syntax| syntax.name != "Plain Text")
                     .map_or("text", |syntax| syntax.name.as_str());
@@ -403,6 +403,11 @@ mod tests {
             ("src/lib.rs", "Rust"),
             ("script.pyw", "Python"),
             ("Sources/App.swift", "Swift"),
+            ("src/main.ts", "TypeScript"),
+            ("src/main.mts", "TypeScript"),
+            ("src/main.cts", "TypeScript"),
+            ("types/index.d.ts", "TypeScript"),
+            ("src/App.tsx", "TypeScriptReact"),
             ("Makefile", "Makefile"),
             ("notes.txt", "text"),
             ("notes.unknown-extension", "text"),

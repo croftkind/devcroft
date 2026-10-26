@@ -28,12 +28,22 @@ use super::model::{FileContent, Hunk, LineTag, ReviewDiff};
 /// Swift, so without this `.swift` files resolve to nothing and the Review
 /// tab paints them plain.
 const SWIFT_SYNTAX: &str = include_str!("../../assets/syntaxes/Swift.sublime-syntax");
+// Syntect's defaults also omit TypeScript and TSX. These definitions are
+// vendored from bat's syntect-compatible bundle (see the same README).
+const TYPESCRIPT_SYNTAX: &str = include_str!("../../assets/syntaxes/TypeScript.sublime-syntax");
+const TSX_SYNTAX: &str = include_str!("../../assets/syntaxes/TypeScriptReact.sublime-syntax");
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
     let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
-    let swift = SyntaxDefinition::load_from_str(SWIFT_SYNTAX, true, None)
-        .expect("the vendored Swift syntax must parse");
-    builder.add(swift);
+    for (name, source) in [
+        ("Swift", SWIFT_SYNTAX),
+        ("TypeScript", TYPESCRIPT_SYNTAX),
+        ("TSX", TSX_SYNTAX),
+    ] {
+        let syntax = SyntaxDefinition::load_from_str(source, true, None)
+            .unwrap_or_else(|error| panic!("the vendored {name} syntax must parse: {error}"));
+        builder.add(syntax);
+    }
     builder.build()
 });
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
@@ -348,6 +358,117 @@ mod tests {
         assert_eq!(syntax_for_path("foo.py3").unwrap().name, "Python");
         assert!(syntax_for_path("Makefile").is_some());
         assert!(syntax_for_path("notes.unknown-extension").is_none());
+    }
+
+    #[test]
+    fn recognizes_typescript_and_tsx_extensions() {
+        for path in [
+            "src/main.ts",
+            "src/main.mts",
+            "src/main.cts",
+            "types/index.d.ts",
+            "types/index.d.mts",
+            "types/index.d.cts",
+            "src/main.TS",
+        ] {
+            assert_eq!(
+                syntax_for_path(path).map(|syntax| syntax.name.as_str()),
+                Some("TypeScript"),
+                "{path} must resolve to TypeScript"
+            );
+        }
+        for path in ["src/App.tsx", "src/App.TSX"] {
+            assert_eq!(
+                syntax_for_path(path).map(|syntax| syntax.name.as_str()),
+                Some("TypeScriptReact"),
+                "{path} must resolve to TSX"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_and_tsx_highlight_both_sides_in_both_themes() {
+        for (path, old, new, tokens) in [
+            (
+                "src/main.ts",
+                "export type Label = \"before\";\n",
+                "export type Label = \"after\";\n",
+                ["export", "type"],
+            ),
+            (
+                "src/App.tsx",
+                "export const view = <button title=\"before\">Hello</button>;\n",
+                "export const view = <button title=\"after\">Hello</button>;\n",
+                ["export", "button"],
+            ),
+        ] {
+            let mut diff = rust_diff();
+            let (hunks, truncated) = super::super::model::diff_text(old, new);
+            diff.files[0].path = path.into();
+            diff.files[0].content = FileContent::Text { hunks, truncated };
+            let highlights = highlight(&diff);
+            let FileContent::Text { hunks, .. } = &diff.files[0].content else {
+                unreachable!();
+            };
+            for dark in [false, true] {
+                for (line_index, line) in hunks[0].lines.iter().enumerate() {
+                    let spans = highlights.line(dark, 0, 0, line_index);
+                    let literal = match line.tag {
+                        LineTag::Deletion => "before",
+                        LineTag::Addition => "after",
+                        LineTag::Context => unreachable!("fixture changes every line"),
+                    };
+                    for token in tokens.into_iter().chain([literal]) {
+                        let start = line.text.find(token).unwrap();
+                        assert!(
+                            spans.iter().any(|span| {
+                                span.range.start <= start && span.range.end >= start + token.len()
+                            }),
+                            "{path} {dark:?} {:?}: {token} must be colored, got {spans:?}",
+                            line.tag
+                        );
+                    }
+                }
+            }
+            assert_ne!(
+                highlights.line(false, 0, 0, 0),
+                highlights.line(true, 0, 0, 0),
+                "{path} must use the selected theme"
+            );
+        }
+    }
+
+    #[test]
+    fn kit_highlights_typescript_and_tsx_with_valid_utf8_offsets() {
+        for (language, source, keyword) in [
+            (
+                "TypeScript",
+                "/* café\r\n続き */\r\nexport type Label = \"日本語\";",
+                "type",
+            ),
+            (
+                "TypeScriptReact",
+                "/* café\r\n続き */\r\nexport const view = <button title=\"日本語\" />;",
+                "button",
+            ),
+        ] {
+            for dark in [false, true] {
+                let spans = highlight_source(language, source, dark);
+                let start = source.find(keyword).unwrap();
+                assert!(spans.iter().any(|(range, _)| {
+                    range.start <= start && range.end >= start + keyword.len()
+                }));
+                assert!(spans.iter().any(|(range, _)| {
+                    source
+                        .get(range.clone())
+                        .is_some_and(|text| text.contains("日本語"))
+                }));
+                for (range, _) in spans {
+                    let text = source.get(range).expect("UTF-8 byte-aligned span");
+                    assert!(!text.contains(['\r', '\n']));
+                }
+            }
+        }
     }
 
     #[test]

@@ -158,6 +158,8 @@ pub(crate) const EDITOR_LANGUAGES: &[(&str, &str)] = &[
     ("Scala", "scala"),
     ("Shell-Unix-Generic", "bash"),
     ("Swift", "swift"),
+    ("TypeScript", "typescript"),
+    ("TypeScriptReact", "tsx"),
     ("YAML", "yaml"),
 ];
 
