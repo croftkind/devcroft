@@ -42,8 +42,8 @@ use crate::agent_sessions::{
 use crate::command_palette::{
     GoToAgent, GoToEditor, GoToResources, GoToReview, GoToTerminal, NewAgentSession,
     PaletteCommand, PaletteItem, PaletteMode, PaletteSection, ToggleActionsPalette,
-    ToggleProjectsPalette, is_primary_modifier, is_quit_shortcut, item_at,
-    palette_mode_for_shortcut, palette_sections_for_mode, query_has_terms,
+    ToggleProjectsPalette, is_quit_shortcut, item_at, palette_mode_for_shortcut,
+    palette_sections_for_mode, query_has_terms,
 };
 use crate::data::{
     DataRoot, DeviceStore, RecentRepository, SpaceSelection, Spaces, SyncStatus, SyncTracker,
@@ -715,6 +715,7 @@ impl Workspace {
                 cx,
             )
         });
+        cx.observe(&settings, |_, _, cx| cx.notify()).detach();
         // Best-effort current-repository match so the palette can mark it
         // without waiting for the first switch; a `--checkout` outside any
         // linked binding simply starts unmarked.
@@ -3688,27 +3689,13 @@ impl Workspace {
                 .is_some_and(|editor| editor.read(cx).navigation_in_tree(self.navigation_pane))
     }
 
-    /// The mode toggle: `cmd-j` on macOS, `ctrl-j` on Linux/Windows.
-    /// (`cmd-m`/`super-m` previously collided with system Minimize —
-    /// `Cmd+M` on macOS, `Win+M` minimize-all on Windows — so the toggle
-    /// moved to `J`, which has no OS reservation. `J` also echoes the
-    /// in-mode movement keys `j`/`k`, while the required modifier keeps it
-    /// distinct from plain-`j` move-down.) Plain `m` stays free as the Edit
-    /// Markdown action key, `cmd-m` returns to the system (Minimize on
-    /// macOS), and `ctrl-m` returns to terminals as an Enter alias.
-    pub(crate) fn is_trigger(keystroke: &gpui_kit::Keystroke) -> bool {
-        let modifiers = &keystroke.modifiers;
-        keystroke.key.eq_ignore_ascii_case("j")
-            && is_primary_modifier(modifiers.platform, modifiers.control)
-            && !modifiers.alt
-            && !modifiers.shift
-            && !modifiers.function
-    }
-
-    fn navigation_input(keystroke: &gpui_kit::Keystroke) -> NavigationInput {
+    fn navigation_input(
+        keystroke: &gpui_kit::Keystroke,
+        shortcut: &crate::navigation_shortcut::NavigationShortcut,
+    ) -> NavigationInput {
         let modifiers = &keystroke.modifiers;
         let key = keystroke.key.to_ascii_lowercase();
-        let trigger = Self::is_trigger(keystroke);
+        let trigger = shortcut.matches(keystroke);
         if trigger {
             return NavigationInput::Trigger;
         }
@@ -3760,6 +3747,7 @@ impl Workspace {
         if self.onboarding.is_some() {
             return;
         }
+        let shortcut = self.settings.read(cx).navigation_shortcut().clone();
         // Quit stays live everywhere, including navigation mode and held-key
         // repeats: close the HUD (if open) and let the keystroke continue to
         // normal dispatch, which quits via the global OS-primary binding.
@@ -3787,7 +3775,7 @@ impl Workspace {
         // only with modifier movement — a genuine held repeat (nothing
         // moved) stays swallowed, as does any marked non-trigger key.
         if self.navigation_claimed_keys.contains_key(&key) {
-            let rearm = self.navigation_claimed_keys[&key] && Self::is_trigger(&event.keystroke);
+            let rearm = self.navigation_claimed_keys[&key] && shortcut.matches(&event.keystroke);
             if !rearm {
                 window.prevent_default();
                 cx.stop_propagation();
@@ -3795,17 +3783,15 @@ impl Workspace {
             }
             self.navigation_claimed_keys.remove(&key);
         }
-        // A dialog/sheet is rendered above the workspace and must retain its
-        // own keyboard trap. It can have appeared through another workflow
+        // Dialogs, sheets, and palettes retain their own keyboard input and
+        // focus traps. They can have appeared through another workflow
         // while the HUD was open, so clear the stale mode before considering
         // the current key and let that key reach the overlay.
-        if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
+        if window.has_active_dialog(cx) || window.has_active_sheet(cx) || self.command_open {
             self.close_navigation(cx);
-            // Claim the chord so held repeats cannot open the HUD after
-            // the overlay closes; leave ordinary dialog typing alone.
-            if Self::is_trigger(&event.keystroke) {
-                self.navigation_claimed_keys.insert(key, false);
-            }
+            // Overlay keys belong to its input/focus trap. In particular, do
+            // not claim a configurable plain key here: dialogs are outside
+            // the workspace subtree, so their key-ups cannot clear that claim.
             return;
         }
         // The two palette shortcuts stay live inside navigation mode (quit is
@@ -3826,7 +3812,7 @@ impl Workspace {
             self.close_navigation(cx);
             return;
         }
-        let input = Self::navigation_input(&event.keystroke);
+        let input = Self::navigation_input(&event.keystroke, &shortcut);
         let decision = navigation::decide(
             self.navigation_open,
             input,
@@ -3984,12 +3970,10 @@ impl Workspace {
                 .to_owned(),
             ))
             .child(binding(
-                if cfg!(target_os = "macos") {
-                    "Esc / ⌘J"
-                } else {
-                    "Esc / Ctrl+J"
-                }
-                .to_owned(),
+                format!(
+                    "Esc / {}",
+                    self.settings.read(cx).navigation_shortcut().label()
+                ),
                 "Close".to_owned(),
             ));
         sections = sections.child(section("Common", common));
@@ -4014,10 +3998,11 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_navigation_indicator(&self) -> AnyElement {
+    fn render_navigation_indicator(&self, cx: &App) -> AnyElement {
+        let shortcut = self.settings.read(cx).navigation_shortcut().label();
         h_flex()
             .flex_none()
-            .w(px(104.))
+            .min_w(px(104.))
             .items_center()
             // The wider palette covers part of this slot. Keep its layout
             // space while hiding the whole badge, including its border.
@@ -4025,6 +4010,7 @@ impl Workspace {
             .child(
                 h_flex()
                     .flex_none()
+                    .max_w(px(200.))
                     .items_center()
                     .gap_1p5()
                     .h(px(28.))
@@ -4040,13 +4026,11 @@ impl Workspace {
                             .text_color(rgb(0xf59e0b))
                     })
                     .child(Icon::new(gpui_kit::assets::IconName::Keyboard).size(px(14.)))
-                    .child(if self.navigation_open {
-                        "Navigation"
-                    } else if cfg!(target_os = "macos") {
-                        "⌘J"
+                    .child(div().min_w_0().truncate().child(if self.navigation_open {
+                        "Navigation".to_owned()
                     } else {
-                        "Ctrl+J"
-                    }),
+                        shortcut
+                    })),
             )
             .into_any_element()
     }
@@ -4199,22 +4183,19 @@ impl Render for Workspace {
             // `window.on_key_event`, which panics outside paint because view
             // render runs in layout). Key-up bubbles from any focused
             // descendant — terminals only handle key-down — so releases are
-            // observed window-wide and repeats stay swallowed until then.
+            // observed throughout the workspace. Dialogs are outside this
+            // subtree, so their fresh keys are never claimed here.
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, _| {
                 let key = event.keystroke.key.to_ascii_lowercase();
                 this.navigation_claimed_keys.remove(&key);
             }))
             // Redundant re-arm for the held-key set: if a key-up is ever
-            // lost by the platform, the modifier release that always
-            // follows a modified press (the trigger included) clears the
-            // set once navigation mode is closed. Closed-only on purpose:
+            // lost by the platform, releasing all modifiers clears the set
+            // once navigation mode is closed. Closed-only on purpose:
             // clearing while open would let a still-held key re-fire as a
-            // fresh action. While closed the only entry that must survive
-            // is the trigger's own flicker guard, and its repeats always
-            // carry modifiers — an all-released event can never arrive
-            // mid-flicker. Plain action-key repeats involve no modifiers,
-            // so they cannot trip this either; a modifier tap mid-hold
-            // merely degrades to typing a physically held key.
+            // fresh action. Unmodified triggers normally re-arm on KeyUp;
+            // an explicit modifier tap can also clear their closed-mode
+            // guard, just as it can re-arm a modified trigger.
             //
             // Any modifier movement also marks every claim: a later
             // modifier press proves the previous hold ended, which re-arms
@@ -4592,7 +4573,7 @@ impl Render for Workspace {
                                         )
                                     }),
                             )
-                            .child(self.render_navigation_indicator()),
+                            .child(self.render_navigation_indicator(cx)),
                     )
                     .when(self.home_visible && !is_home_page, |header| {
                         let status = self.portable_git_poll.status();
@@ -5909,6 +5890,152 @@ mod tests {
         );
     }
 
+    #[gpui_kit::test]
+    fn navigation_trigger_changes_live_and_guards_unmodified_repeats(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{KeyUpEvent, Keystroke};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::data::DataRoot::new(directory.path().to_owned());
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| {
+                let mut workspace = Workspace::new_for_test(window, cx, directory.path());
+                workspace.settings = cx.new(|cx| {
+                    SettingsView::new(
+                        window,
+                        Some(root),
+                        crate::metrics::DEFAULT_APP_FONT_SIZE,
+                        crate::data::SyncTracker::default(),
+                        cx,
+                    )
+                });
+                cx.observe(&workspace.settings, |_, _, cx| cx.notify())
+                    .detach();
+                workspace
+            });
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        workspace
+            .downgrade()
+            .update_in(test_cx, |view, window, cx| view.open_settings(window, cx))
+            .unwrap();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("settings-section-Keybindings", cx);
+            window.render_frame(cx);
+            window.click("record-navigation-trigger", cx);
+            window.press("f8", cx);
+            window.press("escape", cx);
+            assert!(!window.has_active_dialog(cx));
+        });
+        let default = if cfg!(target_os = "macos") {
+            "cmd-j"
+        } else {
+            "ctrl-j"
+        };
+        test_cx.simulate_keystrokes(default);
+        workspace.read_with(test_cx, |view, _| {
+            assert!(
+                !view.navigation_open,
+                "old trigger no longer opens navigation"
+            )
+        });
+        test_cx.simulate_keystrokes("f8");
+        workspace.read_with(test_cx, |view, _| assert!(view.navigation_open));
+        test_cx.simulate_keystrokes("f8");
+        workspace.read_with(test_cx, |view, _| {
+            assert!(
+                view.navigation_open,
+                "held trigger does not close navigation"
+            )
+        });
+        test_cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("f8").unwrap(),
+        });
+        test_cx.simulate_keystrokes("f8");
+        workspace.read_with(test_cx, |view, _| assert!(!view.navigation_open));
+        test_cx.simulate_keystrokes("f8");
+        workspace.read_with(test_cx, |view, _| {
+            assert!(
+                !view.navigation_open,
+                "held trigger does not reopen navigation"
+            )
+        });
+        test_cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("f8").unwrap(),
+        });
+        test_cx.simulate_keystrokes("f8");
+        workspace.read_with(test_cx, |view, _| assert!(view.navigation_open));
+        test_cx.simulate_event(KeyUpEvent {
+            keystroke: Keystroke::parse("f8").unwrap(),
+        });
+        test_cx.update(|window, cx| window.press("escape", cx));
+        workspace
+            .downgrade()
+            .update_in(test_cx, |view, window, cx| view.open_settings(window, cx))
+            .unwrap();
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            window.click("record-navigation-trigger", cx);
+            window.press("j", cx);
+            window.press("escape", cx);
+            let input = cx.new(|cx| gpui_kit::component::input::InputState::new(window, cx));
+            window.open_dialog(cx, {
+                let input = input.clone();
+                move |dialog, _, _| {
+                    dialog
+                        .title("Typing with a plain trigger")
+                        .child(gpui_kit::component::input::Input::new(&input))
+                }
+            });
+            window.render_frame(cx);
+            input.read(cx).focus_handle(cx).focus(window, cx);
+            window.press("j", cx);
+            window.press("j", cx);
+            assert_eq!(
+                input.read(cx).value().as_str(),
+                "jj",
+                "trigger characters remain ordinary dialog input after release"
+            );
+            window.press("escape", cx);
+        });
+        for mode in [PaletteMode::Actions, PaletteMode::Projects] {
+            workspace
+                .downgrade()
+                .update_in(test_cx, |view, window, cx| {
+                    view.toggle_command_palette(mode, window, cx)
+                })
+                .unwrap();
+            test_cx.update(|window, cx| {
+                window.press("j", cx);
+                window.press("j", cx);
+            });
+            workspace.read_with(test_cx, |view, cx| {
+                assert!(view.command_open);
+                assert!(!view.navigation_open);
+                assert_eq!(
+                    view.command_state.read(cx).query(cx).as_str(),
+                    "jj",
+                    "trigger characters remain ordinary palette input"
+                );
+            });
+            workspace
+                .downgrade()
+                .update_in(test_cx, |view, window, cx| {
+                    view.close_command_palette(window, cx)
+                })
+                .unwrap();
+        }
+    }
+
     /// Component focus traversal is a navigation-mode command. In normal mode
     /// the workspace unbind (`bind_app_keys`) keeps gpui-component's `Root`
     /// traversal from stealing Tab, so the key stays with the focused
@@ -6408,7 +6535,10 @@ mod tests {
     #[test]
     fn navigation_tab_maps_to_component_traversal() {
         let input = |key: &'static str| {
-            Workspace::navigation_input(&gpui_kit::Keystroke::parse(key).unwrap())
+            Workspace::navigation_input(
+                &gpui_kit::Keystroke::parse(key).unwrap(),
+                &Default::default(),
+            )
         };
         assert_eq!(input("tab"), NavigationInput::Tab);
         assert_eq!(input("shift-tab"), NavigationInput::BackTab);

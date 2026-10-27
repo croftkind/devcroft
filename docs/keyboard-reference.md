@@ -11,8 +11,15 @@ or click the indicator to see their statuses and clear the count. The count is
 per agent, including multiple agents in the same checkout. The project palette
 shows the existing agent status for each checkout.
 
-Toggle with `Cmd+J` on macOS (`Ctrl+J` on Linux/Windows). The top bar shows a
-a keyboard badge with `⌘J` on macOS (`Ctrl+J` elsewhere) right after the command
+Toggle with `Cmd+J` on macOS (`Ctrl+J` on Linux/Windows) by default.
+To change it, open **Settings → Keybindings → Navigation mode**, choose
+**Record shortcut**, and press a key or key combination. Changes apply
+immediately and are saved on this device. **Escape** cancels recording;
+**Reset to default** restores the original shortcut. Palette and quit shortcuts
+are reserved. An unmodified trigger takes priority over normal typing, so
+choose a key you do not need to type in editors or terminals.
+
+The top bar shows a keyboard badge with your current trigger right after the command
 bar. It becomes an amber `Navigation` badge while the mode owns the keyboard,
 without shifting the search field. The key list sits
 at the bottom-right of the window. Contextual actions appear only for the

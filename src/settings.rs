@@ -8,7 +8,8 @@
 //! agents only), the sidebar session-limit slider (10–50, step 5), and
 //! Devcroft skill cards with a header refresh action.
 //! Editor hosts default-editor radio cards, Neovim availability, and external
-//! launcher switches. Keybindings documents the current global shortcuts.
+//! launcher switches. Keybindings configures the navigation trigger and
+//! documents the current global shortcuts.
 //!
 //! [`SettingsView`] is a long-lived [`Workspace`](crate::workspace::Workspace)
 //! entity rendered inside a dialog (`window.open_dialog`): the dialog owns
@@ -27,8 +28,8 @@ use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled,
-    WeakEntity, Window, div, px,
+    IntoElement, KeyDownEvent, KeystrokeEvent, MouseButton, MouseDownEvent, ParentElement, Render,
+    Styled, Subscription, WeakEntity, Window, div, px,
 };
 
 use std::{collections::HashMap, rc::Rc};
@@ -55,6 +56,7 @@ use crate::metrics::{
     DEFAULT_APP_FONT_SIZE, MAX_APP_FONT_SIZE, MIN_APP_FONT_SIZE, clamp_app_font_size,
     review_font_size, set_app_font_size,
 };
+use crate::navigation_shortcut::NavigationShortcut;
 use crate::selection_card;
 use crate::workspace::Workspace;
 
@@ -114,6 +116,12 @@ pub(crate) struct SettingsView {
     active_section: SettingsSection,
     font_size: f32,
     terminal_preferences_error: Option<String>,
+    navigation_shortcut: NavigationShortcut,
+    navigation_recording: bool,
+    navigation_shortcut_focus: FocusHandle,
+    navigation_shortcut_error: Option<String>,
+    navigation_recorded_key: Option<String>,
+    _navigation_recorder: Subscription,
     editor_choice: EditorChoice,
     language_servers: Entity<crate::editor::lsp::settings::LanguageServers>,
     external_editors: HashMap<String, bool>,
@@ -217,6 +225,22 @@ impl SettingsView {
         let stored = data_root
             .as_ref()
             .and_then(|root| DeviceStore::new(root).load().ok());
+        let navigation_shortcut = stored
+            .as_ref()
+            .map(|state| state.navigation_shortcut_or_default())
+            .unwrap_or_default();
+        // Capture before binding resolution so Escape cancels recording and
+        // reserved shortcuts show feedback instead of opening a palette/quitting.
+        let recorder = cx.entity().downgrade();
+        let recorder_window = window.window_handle();
+        let navigation_recorder = cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle() == recorder_window {
+                let _ = recorder.update(cx, |this, cx| {
+                    this.record_navigation_keystroke(event, window, cx);
+                });
+            }
+        });
+        let navigation_shortcut_focus = cx.focus_handle();
         let editor_choice = stored
             .as_ref()
             .map(|state| state.editor_choice_or_default())
@@ -283,6 +307,12 @@ impl SettingsView {
             active_section: SettingsSection::General,
             font_size: clamp_app_font_size(initial_font_size),
             terminal_preferences_error: None,
+            navigation_shortcut,
+            navigation_recording: false,
+            navigation_shortcut_focus,
+            navigation_shortcut_error: None,
+            navigation_recorded_key: None,
+            _navigation_recorder: navigation_recorder,
             editor_choice,
             language_servers: cx.new(|cx| {
                 crate::editor::lsp::settings::LanguageServers::new(
@@ -345,14 +375,91 @@ impl SettingsView {
         self.workspace = Some(workspace);
     }
 
+    pub(crate) fn navigation_shortcut(&self) -> &NavigationShortcut {
+        &self.navigation_shortcut
+    }
+
+    fn start_navigation_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation_recording = true;
+        self.navigation_shortcut_error = None;
+        self.navigation_recorded_key = None;
+        self.navigation_shortcut_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn save_navigation_shortcut(&mut self, shortcut: NavigationShortcut, cx: &mut Context<Self>) {
+        let value = (shortcut != NavigationShortcut::default()).then(|| shortcut.stored_value());
+        let result = self
+            .data_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Data directory unavailable"))
+            .and_then(|root| {
+                DeviceStore::new(root).update(|state| state.navigation_trigger = value)
+            });
+        match result {
+            Ok(()) => {
+                self.navigation_shortcut = shortcut;
+                self.navigation_recording = false;
+                self.navigation_shortcut_error = None;
+            }
+            Err(error) => {
+                self.navigation_shortcut_error = Some(format!("Could not save shortcut: {error:#}"))
+            }
+        }
+        cx.notify();
+    }
+
+    fn record_navigation_keystroke(
+        &mut self,
+        event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.navigation_shortcut_focus.is_focused(window) {
+            return;
+        }
+        let key = event.keystroke.key.to_ascii_lowercase();
+        if self.navigation_recorded_key.as_ref() == Some(&key) {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if !self.navigation_recording {
+            return;
+        }
+        window.prevent_default();
+        cx.stop_propagation();
+        self.navigation_recorded_key = Some(key.clone());
+        if key == "escape" {
+            self.navigation_recording = false;
+            self.navigation_shortcut_error = None;
+            cx.notify();
+            return;
+        }
+        match NavigationShortcut::from_keystroke(&event.keystroke) {
+            Ok(shortcut) => self.save_navigation_shortcut(shortcut, cx),
+            Err(error) => {
+                self.navigation_shortcut_error = Some(error.to_owned());
+                cx.notify();
+            }
+        }
+    }
+
     /// Re-read persisted Sync state plus the Agent section so the dialog
     /// never shows stale state (e.g. after external git or CLI edits).
     /// Called before the dialog opens.
     pub(crate) fn refresh_from_disk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.navigation_recording = false;
+        self.navigation_recorded_key = None;
+        self.navigation_shortcut_error = None;
         self.check_neovim(cx);
         self.check_external_editors(cx);
         if let Some(root) = self.data_root.clone() {
             let stored = DeviceStore::new(&root).load().ok();
+            self.navigation_shortcut = stored
+                .as_ref()
+                .map(|state| state.navigation_shortcut_or_default())
+                .unwrap_or_default();
             self.editor_choice = stored
                 .as_ref()
                 .map(|state| state.editor_choice_or_default())
@@ -955,6 +1062,8 @@ impl SettingsView {
     }
 
     fn select_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        self.navigation_recording = false;
+        self.navigation_recorded_key = None;
         if section == SettingsSection::Editor {
             self.check_neovim(cx);
             self.check_external_editors(cx);
@@ -2409,12 +2518,36 @@ impl SettingsView {
             .child(skill)
     }
 
-    fn render_keybindings(&self, cx: &App) -> impl IntoElement {
+    fn render_keybindings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let navigation = group(cx, "Navigation mode", Some("Choose a key or key combination to show shortcuts for the current tab."))
+            .child(live_row(cx, "Trigger key", "The trigger takes priority over typing and terminal shortcuts.",
+                h_flex().gap_2().items_center()
+                    .child(kbd(cx, &self.navigation_shortcut.label()))
+                    .child(Button::new("record-navigation-trigger")
+                        .track_focus(&self.navigation_shortcut_focus)
+                        .label(if self.navigation_recording { "Press a key…" } else { "Record shortcut" })
+                        .on_click(cx.listener(|this, _, window, cx| this.start_navigation_recording(window, cx))))
+                    .when(self.navigation_recording, |row| row.child(Button::new("cancel-navigation-trigger")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.navigation_recording = false;
+                            this.navigation_shortcut_error = None;
+                            cx.notify();
+                        }))))
+                    .when(!self.navigation_recording, |row| row.child(Button::new("reset-navigation-trigger")
+                        .label("Reset to default")
+                        .disabled(self.navigation_shortcut == NavigationShortcut::default())
+                        .on_click(cx.listener(|this, _, _, cx| this.save_navigation_shortcut(NavigationShortcut::default(), cx)))))))
+            .when(self.navigation_recording, |group| group.child(div().text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Press your shortcut now. Escape cancels. Palette and quit shortcuts are reserved.")))
+            .when_some(self.navigation_shortcut_error.as_ref(), |group, error| group.child(div().text_xs()
+                .text_color(cx.theme().danger).child(error.clone())));
         v_flex().gap_4()
+            .child(navigation)
             .child(group(cx, "Global shortcuts", Some("Available everywhere, including terminals."))
                 .child(live_row(cx, "Actions palette", "Find commands, settings, and sync.", kbd(cx, if cfg!(target_os = "macos") { "⌘K" } else { "Ctrl+K" })))
                 .child(live_row(cx, "Projects palette", "Switch between recent repositories.", kbd(cx, if cfg!(target_os = "macos") { "⌘P" } else { "Ctrl+P" })))
-                .child(live_row(cx, "Navigation mode", "Show shortcuts for the current tab.", kbd(cx, if cfg!(target_os = "macos") { "⌘J" } else { "Ctrl+J" })))
                 .child(live_row(cx, "Close dialog or palette", "Git and other dialogs use the standard close behavior.", kbd(cx, "Esc"))))
             .child(group(cx, "In navigation mode", Some("Press a key after opening navigation mode. Available actions appear in the overlay."))
                 .child(live_row(cx, "Switch tab", "Agent · Editor · Terminal · Review · Resources", kbd(cx, "a e t d r")))
@@ -2625,7 +2758,11 @@ impl Focusable for SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.navigation_recording && !self.navigation_shortcut_focus.is_focused(window) {
+            self.navigation_recording = false;
+            self.navigation_recorded_key = None;
+        }
         let focus = self.focus_handle.clone();
         let track = self.focus_handle.clone();
         h_flex()
@@ -2640,6 +2777,13 @@ impl Render for SettingsView {
                 cx.listener(move |_, _, window, cx| focus.focus(window, cx)),
             )
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, _| {
+                if this.navigation_recorded_key.as_deref()
+                    == Some(event.keystroke.key.to_ascii_lowercase().as_str())
+                {
+                    this.navigation_recorded_key = None;
+                }
+            }))
             .child(self.render_sidebar(cx))
             .child(self.render_section(cx))
     }
@@ -2655,6 +2799,128 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    #[gpui_kit::test]
+    fn navigation_shortcut_recording_cancels_validates_saves_and_resets(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_app_keys(cx);
+            cx.set_reduce_motion(true);
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(directory.path().to_owned());
+        let stored_root = root.clone();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let settings = cx.new(|cx| {
+                SettingsView::new(
+                    window,
+                    Some(stored_root),
+                    DEFAULT_APP_FONT_SIZE,
+                    SyncTracker::default(),
+                    cx,
+                )
+            });
+            *slot.borrow_mut() = Some(settings);
+            let host = cx.new(|_| DialogTestHost);
+            gpui_kit::component::Root::new(host, window, cx)
+        });
+        let settings = holder.borrow().clone().unwrap();
+        test_cx.update(|window, cx| {
+            SettingsView::open(settings.clone(), window, cx);
+            window.render_frame(cx);
+            window.click("settings-section-Keybindings", cx);
+            window.render_frame(cx);
+            window.click("record-navigation-trigger", cx);
+            window.press("escape", cx);
+            assert!(
+                window.has_active_dialog(cx),
+                "Escape cancels recording without closing Settings"
+            );
+        });
+        settings.read_with(test_cx, |view, _| {
+            assert!(!view.navigation_recording);
+            assert_eq!(view.navigation_shortcut, NavigationShortcut::default());
+        });
+        test_cx.update(|window, cx| {
+            window.click("record-navigation-trigger", cx);
+        });
+        test_cx.update(|window, cx| {
+            let focus = settings.read(cx).focus_handle.clone();
+            focus.focus(window, cx);
+            window.render_frame(cx);
+        });
+        settings.read_with(test_cx, |view, _| {
+            assert!(!view.navigation_recording, "moving focus cancels recording");
+            assert_eq!(view.navigation_shortcut, NavigationShortcut::default());
+        });
+        test_cx.update(|window, cx| window.click("record-navigation-trigger", cx));
+        for reserved in ["secondary-k", "secondary-p", "secondary-q"] {
+            test_cx.update(|window, cx| {
+                window.press(reserved, cx);
+            });
+            settings.read_with(test_cx, |view, _| {
+                assert!(
+                    view.navigation_recording,
+                    "recording survives reserved {reserved}"
+                );
+                assert!(view.navigation_shortcut_error.is_some());
+                assert_eq!(view.navigation_shortcut, NavigationShortcut::default());
+            });
+        }
+        test_cx.update(|window, cx| window.press("ctrl-alt-u", cx));
+        let chosen = NavigationShortcut::parse("ctrl-alt-u").unwrap();
+        assert_eq!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .navigation_shortcut_or_default(),
+            chosen
+        );
+        settings.read_with(test_cx, |view, _| {
+            assert!(!view.navigation_recording);
+            assert!(view.navigation_shortcut_error.is_none());
+            assert_eq!(view.navigation_shortcut, chosen);
+        });
+        test_cx.update(|window, cx| {
+            // A new Settings entity reads the saved trigger on startup.
+            let reopened = cx.new(|cx| {
+                SettingsView::new(
+                    window,
+                    Some(root.clone()),
+                    DEFAULT_APP_FONT_SIZE,
+                    SyncTracker::default(),
+                    cx,
+                )
+            });
+            assert_eq!(reopened.read(cx).navigation_shortcut, chosen);
+            window.render_frame(cx);
+            window.click("reset-navigation-trigger", cx);
+        });
+        assert!(
+            DeviceStore::new(&root)
+                .load()
+                .unwrap()
+                .navigation_trigger
+                .is_none()
+        );
+        // Save failures keep the current shortcut and remain visible.
+        settings.update(test_cx, |view, cx| {
+            view.data_root = None;
+            view.save_navigation_shortcut(chosen, cx);
+            assert_eq!(view.navigation_shortcut, NavigationShortcut::default());
+            assert!(
+                view.navigation_shortcut_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Could not save")
+            );
+        });
     }
 
     #[gpui_kit::test]

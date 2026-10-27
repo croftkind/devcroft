@@ -32,6 +32,7 @@ mod keys;
 mod markdown_references;
 mod metrics;
 mod navigation;
+mod navigation_shortcut;
 mod onboarding;
 mod pane;
 mod preview;
@@ -93,8 +94,8 @@ pub(crate) fn bind_app_keys(cx: &mut App) {
     // `ctrl-*` on macOS would steal readline kill-line/history-prev
     // from terminals. One binding per OS avoids both.)
     // Editor completions have an Input/editor-scoped binding below. Other
-    // application commands live in navigation mode (`cmd-j`
-    // on macOS, `ctrl-j` elsewhere, see `docs/keyboard-reference.md`)
+    // application commands live in navigation mode (configurable, defaulting
+    // to `cmd-j` on macOS / `ctrl-j` elsewhere; see `docs/keyboard-reference.md`)
     // and the palettes: tab jumps, session creation, and settings have no
     // direct bindings, so `ctrl-a`/`ctrl-e` (readline), `ctrl-s` (XOFF flow
     // control), `ctrl-n` (readline), `ctrl-d` (end-of-file), and `ctrl-/`

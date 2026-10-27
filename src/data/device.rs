@@ -70,6 +70,9 @@ pub(crate) struct DeviceState {
     /// Copy terminal selections on release; absent preserves the historical default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) terminal_copy_on_select: Option<bool>,
+    /// Navigation-mode trigger. Absent or invalid values use the platform default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) navigation_trigger: Option<String>,
     /// Recent-session rows per repository in the Agent sidebar (Agents
     /// settings). Absent means the default; out-of-range values are clamped
     /// on read, never rejected.
@@ -124,6 +127,15 @@ pub(crate) struct DeviceRepositoryBinding {
 }
 
 impl DeviceState {
+    pub(crate) fn navigation_shortcut_or_default(
+        &self,
+    ) -> crate::navigation_shortcut::NavigationShortcut {
+        self.navigation_trigger
+            .as_deref()
+            .and_then(|value| crate::navigation_shortcut::NavigationShortcut::parse(value).ok())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn editor_choice_or_default(&self) -> EditorChoice {
         self.editor_choice
             .as_deref()
@@ -314,6 +326,41 @@ mod tests {
 
     fn store_in(dir: &Path) -> DeviceStore {
         DeviceStore::new(&DataRoot::new(dir.to_owned()))
+    }
+
+    #[test]
+    fn navigation_trigger_persists_and_invalid_values_keep_the_default() {
+        use crate::navigation_shortcut::NavigationShortcut;
+        let directory = tempfile::tempdir().unwrap();
+        let store = store_in(directory.path());
+        assert_eq!(
+            store.load().unwrap().navigation_shortcut_or_default(),
+            NavigationShortcut::default()
+        );
+        store
+            .update(|state| {
+                state.navigation_trigger = Some("ctrl-alt-u".to_owned());
+                state.extra.insert("future_setting".to_owned(), json!(123));
+            })
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().navigation_shortcut_or_default(),
+            NavigationShortcut::parse("ctrl-alt-u").unwrap()
+        );
+        for value in ["", "garbage", "escape", "secondary-k", "secondary-q"] {
+            store
+                .update(|state| state.navigation_trigger = Some(value.to_owned()))
+                .unwrap();
+            assert_eq!(
+                store.load().unwrap().navigation_shortcut_or_default(),
+                NavigationShortcut::default(),
+                "{value}"
+            );
+        }
+        store
+            .update(|state| state.navigation_trigger = None)
+            .unwrap();
+        assert_eq!(store.load().unwrap().extra["future_setting"], json!(123));
     }
 
     #[test]
