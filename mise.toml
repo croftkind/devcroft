@@ -31,8 +31,8 @@ run = "./scripts/install-app.sh ${usage_debug:+--debug}"
 description = "Run formatting, compilation, and lints"
 run = [
   "cargo fmt --all -- --check",
-  "cargo check",
-  "cargo clippy --all-targets -- -D warnings",
+  "cargo check --locked",
+  "cargo clippy --locked --all-targets -- -D warnings",
 ]
 
 [tasks.fmt]
@@ -41,4 +41,11 @@ run = "cargo fmt --all"
 
 [tasks.test]
 description = "Run tests"
-run = "cargo test"
+run = "cargo test --locked"
+
+[tasks.ci]
+description = "Run formatting, compilation, lints, and tests"
+run = [
+  "mise run check",
+  "mise run test",
+]
