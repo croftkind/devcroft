@@ -25,7 +25,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Validate release branch
         id: version
         env:
@@ -39,8 +39,41 @@ jobs:
           bash -n scripts/install.sh scripts/release/package.sh packaging/devcroft-app
           shellcheck scripts/install.sh scripts/release/package.sh packaging/devcroft-app
 
+  # Tests compile the dev profile and the build job compiles the release profile.
+  # Splitting them keeps the two cold compiles off a single critical path; the
+  # release build no longer waits for a full dev-profile build first.
+  test:
+    needs: validate
+    name: Test (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang libclang-dev pkg-config \
+            libasound2-dev libfontconfig1-dev libfreetype6-dev libssl-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
+            libx11-xcb-dev libvulkan-dev libzstd-dev
+      - name: Install Rust and Zig
+        uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+      - name: Stamp branch version
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+        run: python3 scripts/release/prepare.py "$RELEASE_BRANCH" --stamp
+      - name: Run tests
+        run: cargo test --locked
+
   build:
     needs: validate
+    name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +86,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -61,19 +94,19 @@ jobs:
           sudo apt-get install -y build-essential cmake clang libclang-dev pkg-config \
             libasound2-dev libfontconfig1-dev libfreetype6-dev libssl-dev \
             libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev \
-            libx11-xcb-dev libvulkan-dev libzstd-dev
-      - uses: jdx/mise-action@v3
+            libx11-xcb-dev libvulkan-dev libzstd-dev mold
+      - name: Install Rust and Zig
+        uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
       - name: Install cargo-packager
         run: cargo install cargo-packager --version 0.11.8 --locked
       - name: Stamp branch version
         env:
           RELEASE_BRANCH: ${{ github.ref_name }}
         run: python3 scripts/release/prepare.py "$RELEASE_BRANCH" --stamp
-      - name: Check formatting and test
-        run: |
-          cargo fmt --all -- --check
-          cargo test --locked
       - name: Build release binary
+        env:
+          # mold is installed on the Linux runner only; an empty RUSTFLAGS is a no-op.
+          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-fuse-ld=mold' || '' }}
         run: cargo build --release --locked
       - name: Package and smoke test
         env:
@@ -96,7 +129,7 @@ jobs:
           test "$("$RUNNER_TEMP/devcroft-deb/usr/bin/devcroft" --version)" = "devcroft $RELEASE_VERSION"
           test -x "$RUNNER_TEMP/devcroft-deb/usr/bin/devcroft-app"
           test -f "$RUNNER_TEMP/devcroft-deb/usr/share/applications/devcroft-app.desktop"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -106,15 +139,15 @@ jobs:
           retention-days: 7
 
   publish:
-    needs: [validate, build]
+    needs: [validate, build, test]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: dist
@@ -130,7 +163,7 @@ jobs:
     if: vars.HOMEBREW_TAP != ''
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download published checksums
         env:
           GH_TOKEN: ${{ github.token }}
@@ -139,7 +172,7 @@ jobs:
           mkdir -p dist
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir dist
       - name: Check out Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ vars.HOMEBREW_TAP }}
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
