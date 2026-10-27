@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::component::diff::{DiffLineRange, DiffMode, DiffSide};
 use std::{fs, process::Command};
 
 fn git(root: &Path, args: &[&str]) {
@@ -135,74 +136,95 @@ fn long_file_names_scroll_independently(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn long_diff_lines_grow_without_overlapping_following_rows(cx: &mut gpui_kit::TestAppContext) {
+fn split_diff_wraps_long_lines_and_reflows_on_resize(cx: &mut gpui_kit::TestAppContext) {
     use gpui_kit::test::TestWindowExt as _;
     let (dir, view) = setup(cx);
-    // Include an unbroken token as well as ordinary code with spaces.
-    let source = format!(
-        "{}\n{}\n{}",
-        "identifier".repeat(100),
-        "let value = 42; ".repeat(80),
-        "short\n".repeat(100)
-    );
-    fs::write(dir.path().join("a.txt"), source).unwrap();
+    fs::write(
+        dir.path().join("a.txt"),
+        format!("{}\nnext\n", "identifier ".repeat(60)),
+    )
+    .unwrap();
     view.update(cx, |view, cx| view.reload(cx));
     cx.run_until_parked();
-    let row = view.read_with(cx, |view, _| {
-        let ReviewState::Loaded(loaded) = &view.state else {
-            unreachable!()
-        };
-        loaded
-            .rows
-            .iter()
-            .position(|row| {
-                let stream::StreamRow::Line { file, hunk, line } = *row else {
-                    return false;
-                };
-                let model::FileContent::Text { hunks, .. } = &loaded.diff.files[file].content
-                else {
-                    return false;
-                };
-                hunks[hunk].lines[line].new_no == Some(1)
-            })
-            .unwrap()
-    });
     let render_view = view.clone();
     let (_, cx) = cx
         .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
     cx.simulate_resize(gpui_kit::size(px(900.), px(900.)));
-    cx.update(|window, cx| window.render_frame(cx));
-    let first_selector = format!("review-row-{row}").leak();
-    let first = cx.debug_bounds(first_selector).unwrap();
-    assert!(
-        first.size.height > px(stream::ROW_H),
-        "long tokens must wrap"
-    );
-    let next_selector = format!("review-row-{}", row + 1).leak();
-    let next = cx.debug_bounds(next_selector).unwrap();
-    assert!(next.size.height > px(stream::ROW_H), "long code must wrap");
-    assert!(
-        next.top() >= first.bottom(),
-        "wrapped rows must not overlap"
-    );
-    cx.simulate_resize(gpui_kit::size(px(1600.), px(900.)));
-    cx.update(|window, cx| window.render_frame(cx));
-    let wider = cx.debug_bounds(first_selector).unwrap();
-    assert!(
-        wider.size.height < first.size.height,
-        "widening must reflow wrapped rows"
-    );
-    view.update(cx, |view, _| {
-        view.list_handle.scroll_to(ListOffset {
-            item_ix: row,
-            offset_in_item: px(48.),
-        });
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.click("review-diff-split", cx);
     });
-    cx.update(|window, cx| window.render_frame(cx));
-    view.read_with(cx, |view, _| {
-        let top = view.list_handle.logical_scroll_top();
-        assert_eq!(top.item_ix, row);
-        assert_eq!(top.offset_in_item, px(48.));
+    cx.run_until_parked();
+    let first = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("git-diff-wrap").is_none());
+        let first = window
+            .within(("diff-file", 0usize))
+            .within(("new", 0usize))
+            .find("source")
+            .bounds();
+        assert!(first.size.height > px(48.), "Split must wrap automatically");
+        first
+    });
+    cx.simulate_resize(gpui_kit::size(px(1600.), px(900.)));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let wider = window
+            .within(("diff-file", 0usize))
+            .within(("new", 0usize))
+            .find("source")
+            .bounds();
+        assert!(
+            wider.size.height < first.size.height,
+            "wider columns reflow the source"
+        );
+        let next = window
+            .within(("diff-file", 0usize))
+            .within(("new", 1usize))
+            .find("source")
+            .bounds();
+        assert!(next.top() >= wider.bottom(), "wrapped rows cannot overlap");
+    });
+}
+
+#[gpui_kit::test]
+fn navigation_mode_scrolls_the_focused_kit_diff(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    fs::write(
+        dir.path().join("a.txt"),
+        (0..150)
+            .map(|ix| format!("line {ix}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let render_view = view.clone();
+    let (_, cx) = cx
+        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        view.read(cx).diff_state.focus_handle(cx).focus(window, cx);
+        let before = window
+            .within(("diff-file", 0usize))
+            .within(("new", 0usize))
+            .find("source")
+            .bounds();
+        view.update(cx, |view, cx| view.move_diff_scroll(true, window, cx));
+        window.render_frame(cx);
+        let after = window
+            .within(("diff-file", 0usize))
+            .within(("new", 0usize))
+            .find("source")
+            .bounds();
+        assert!(
+            after.top() < before.top(),
+            "navigation-mode j must scroll Kit's code"
+        );
     });
 }
 
@@ -307,53 +329,29 @@ fn background_refresh_keeps_unchanged_rows_and_reopens_changed_files(
 }
 
 #[gpui_kit::test]
-fn rendered_review_reopens_changed_files_without_moving_the_current_file(
+fn refresh_reopens_changed_files_and_retains_the_selected_source(
     cx: &mut gpui_kit::TestAppContext,
 ) {
-    use gpui_kit::test::TestWindowExt as _;
     let (dir, view) = setup(cx);
     fs::write(dir.path().join("b.txt"), "reviewed\n".repeat(100)).unwrap();
     view.update(cx, |view, cx| view.reload(cx));
     cx.run_until_parked();
-    let render_view = view.clone();
-    let (_, cx) = cx
-        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        view.update(cx, |view, cx| {
-            view.toggle_viewed("a.txt", cx);
-            let ReviewState::Loaded(loaded) = &view.state else {
-                unreachable!()
-            };
-            view.list_handle.scroll_to(ListOffset {
-                item_ix: loaded.file_row_start[1] + 10,
-                offset_in_item: px(0.),
-            });
+    let selection = DiffLineRange::new("b.txt", DiffSide::Modified, 10, 12);
+    view.update(cx, |view, cx| {
+        view.toggle_viewed("a.txt", cx);
+        view.last_scrolled = Some("b.txt".into());
+        view.diff_state.update(cx, |diff, cx| {
+            diff.set_selected_lines(Some(selection.clone()), cx)
         });
-        window.render_frame(cx);
-    });
-    let previous_row = view.read_with(cx, |view, _| {
-        let ReviewState::Loaded(loaded) = &view.state else {
-            unreachable!()
-        };
-        assert_eq!(view.last_scrolled.as_deref(), Some("b.txt"));
-        view.list_handle.logical_scroll_top().item_ix - loaded.file_row_start[1]
     });
     fs::write(dir.path().join("a.txt"), "updated!\n").unwrap();
     view.update(cx, |view, cx| view.refresh(cx));
     cx.run_until_parked();
-    cx.update(|window, cx| window.render_frame(cx));
-    view.read_with(cx, |view, _| {
+    view.read_with(cx, |view, cx| {
         assert_progress(view, "a.txt", false, false);
-        let ReviewState::Loaded(loaded) = &view.state else {
-            unreachable!()
-        };
         assert_eq!(view.last_scrolled.as_deref(), Some("b.txt"));
-        assert_eq!(
-            view.list_handle.logical_scroll_top().item_ix - loaded.file_row_start[1],
-            previous_row,
-            "expanding an earlier file preserves the current viewport"
-        );
+        assert_eq!(view.diff_state.read(cx).selected_lines(), Some(selection));
+        assert!(!view.diff_state.read(cx).is_file_collapsed("a.txt"));
     });
 }
 
@@ -379,27 +377,8 @@ fn returning_to_review_keeps_unchanged_rows(cx: &mut gpui_kit::TestAppContext) {
     });
 }
 
-fn top_line(view: &ReviewView) -> (String, String, gpui_kit::Pixels) {
-    let ReviewState::Loaded(loaded) = &view.state else {
-        panic!("expected loaded review");
-    };
-    let top = view.list_handle.logical_scroll_top();
-    let stream::StreamRow::Line { file, hunk, line } = loaded.rows[top.item_ix] else {
-        panic!("expected visible code line: {:?}", loaded.rows[top.item_ix]);
-    };
-    let model::FileContent::Text { hunks, .. } = &loaded.diff.files[file].content else {
-        unreachable!()
-    };
-    (
-        loaded.diff.files[file].path.clone(),
-        hunks[hunk].lines[line].text.clone(),
-        top.offset_in_item,
-    )
-}
-
 #[gpui_kit::test]
-fn refresh_preserves_visible_code_when_lines_and_files_move(cx: &mut gpui_kit::TestAppContext) {
-    use gpui_kit::test::TestWindowExt as _;
+fn refresh_reanchors_selected_source_when_lines_and_files_move(cx: &mut gpui_kit::TestAppContext) {
     let (dir, view) = setup(cx);
     let content = (0..150)
         .map(|ix| format!("line {ix}\n"))
@@ -407,23 +386,15 @@ fn refresh_preserves_visible_code_when_lines_and_files_move(cx: &mut gpui_kit::T
     fs::write(dir.path().join("b.txt"), &content).unwrap();
     view.update(cx, |view, cx| view.reload(cx));
     cx.run_until_parked();
-    let render_view = view.clone();
-    let (_, cx) = cx
-        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        view.update(cx, |view, _| {
-            let ReviewState::Loaded(loaded) = &view.state else {
-                unreachable!()
-            };
-            view.list_handle.scroll_to(ListOffset {
-                item_ix: loaded.file_row_start[1] + 40,
-                offset_in_item: px(7.),
-            });
+    view.update(cx, |view, cx| {
+        view.last_scrolled = Some("b.txt".into());
+        view.diff_state.update(cx, |diff, cx| {
+            diff.set_selected_lines(
+                Some(DiffLineRange::new("b.txt", DiffSide::Modified, 40, 41)),
+                cx,
+            )
         });
-        window.render_frame(cx);
     });
-    let before = view.read_with(cx, |view, _| top_line(view));
     for (path, value) in [
         ("aa.txt", "new file\n".to_owned()),
         ("a.txt", "original\n".to_owned()),
@@ -432,12 +403,11 @@ fn refresh_preserves_visible_code_when_lines_and_files_move(cx: &mut gpui_kit::T
         fs::write(dir.path().join(path), value).unwrap();
         view.update(cx, |view, cx| view.refresh(cx));
         cx.run_until_parked();
-        cx.update(|window, cx| {
-            window.render_frame(cx);
-            window.render_frame(cx);
-        });
         view.read_with(cx, |view, cx| {
-            assert_eq!(top_line(view), before, "after editing {path}");
+            assert_eq!(
+                view.diff_state.read(cx).selected_text(cx),
+                "line 39\nline 40\n"
+            );
             assert_eq!(view.last_scrolled.as_deref(), Some("b.txt"));
             let selected = view.tree_state.read(cx).selected_entry().unwrap();
             assert_eq!(file_path_from_id(&selected.item().id), Some("b.txt"));
@@ -446,59 +416,25 @@ fn refresh_preserves_visible_code_when_lines_and_files_move(cx: &mut gpui_kit::T
 }
 
 #[gpui_kit::test]
-fn commit_only_refresh_does_not_invalidate_the_rendered_list(cx: &mut gpui_kit::TestAppContext) {
-    use gpui_kit::test::TestWindowExt as _;
+fn commit_only_refresh_retains_kit_state_and_selection(cx: &mut gpui_kit::TestAppContext) {
     let (dir, view) = setup(cx);
-    fs::write(dir.path().join("b.txt"), "reviewed\n".repeat(150)).unwrap();
-    view.update(cx, |view, cx| view.reload(cx));
-    cx.run_until_parked();
-    let render_view = view.clone();
-    let (_, cx) = cx
-        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
-    cx.update(|window, cx| {
-        window.render_frame(cx);
-        view.update(cx, |view, _| {
-            let ReviewState::Loaded(loaded) = &view.state else {
-                unreachable!()
-            };
-            view.list_handle.scroll_to(ListOffset {
-                item_ix: loaded.file_row_start[1] + 40,
-                offset_in_item: px(7.),
-            });
+    let selection = DiffLineRange::new("b.txt", DiffSide::Modified, 1, 1);
+    let before = view.update(cx, |view, cx| {
+        view.diff_state.update(cx, |diff, cx| {
+            diff.set_mode(DiffMode::Split, cx);
+            diff.set_selected_lines(Some(selection.clone()), cx);
         });
-        window.render_frame(cx);
-    });
-    let (syntax, before, bounds, selection) = view.read_with(cx, |view, cx| {
-        let ReviewState::Loaded(loaded) = &view.state else {
-            unreachable!()
-        };
-        let top = view.list_handle.logical_scroll_top();
-        (
-            loaded.syntax.clone(),
-            top_line(view),
-            view.list_handle.bounds_for_item(top.item_ix).unwrap(),
-            view.tree_state.read(cx).selected_index(),
-        )
+        view.diff_state.entity_id()
     });
     commit(dir.path());
     view.update(cx, |view, cx| view.refresh(cx));
     cx.run_until_parked();
-    // Check before rendering: a list reset would discard measured item bounds.
     view.read_with(cx, |view, cx| {
-        let ReviewState::Loaded(loaded) = &view.state else {
-            unreachable!()
-        };
-        assert!(Rc::ptr_eq(&syntax, &loaded.syntax));
-        assert_eq!(top_line(view), before);
-        assert_eq!(view.tree_state.read(cx).selected_index(), selection);
-        assert_eq!(
-            view.list_handle
-                .bounds_for_item(view.list_handle.logical_scroll_top().item_ix),
-            Some(bounds),
-        );
+        assert_eq!(view.diff_state.entity_id(), before);
+        assert_eq!(view.diff_state.read(cx).mode(), DiffMode::Split);
+        assert_eq!(view.diff_state.read(cx).selected_lines(), Some(selection));
+        assert_eq!(view.diff_state.read(cx).selected_text(cx), "reviewed\n");
     });
-    cx.update(|window, cx| window.render_frame(cx));
-    view.read_with(cx, |view, _| assert_eq!(top_line(view), before));
 }
 
 #[gpui_kit::test]

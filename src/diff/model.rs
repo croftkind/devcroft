@@ -136,6 +136,8 @@ pub(crate) struct HunkLine {
     pub(crate) old_no: Option<u32>,
     pub(crate) new_no: Option<u32>,
     pub(crate) text: String,
+    /// Exact source terminator, kept for copying the bounded patch snapshot.
+    pub(crate) ending: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,14 +147,24 @@ pub(crate) enum LineTag {
     Addition,
 }
 
+/// Git source coordinates count LF-delimited lines. Similar's default line
+/// tokenizer also splits bare CR, which would turn literal source bytes into
+/// extra lines and produce invalid sparse patches/anchors.
+fn source_line_diff<'old, 'new>(old: &'old str, new: &'new str) -> TextDiff<'old, 'new, str> {
+    TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .diff_slices(
+            &old.split_inclusive('\n').collect::<Vec<_>>(),
+            &new.split_inclusive('\n').collect::<Vec<_>>(),
+        )
+}
+
 /// Diff two text contents into hunks, keeping `CONTEXT_LINES` of context and
 /// capping total emitted lines at `MAX_HUNK_LINES_PER_FILE`.
 ///
 /// Returns the hunks plus whether emission was truncated.
 pub(crate) fn diff_text(old: &str, new: &str) -> (Vec<Hunk>, bool) {
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_lines(old, new);
+    let diff = source_line_diff(old, new);
     let mut hunks = Vec::new();
     let mut truncated = false;
     let mut emitted = 0_usize;
@@ -189,9 +201,7 @@ pub(crate) fn diff_text(old: &str, new: &str) -> (Vec<Hunk>, bool) {
 /// shows the pasted documents side by side — needs every line present to
 /// reference it by number.
 pub(crate) fn diff_text_merged(old: &str, new: &str) -> (Vec<Hunk>, bool) {
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_lines(old, new);
+    let diff = source_line_diff(old, new);
     let (old_range, new_range) = group_ranges(diff.ops());
     let mut lines = group_lines(&diff, diff.ops());
     // Nothing changed: no listing, exactly like [`diff_text`], so callers can
@@ -241,11 +251,20 @@ fn group_lines(diff: &TextDiff<'_, '_, str>, ops: &[DiffOp]) -> Vec<HunkLine> {
                 ChangeTag::Delete => LineTag::Deletion,
                 ChangeTag::Insert => LineTag::Addition,
             };
+            let source = change.value();
+            let ending = if source.ends_with("\r\n") {
+                "\r\n"
+            } else if source.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
             let line = HunkLine {
                 tag,
                 old_no: change.old_index().map(|index| index as u32 + 1),
                 new_no: change.new_index().map(|index| index as u32 + 1),
-                text: change.value().trim_end_matches(['\r', '\n']).to_owned(),
+                text: source[..source.len() - ending.len()].to_owned(),
+                ending,
             };
             if tag == LineTag::Context {
                 flush(&mut pending, &mut lines);
@@ -261,9 +280,7 @@ fn group_lines(diff: &TextDiff<'_, '_, str>, ops: &[DiffOp]) -> Vec<HunkLine> {
 
 /// Count added and deleted lines between two texts without keeping hunks.
 pub(crate) fn count_changes(old: &str, new: &str) -> (u32, u32) {
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_lines(old, new);
+    let diff = source_line_diff(old, new);
     let mut additions = 0_u32;
     let mut deletions = 0_u32;
     for op in diff.ops() {

@@ -1,13 +1,19 @@
 # Review comments
 
-Open Review, click a diff line, write feedback in the editor directly below it,
-and choose **Save comment**. The saved comment stays highlighted. The editor receives keyboard focus automatically.
-Shift-click another line to select an inclusive line range. Ranges stay within
-one file and one side of the diff; deleted lines use the old side, and additions
-and ordinary context clicks use the new side. A range beginning on a deleted
-line can extend into old-side context. A subtle blue background and blue gutters
-show the selected range; the editor appears below its final line. Gold
-gutters identify commented lines.
+Review uses the same diff component as Git Changes and History. Choose
+**Unified** or **Split**, and use **Previous change / Next change** to navigate.
+Split view always wraps long lines within each column. Unified view scrolls
+horizontally. Select a file in the Files sidebar to jump to its diff. Drag over
+source text, double-click a word, or select lines from the gutter, then use
+`Cmd+C` on macOS (`Ctrl+C` elsewhere) to copy source without diff markers.
+`Shift+Up` / `Shift+Down` extends a gutter selection.
+
+Hover a source line and click its **+** button to write feedback. To comment on
+an inclusive range, select lines in the gutter and click **+** on one of those
+lines. Ranges stay within one file and one side; Split view makes the old and
+new sides explicit. The editor appears below the range's final line, receives
+keyboard focus, and offers **Save comment**. Use the file header's
+**Open in Editor** action to open its current working-tree file.
 
 Saved comments stay visible as threads below their anchored ranges. Each thread
 provides **Edit**, **Resolve / Reopen**, and **Delete**, with editing inside the
@@ -15,8 +21,9 @@ thread. The sidebar is an index showing file locations and comment text only;
 it has no code excerpts or per-comment controls. The toolbar button before Refresh shows the comment count and toggles this sidebar. Sidebar cards retain subtle
 green backgrounds for resolved comments and yellow backgrounds for outdated
 comments, including when resolved; inline threads in the main pane have no status tint.
-Clicking anywhere on a comment card jumps to its inline thread, centering it in the pane, and highlights the anchored range. Edit, Resolve/Reopen,
-and Delete act independently without jumping. Outdated or hidden anchors appear
+Clicking a comment card opens its file, scrolls to its inline thread, and highlights the anchored range.
+Edit reveals and focuses the editor. Resolve/Reopen and Delete act independently
+without jumping. Outdated or hidden anchors appear
 under the file header; comments whose files are absent from the diff appear in
 the main pane's "Comments outside the current diff" section. Outdated threads
 retain their saved code excerpts. All controls remain available there, even when
@@ -28,9 +35,12 @@ The open Review tab checks for code changes automatically. Marking a file
 cleared and the file expands. Unchanged files keep their review progress,
 including across new commits on the same branch. Manual collapse controls
 remain independent of viewed marks. Automatic checks update the UI only when
-the displayed review changes. Automatic refreshes preserve the visible code and
-scroll offset, including when earlier files expand or lines are inserted above it.
-Returning to Review and automatic portable sync also keep the current viewport.
+the displayed review changes. Unchanged refreshes preserve the diff selection
+and viewport. When source
+changes, Review restores the selected source range, following unchanged lines
+when they move, or returns to the selected file. The Files sidebar remains a
+direct navigation control; scrolling the diff does not change its selection.
+Returning to Review and automatic portable sync preserve an unchanged viewport.
 
 Use **Refresh**, or return to the Review tab, after the agent changes
 comments. Unsaved drafts survive same-pair refreshes. Switching branch pairs or

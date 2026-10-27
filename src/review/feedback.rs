@@ -7,6 +7,7 @@ use super::{
 };
 use gpui_kit::{
     component::{
+        diff::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide},
         h_flex,
         input::{Textarea, TextareaState},
         v_flex,
@@ -108,6 +109,197 @@ mod tests {
     use ::core::prelude::v1::test;
 
     #[gpui_kit::test]
+    fn kit_add_comment_preserves_old_side_and_selected_new_range(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (dir, view) = crate::review::tests::setup(cx);
+        std::fs::write(dir.path().join("a.txt"), "reviewed\nsecond\n").unwrap();
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        let render_view = view.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window
+                .within(("diff-file", 0usize))
+                .within(("new", 0usize))
+                .within("new-gutter")
+                .click(("line", 0usize), cx);
+            window.press("shift-down", cx);
+            window.press(
+                if cfg!(target_os = "macos") {
+                    "cmd-c"
+                } else {
+                    "ctrl-c"
+                },
+                cx,
+            );
+        });
+        assert_eq!(
+            cx.read(|cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("reviewed\nsecond\n")
+        );
+        cx.update(|window, cx| {
+            window.click("review-diff-split", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window
+                .within(("diff-file", 0usize))
+                .within(("old", 0usize))
+                .hover("source", cx);
+            window
+                .within(("diff-file", 0usize))
+                .within(("old", 0usize))
+                .click(("add-annotation", 0usize), cx);
+        });
+        view.read_with(cx, |view, _| {
+            let anchor = view.feedback.selection.as_ref().unwrap();
+            assert_eq!((anchor.side, anchor.start, anchor.end), (Side::Old, 1, 1));
+        });
+        view.update(cx, |view, cx| {
+            view.feedback.input = None;
+            view.feedback.selection = None;
+            view.diff_state.update(cx, |diff, cx| {
+                diff.set_selected_lines(
+                    Some(DiffLineRange::new("a.txt", DiffSide::Modified, 1, 2)),
+                    cx,
+                );
+            });
+        });
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            window
+                .within(("diff-file", 0usize))
+                .within(("new", 1usize))
+                .hover("source", cx);
+            window
+                .within(("diff-file", 0usize))
+                .within(("new", 1usize))
+                .click(("add-annotation", 1usize), cx);
+        });
+        view.read_with(cx, |view, _| {
+            let anchor = view.feedback.selection.as_ref().unwrap();
+            assert_eq!((anchor.side, anchor.start, anchor.end), (Side::New, 1, 2));
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            let annotations = view.diff_annotations(loaded);
+            assert_eq!(annotations.len(), 1);
+            assert_eq!(
+                annotations[0].position(),
+                Some(&DiffLinePosition::new("a.txt", DiffSide::Modified, 2))
+            );
+        });
+        cx.update(|window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                view.feedback
+                    .input
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |input, cx| {
+                        input.set_value("Please update both lines", window, cx)
+                    });
+                view.save_comment(cx);
+            });
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.feedback.input.is_none());
+            assert_eq!(view.feedback.comments.len(), 1);
+            assert_eq!(view.feedback.comments[0].anchor.end, 2);
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            assert_eq!(
+                view.diff_annotations(loaded)[0].position().unwrap().side(),
+                DiffSide::Modified
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn kit_comment_rejects_cross_side_and_stale_ranges(cx: &mut TestAppContext) {
+        let (dir, view) = crate::review::tests::setup(cx);
+        let render_view = view.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let range = DiffLineRange::new("a.txt", DiffSide::Original, 1, 1)
+                    .with_end_side(DiffSide::Modified);
+                view.select_diff_range(&range, window, cx);
+                assert!(view.feedback.input.is_none());
+                assert!(view.feedback.error.as_ref().unwrap().contains("one side"));
+            })
+        });
+        std::fs::write(dir.path().join("a.txt"), "changed after rendering\n").unwrap();
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.select_diff_range(
+                    &DiffLineRange::new("a.txt", DiffSide::Modified, 1, 1),
+                    window,
+                    cx,
+                );
+                assert!(view.feedback.input.is_none());
+                assert!(
+                    view.feedback
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .contains("Code changed")
+                );
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn kit_comment_accepts_literal_carriage_returns(cx: &mut TestAppContext) {
+        for source in ["trailing\r", "trailing\r\r\n"] {
+            let (dir, view) = crate::review::tests::setup(cx);
+            std::fs::write(dir.path().join("a.txt"), source).unwrap();
+            view.update(cx, |view, cx| view.reload(cx));
+            cx.run_until_parked();
+            let render_view = view.clone();
+            let (_, cx) =
+                cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+            cx.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    match &view.state {
+                        ReviewState::Loaded(_) => {}
+                        ReviewState::Failed(message) => {
+                            panic!("Review failed for {source:?}: {message}")
+                        }
+                        ReviewState::Loading => panic!("Review still loading for {source:?}"),
+                    }
+                    assert!(!view.feedback.busy);
+                    let ReviewState::Loaded(loaded) = &view.state else {
+                        unreachable!()
+                    };
+                    assert!(
+                        loaded
+                            .diff
+                            .files
+                            .iter()
+                            .any(|f| f.path == "a.txt"
+                                && matches!(f.content, FileContent::Text { .. })),
+                        "text file should be present for {source:?}"
+                    );
+                    view.select_diff_range(
+                        &DiffLineRange::new("a.txt", DiffSide::Modified, 1, 1),
+                        window,
+                        cx,
+                    );
+                    assert!(view.feedback.error.is_none());
+                    assert_eq!(view.feedback.selection.as_ref().unwrap().source, source);
+                })
+            });
+        }
+    }
+
+    #[gpui_kit::test]
     fn background_refresh_cannot_interrupt_or_overwrite_a_comment_save(cx: &mut TestAppContext) {
         for refresh_first in [false, true] {
             let (_dir, view) = crate::review::tests::setup(cx);
@@ -193,21 +385,19 @@ mod tests {
                 }));
             });
             window.render_frame(cx);
-            view.update(cx, |view, _| {
-                let ReviewState::Loaded(loaded) = &view.state else {
-                    unreachable!()
-                };
-                view.list_handle.scroll_to(ListOffset {
-                    item_ix: loaded.file_row_start[1] + 40,
-                    offset_in_item: px(7.),
+            view.update(cx, |view, cx| {
+                view.last_scrolled = Some("b.txt".into());
+                view.diff_state.update(cx, |diff, cx| {
+                    let range = DiffLineRange::new("b.txt", DiffSide::Modified, 40, 40);
+                    diff.set_selected_lines(Some(range), cx);
+                    diff.scroll_to_line(DiffLinePosition::new("b.txt", DiffSide::Modified, 40), cx);
+                });
+                let id = super::super::tree::file_item_id("b.txt").into();
+                view.tree_state.update(cx, |tree, cx| {
+                    tree.set_selected_index(tree.index_of(&id), cx)
                 });
             });
             window.render_frame(cx);
-        });
-        let before = view.read_with(cx, |view, _| {
-            assert!(view.editor_row.get().is_some());
-            let top = view.list_handle.logical_scroll_top();
-            (top.item_ix, top.offset_in_item)
         });
         std::fs::write(dir.path().join("manual.txt"), "updated!\n").unwrap();
         view.update(cx, |view, cx| view.refresh(cx));
@@ -217,8 +407,10 @@ mod tests {
             window.render_frame(cx);
         });
         view.read_with(cx, |view, cx| {
-            let top = view.list_handle.logical_scroll_top();
-            assert_eq!((top.item_ix, top.offset_in_item), before);
+            assert_eq!(
+                view.diff_state.read(cx).selected_lines(),
+                Some(DiffLineRange::new("b.txt", DiffSide::Modified, 40, 40))
+            );
             assert_eq!(
                 view.feedback.input.as_ref().unwrap().read(cx).value(),
                 "Please update this",
@@ -426,7 +618,6 @@ mod tests {
             diff: Rc::new(diff),
             rows,
             file_row_start,
-            syntax: Rc::new(Default::default()),
         };
         let mut anchor = Anchor {
             path: "file.rs".into(),
@@ -472,6 +663,40 @@ fn thread_anchor_row(loaded: &super::LoadedReview, anchor: &Anchor) -> usize {
     })
 }
 
+fn kit_side(side: Side) -> DiffSide {
+    match side {
+        Side::Old => DiffSide::Original,
+        Side::New => DiffSide::Modified,
+    }
+}
+
+fn annotation_for(
+    loaded: &super::LoadedReview,
+    anchor: &Anchor,
+    id: ElementId,
+) -> Option<DiffAnnotation> {
+    if !loaded
+        .diff
+        .files
+        .iter()
+        .any(|file| file.path == anchor.path)
+    {
+        return None;
+    }
+    Some(if anchor_end_row(loaded, anchor).is_some() {
+        DiffAnnotation::line(
+            id,
+            DiffLinePosition::new(
+                anchor.path.clone(),
+                kit_side(anchor.side),
+                anchor.end as usize,
+            ),
+        )
+    } else {
+        DiffAnnotation::file(id, anchor.path.clone())
+    })
+}
+
 #[derive(Default)]
 pub(super) struct Feedback {
     store: Option<Store>,
@@ -484,9 +709,105 @@ pub(super) struct Feedback {
     filter: usize,
     busy: bool,
     scroll: ScrollHandle,
+    outside_scroll: ScrollHandle,
 }
 
 impl ReviewView {
+    pub(super) fn diff_annotations(&self, loaded: &super::LoadedReview) -> Vec<DiffAnnotation> {
+        let mut annotations = self
+            .feedback
+            .comments
+            .iter()
+            .filter_map(|comment| {
+                annotation_for(
+                    loaded,
+                    &comment.anchor,
+                    SharedString::from(comment.id.clone()).into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if self.feedback.input.is_some()
+            && self.is_new_comment()
+            && let Some(anchor) = &self.feedback.selection
+            && let Some(annotation) = annotation_for(loaded, anchor, "review-draft".into())
+        {
+            annotations.push(annotation);
+        }
+        annotations
+    }
+
+    pub(super) fn render_diff_annotation(
+        &self,
+        annotation: &DiffAnnotation,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if annotation.id() == &ElementId::from("review-draft") {
+            return self.render_comment_editor(cx);
+        }
+        self.feedback
+            .comments
+            .iter()
+            .find(|comment| {
+                annotation.id() == &ElementId::from(SharedString::from(comment.id.clone()))
+            })
+            .map(|comment| self.render_thread(comment.clone(), cx))
+            .unwrap_or_else(|| div().into_any_element())
+    }
+
+    pub(super) fn render_feedback_error(&self) -> AnyElement {
+        div()
+            .when_some(self.feedback.error.clone(), |view, error| {
+                view.px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(rgb(0xf87171))
+                    .child(error)
+            })
+            .into_any_element()
+    }
+
+    pub(super) fn render_outside_comments(
+        &self,
+        loaded: &super::LoadedReview,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let groups = self.inline_thread_groups();
+        let comments = groups
+            .get(&loaded.rows.len())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let editor = self.inline_editor_row() == Some(loaded.rows.len()) && self.is_new_comment();
+        if comments.is_empty() && !editor && !loaded.rows.is_empty() {
+            return div().into_any_element();
+        }
+        v_flex()
+            .id("review-outside-comments")
+            .w_full()
+            .max_h(px(300.))
+            .overflow_y_scroll()
+            .track_scroll(&self.feedback.outside_scroll)
+            .p_3()
+            .gap_2()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x858989))
+                    .child(if loaded.rows.is_empty() {
+                        "No changes in this scope. Saved review comments:"
+                    } else {
+                        "Comments outside the current diff"
+                    }),
+            )
+            .children(
+                comments
+                    .iter()
+                    .map(|comment| self.render_thread(comment.clone(), cx)),
+            )
+            .when(editor, |view| view.child(self.render_comment_editor(cx)))
+            .into_any_element()
+    }
+
     pub(super) fn draft_anchor(&self) -> Option<Anchor> {
         self.feedback.input.as_ref()?;
         if self.feedback.editing.is_some() {
@@ -541,18 +862,6 @@ impl ReviewView {
         groups
     }
 
-    pub(super) fn render_inline_threads(
-        &self,
-        comments: &[Rc<Comment>],
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        v_flex()
-            .w_full()
-            .gap_2()
-            .children(comments.iter().map(|c| self.render_thread(c.clone(), cx)))
-            .into_any_element()
-    }
-
     pub(super) fn is_new_comment(&self) -> bool {
         self.feedback.editing.is_none()
     }
@@ -599,6 +908,8 @@ impl ReviewView {
             .unwrap_or_default();
         let error_message = self.feedback.error.clone().unwrap_or_default();
         v_flex()
+            .id("review-comment-editor")
+            .test_support()
             .h(px(210.))
             .flex_none()
             .w_full()
@@ -698,64 +1009,50 @@ impl ReviewView {
         reset || before != self.comment_revisions() || previous_error != self.feedback.error
     }
 
-    pub(super) fn select_line(
+    pub(super) fn select_diff_range(
         &mut self,
-        row: StreamRow,
-        extend: bool,
+        range: &DiffLineRange,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.feedback.busy {
             return;
         }
+        if range.side() != range.end_side() {
+            self.feedback.error =
+                Some("Select a range within one file and one side of the diff.".into());
+            cx.notify();
+            return;
+        }
         let ReviewState::Loaded(loaded) = &self.state else {
             return;
         };
-        let StreamRow::Line { file, hunk, line } = row else {
+        let Some(file) = loaded
+            .diff
+            .files
+            .iter()
+            .find(|file| file.path.as_str() == range.path().as_str())
+        else {
             return;
         };
-        let file = &loaded.diff.files[file];
         let FileContent::Text { hunks, .. } = &file.content else {
             return;
         };
-        let line = &hunks[hunk].lines[line];
-        let (mut side, mut number) = match line.new_no {
-            Some(n) => (Side::New, n),
-            None => (Side::Old, line.old_no.unwrap()),
+        let side = match range.side() {
+            DiffSide::Original => Side::Old,
+            DiffSide::Modified => Side::New,
         };
-        if extend && let Some(previous) = &self.feedback.selection {
-            let selected_number = match previous.side {
-                Side::Old => line.old_no,
-                Side::New => line.new_no,
-            };
-            if previous.path != file.path || selected_number.is_none() {
-                self.feedback.error =
-                    Some("Select a range within one file and one side of the diff.".into());
-                cx.notify();
-                return;
-            }
-            side = previous.side;
-            number = selected_number.unwrap();
-        }
         let result = super::git::anchor_source(&self.cwd, &loaded.diff, &file.path, side);
         match result {
             Ok(Some(source)) => {
-                let mut anchor = Anchor {
+                let anchor = Anchor {
                     path: file.path.clone(),
                     side,
-                    start: number,
-                    end: number,
+                    start: range.start() as u32,
+                    end: range.end() as u32,
                     source,
                     outdated: false,
                 };
-                if extend
-                    && let Some(previous) = &self.feedback.selection
-                    && previous.path == anchor.path
-                    && previous.side == anchor.side
-                {
-                    anchor.start = previous.start.min(number);
-                    anchor.end = previous.start.max(number);
-                }
                 // Reject a stale displayed line after external worktree changes.
                 let source_lines: Vec<_> = anchor.source.lines().collect();
                 if hunks.iter().flat_map(|h| &h.lines).any(|line| {
@@ -766,15 +1063,19 @@ impl ReviewView {
                     n.is_some_and(|n| {
                         n >= anchor.start
                             && n <= anchor.end
-                            && source_lines
-                                .get(n as usize - 1)
-                                .map(|s| s.trim_end_matches('\r'))
-                                != Some(line.text.as_str())
+                            && source_lines.get(n as usize - 1).copied() != Some(line.text.as_str())
                     })
                 }) {
                     self.feedback.error =
                         Some("Code changed. Refresh the diff before commenting.".into());
                 } else {
+                    self.diff_state.update(cx, |diff, cx| {
+                        diff.set_selected_lines(Some(range.clone()), cx);
+                        diff.scroll_to_line(
+                            DiffLinePosition::new(range.path().clone(), range.side(), range.end()),
+                            cx,
+                        );
+                    });
                     self.feedback.selection = Some(anchor);
                     if self.feedback.editing.take().is_some() {
                         self.feedback.input = None;
@@ -799,42 +1100,6 @@ impl ReviewView {
             Err(e) => self.feedback.error = Some(format!("{e:#}")),
         }
         cx.notify();
-    }
-
-    pub(super) fn line_feedback(&self, row: StreamRow) -> (bool, usize) {
-        let ReviewState::Loaded(loaded) = &self.state else {
-            return (false, 0);
-        };
-        let StreamRow::Line { file, hunk, line } = row else {
-            return (false, 0);
-        };
-        let file = &loaded.diff.files[file];
-        let FileContent::Text { hunks, .. } = &file.content else {
-            return (false, 0);
-        };
-        let line = &hunks[hunk].lines[line];
-        let matches = |a: &Anchor| {
-            a.path == file.path
-                && !a.outdated
-                && match a.side {
-                    Side::Old => line.old_no,
-                    Side::New => line.new_no,
-                }
-                .is_some_and(|n| n >= a.start && n <= a.end)
-        };
-        (
-            self.feedback.selection.as_ref().is_some_and(matches)
-                || self
-                    .feedback
-                    .comments
-                    .iter()
-                    .any(|c| Some(&c.id) == self.feedback.active.as_ref() && matches(&c.anchor)),
-            self.feedback
-                .comments
-                .iter()
-                .filter(|c| matches(&c.anchor))
-                .count(),
-        )
     }
 
     fn save_comment(&mut self, cx: &mut Context<Self>) {
@@ -969,7 +1234,10 @@ impl ReviewView {
             .collect()
     }
 
-    fn jump_comment(&mut self, c: &Comment, window: &mut Window, cx: &mut Context<Self>) {
+    fn jump_comment(&mut self, c: &Comment, _window: &mut Window, cx: &mut Context<Self>) {
+        self.collapsed.borrow_mut().remove(&c.anchor.path);
+        self.sync_collapsed(cx);
+        self.rebuild_rows(cx);
         self.feedback.active = Some(c.id.clone());
         if let Some(i) = self
             .visible_comments()
@@ -980,6 +1248,15 @@ impl ReviewView {
         }
         if let Some(row) = self.thread_row(c) {
             if let ReviewState::Loaded(loaded) = &self.state
+                && row == loaded.rows.len()
+                && let Some(index) = self
+                    .inline_thread_groups()
+                    .get(&row)
+                    .and_then(|comments| comments.iter().position(|comment| comment.id == c.id))
+            {
+                self.feedback.outside_scroll.scroll_to_item(index + 1);
+            }
+            if let ReviewState::Loaded(loaded) = &self.state
                 && let Some(stream_row) = loaded.rows.get(row)
             {
                 let path = &loaded.diff.files[stream_row.file()].path;
@@ -989,16 +1266,27 @@ impl ReviewView {
                     state.set_selected_index(state.index_of(&id), cx)
                 });
             }
-            // Center the inline thread when possible: leave ~half a viewport
-            // of context above the anchor row so the comment box lands near
-            // the middle instead of pinned to the top. Near the start/end
-            // of the file the list clamps, which is the "when possible".
-            let above_px = (window.viewport_size().height * 0.5 - px(120.)).max(px(0.));
-            let above_rows = (above_px / px(super::stream::ROW_H)) as usize;
-            self.list_handle.scroll_to(ListOffset {
-                item_ix: row.saturating_sub(above_rows),
-                offset_in_item: px(0.),
-            });
+            if let ReviewState::Loaded(loaded) = &self.state
+                && let Some(annotation) = annotation_for(loaded, &c.anchor, "review-jump".into())
+            {
+                self.diff_state.update(cx, |diff, cx| {
+                    diff.set_file_collapsed(&c.anchor.path, false, cx);
+                    if let Some(position) = annotation.position() {
+                        diff.set_selected_lines(
+                            Some(DiffLineRange::new(
+                                c.anchor.path.clone(),
+                                kit_side(c.anchor.side),
+                                c.anchor.start as usize,
+                                c.anchor.end as usize,
+                            )),
+                            cx,
+                        );
+                        diff.scroll_to_line(position.clone(), cx);
+                    } else {
+                        diff.scroll_to_file(&c.anchor.path, cx);
+                    }
+                });
+            }
         }
         cx.notify();
     }
@@ -1075,6 +1363,7 @@ impl ReviewView {
                             }));
                             this.feedback.editing = Some(edit.clone());
                             this.feedback.selection = None;
+                            this.jump_comment(&edit, window, cx);
                             if let Some(input) = &this.feedback.input {
                                 input.read(cx).focus_handle(cx).focus(window, cx);
                             }

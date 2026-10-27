@@ -1,16 +1,8 @@
-//! Virtualized diff stream rows for the Review tab.
+//! Logical diff rows for comment anchor lookup and Review file headers.
 //!
-//! The stream flattens a loaded diff into [`StreamRow`]s once per load
-//! ([`flatten`]); the view renders only the visible window through
-//! a variable-height list. Diff rows are at least [`ROW_H`] tall; the view can append
-//! an inline comment editor to the row at the end of a selected range.
-//! Per-load flattening plus per-frame visible-only rendering is what keeps
-//! large diffs smooth: fully expanded, a big review would otherwise be tens
-//! of thousands of flex elements laid out on every frame.
-//!
-//! The message rows ("no line changes", truncation) are crate-visible so the
-//! text diff tool says the same things the same way; the diff rows themselves
-//! are the review's, since the tool renders its own side-by-side cells.
+//! Kit owns the virtualized code display. The bounded logical rows keep comment
+//! placement independent of the current unified/split layout. Shared messages
+//! and colors are also used by the text comparison tool.
 
 use std::collections::HashSet;
 
@@ -18,16 +10,11 @@ use gpui_kit::component::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Styled, StyledText, div, px, rgb,
+    ParentElement, Styled, div, px, rgb,
 };
-
-use crate::fonts::TERMINAL_FONT_FAMILY;
-use crate::metrics::review_font_size;
 
 use super::ReviewView;
-use super::model::{
-    ChangedFile, FileStatus, Hunk, HunkLine, LineTag, ReviewDiff, UnavailableReason,
-};
+use super::model::{ChangedFile, FileStatus, ReviewDiff, UnavailableReason};
 
 /// Minimum height of a diff content row. File headers use [`FILE_HEADER_H`] so
 /// they stand out from code lines (see module docs).
@@ -150,70 +137,14 @@ pub(crate) fn status_color(status: FileStatus) -> u32 {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct RowRenderOptions {
-    pub(crate) selected: bool,
-    pub(crate) dark: bool,
-    pub(crate) editor_open_available: bool,
-}
-
-/// Render one flattened row. Pure over the loaded diff except the file
-/// header's viewed/collapsed toggles, which update the view through its entity.
-pub(crate) fn render_row(
-    loaded: &super::LoadedReview,
-    row: StreamRow,
-    viewed: &HashSet<String>,
-    collapsed: &HashSet<String>,
-    view: &Entity<ReviewView>,
-    options: RowRenderOptions,
-) -> AnyElement {
-    let file = &loaded.diff.files[row.file()];
-    match row {
-        StreamRow::FileHeader { .. } => file_header_row(
-            file,
-            viewed.contains(&file.path),
-            collapsed.contains(&file.path),
-            view,
-            options.editor_open_available,
-        ),
-        StreamRow::HunkHeader { hunk, .. } => match &file.content {
-            super::model::FileContent::Text { hunks, .. } => hunk_header_row(&hunks[hunk]),
-            super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
-        },
-        StreamRow::Line { hunk, line, .. } => match &file.content {
-            super::model::FileContent::Text { hunks, .. } => line_row(
-                &hunks[hunk].lines[line],
-                loaded.syntax.line(options.dark, row.file(), hunk, line),
-                options.selected,
-                &file.path,
-                view,
-                options.editor_open_available,
-            ),
-            super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
-        },
-        StreamRow::Collapsed { hunk, .. } => match &file.content {
-            super::model::FileContent::Text { hunks, .. } => {
-                collapsed_row(hunks[hunk].collapsed_before)
-            }
-            super::model::FileContent::Unavailable(_) => unavailable_row_for(file),
-        },
-        StreamRow::Truncated { .. } => truncated_row(),
-        StreamRow::Unavailable { .. } => unavailable_row_for(file),
-        StreamRow::NoChanges { .. } => no_changes_row(),
-    }
-}
-
 pub(crate) fn file_header_row(
     file: &ChangedFile,
     is_viewed: bool,
-    is_collapsed: bool,
     view: &Entity<ReviewView>,
     editor_open_available: bool,
 ) -> AnyElement {
     let path = file.path.clone();
-    let collapse_path = file.path.clone();
     let toggle_view = view.clone();
-    let toggle_collapse = view.clone();
     let open_view = view.clone();
     let open_path = file.path.clone();
     let stats = if file.additions > 0 || file.deletions > 0 {
@@ -236,20 +167,6 @@ pub(crate) fn file_header_row(
         .bg(rgb(0x151a1a))
         .border_b_1()
         .border_color(rgb(0x2a2e2e))
-        .child(
-            div()
-                .flex_none()
-                .w(px(20.))
-                .text_sm()
-                .text_color(rgb(0x858989))
-                .cursor_pointer()
-                .child(if is_collapsed { "▸" } else { "▾" })
-                .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
-                    cx.update_entity(&toggle_collapse, |view, cx| {
-                        view.toggle_collapsed(&collapse_path, cx);
-                    });
-                }),
-        )
         .child(
             div()
                 .flex_none()
@@ -306,135 +223,14 @@ pub(crate) fn file_header_row(
                     cx.update_entity(&toggle_view, |view, cx| {
                         view.toggle_viewed(&path, cx);
                     });
+                    cx.stop_propagation();
                 })
                 .child(if is_viewed { "✓" } else { "○" }),
         )
         .into_any_element()
 }
 
-fn line_row(
-    line: &HunkLine,
-    spans: &[super::syntax::SyntaxSpan],
-    selected: bool,
-    path: &str,
-    view: &Entity<ReviewView>,
-    editor_open_available: bool,
-) -> AnyElement {
-    let (background, sign, sign_color) = match line.tag {
-        LineTag::Context => (None, " ", 0x555a5a),
-        LineTag::Deletion => (Some(DELETION_BG), "-", 0xf87171),
-        LineTag::Addition => (Some(ADDITION_BG), "+", 0x4ade80),
-    };
-    let old_no = match line.old_no {
-        Some(number) => format!("{number:>5}"),
-        None => "     ".to_owned(),
-    };
-    let new_no = match line.new_no {
-        Some(number) => format!("{number:>5}"),
-        None => "     ".to_owned(),
-    };
-    let open_path = path.to_owned();
-    let open_line = line.new_no;
-    let open_view = view.clone();
-    div()
-        .min_h(px(ROW_H))
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_start()
-        .whitespace_nowrap()
-        .font_family(TERMINAL_FONT_FAMILY)
-        .text_size(px(review_font_size()))
-        .line_height(px(ROW_H))
-        .when_some(background, |this, color| this.bg(rgb(color)))
-        .when(selected, |this| this.bg(rgb(0x203442)))
-        .child(
-            div()
-                .w(px(44.))
-                .flex_none()
-                .text_color(rgb(0x555a5a))
-                .child(old_no),
-        )
-        .child(
-            div()
-                .w(px(44.))
-                .flex_none()
-                .text_color(rgb(0x555a5a))
-                .when(editor_open_available && line.new_no.is_some(), |this| {
-                    this.cursor_pointer().on_mouse_down(
-                        MouseButton::Left,
-                        move |_, _, cx: &mut App| {
-                            if let Some(number) = open_line {
-                                cx.update_entity(&open_view, |view, cx| {
-                                    view.open_file(&open_path, Some(number as usize), cx);
-                                });
-                                cx.stop_propagation();
-                            }
-                        },
-                    )
-                })
-                .child(new_no),
-        )
-        .child(
-            div()
-                .w(px(20.))
-                .flex_none()
-                .text_color(rgb(sign_color))
-                .child(sign),
-        )
-        .child(
-            div().flex_1().min_w_0().whitespace_normal().child(
-                StyledText::new(line.text.clone())
-                    .with_highlights(super::syntax::styled_highlights(spans)),
-            ),
-        )
-        .into_any_element()
-}
-
-fn hunk_header_row(hunk: &Hunk) -> AnyElement {
-    div()
-        .h(px(ROW_H))
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .px_3()
-        .gap_2()
-        .bg(rgb(0x101314))
-        .text_color(rgb(0x7d8585))
-        .font_family(TERMINAL_FONT_FAMILY)
-        .text_size(px(review_font_size()))
-        .child(format!(
-            "@@ -{},{} +{},{} @@",
-            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
-        ))
-        .into_any_element()
-}
-
-fn collapsed_row(count: u32) -> AnyElement {
-    div()
-        .h(px(ROW_H))
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        .px_3()
-        .text_color(rgb(0x555a5a))
-        .font_family(TERMINAL_FONT_FAMILY)
-        .text_size(px(review_font_size()))
-        .child(format!("··· {count} unchanged lines ···"))
-        .into_any_element()
-}
-
-fn unavailable_row_for(file: &ChangedFile) -> AnyElement {
-    let reason = match &file.content {
-        super::model::FileContent::Unavailable(reason) => *reason,
-        super::model::FileContent::Text { .. } => UnavailableReason::Missing,
-    };
-    unavailable_row(reason)
-}
-
-fn unavailable_row(reason: UnavailableReason) -> AnyElement {
+pub(super) fn unavailable_row(reason: UnavailableReason) -> AnyElement {
     div()
         .h(px(ROW_H))
         .flex_none()
@@ -470,7 +266,7 @@ pub(crate) fn truncated_row() -> AnyElement {
         .items_center()
         .px_3()
         .text_color(rgb(0xd9a648))
-        .child("··· diff truncated for performance ···")
+        .child("Diff truncated: only complete hunks within the 4,000-line display limit are shown.")
         .into_any_element()
 }
 
@@ -487,6 +283,7 @@ mod tests {
             old_no: Some(1),
             new_no: Some(1),
             text: "x".to_owned(),
+            ending: "\n",
         }
     }
 

@@ -7,7 +7,40 @@ use std::fmt::Write as _;
 
 use gpui_kit::component::diff::DiffFile;
 
-use super::model::{ChangedFile, FileContent, FileStatus, LineTag};
+use super::model::{ChangedFile, FileContent, FileStatus, HunkLine, LineTag};
+
+/// Build from the exact bounded snapshot already captured by Review. Never
+/// re-read a mutable worktree to populate a diff from a different generation.
+pub(crate) fn parse_snapshot(file: &ChangedFile) -> Result<Vec<DiffFile>, String> {
+    let mut patch = serialize_lines(file, ["100644"; 2], |line| {
+        Ok(format!("{}{}", line.text, line.ending))
+    })?;
+    // A patch without source or metadata appears unchanged in Kit. Retain the
+    // real reason rows are absent rather than inventing source or Git modes.
+    let summary = match &file.content {
+        FileContent::Unavailable(reason) => {
+            Some(format!("Content unavailable: {}", reason.label()))
+        }
+        FileContent::Text {
+            hunks,
+            truncated: true,
+        } if hunks.is_empty() => Some(
+            "Diff truncated: no complete hunks fit within the 4,000-line display limit.".into(),
+        ),
+        FileContent::Text {
+            hunks,
+            truncated: false,
+        } if hunks.is_empty() && file.status == FileStatus::Modified => {
+            Some("File changed without displayed line changes.".into())
+        }
+        _ => None,
+    };
+    if let Some(summary) = summary {
+        let header = patch.find("\n--- ").ok_or("Missing patch header")?;
+        patch.insert_str(header + 1, &format!("{summary}\n"));
+    }
+    DiffFile::parse(&patch).map_err(|error| format!("Could not prepare diff: {error}"))
+}
 
 pub(crate) fn parse_file(
     file: &ChangedFile,
@@ -28,9 +61,24 @@ pub(crate) fn parse_file(
 }
 
 fn serialize(file: &ChangedFile, old: &str, new: &str, modes: [&str; 2]) -> Result<String, String> {
-    let FileContent::Text { hunks, .. } = &file.content else {
-        return Err("Text content required for a patch".into());
-    };
+    let mut sources = [SourceLines::new(old), SourceLines::new(new)];
+    serialize_lines(file, modes, |line| {
+        let (side, number) = match line.tag {
+            LineTag::Deletion => (0, line.old_no),
+            _ => (1, line.new_no),
+        };
+        number
+            .and_then(|number| sources[side].line(number))
+            .map(str::to_owned)
+            .ok_or_else(|| "Diff line does not match its source".into())
+    })
+}
+
+fn serialize_lines(
+    file: &ChangedFile,
+    modes: [&str; 2],
+    mut source_line: impl FnMut(&HunkLine) -> Result<String, String>,
+) -> Result<String, String> {
     let original = file.old_path.as_deref().unwrap_or(&file.path);
     let old_path = quote_path(&format!("a/{original}"));
     let new_path = quote_path(&format!("b/{}", file.path));
@@ -62,9 +110,9 @@ fn serialize(file: &ChangedFile, old: &str, new: &str, modes: [&str; 2]) -> Resu
         },
     )
     .unwrap();
-    // Walk each side once rather than allocating an index for every source
-    // line. Large files may have millions of lines but only 4,000 retained.
-    let mut sources = [SourceLines::new(old), SourceLines::new(new)];
+    let FileContent::Text { hunks, .. } = &file.content else {
+        return Ok(patch);
+    };
     for hunk in hunks {
         // The model stores empty spans one-based; unified patches store the
         // line immediately before an empty span, including zero at file start.
@@ -81,16 +129,14 @@ fn serialize(file: &ChangedFile, old: &str, new: &str, modes: [&str; 2]) -> Resu
         )
         .unwrap();
         for line in &hunk.lines {
-            let (prefix, side, number) = match line.tag {
-                LineTag::Context => (' ', 1, line.new_no),
-                LineTag::Deletion => ('-', 0, line.old_no),
-                LineTag::Addition => ('+', 1, line.new_no),
+            let prefix = match line.tag {
+                LineTag::Context => ' ',
+                LineTag::Deletion => '-',
+                LineTag::Addition => '+',
             };
-            let source = number
-                .and_then(|number| sources[side].line(number))
-                .ok_or("Diff line does not match its source")?;
+            let source = source_line(line)?;
             patch.push(prefix);
-            patch.push_str(source);
+            patch.push_str(&source);
             if !source.ends_with('\n') {
                 patch.push_str("\n\\ No newline at end of file\n");
             }
@@ -269,26 +315,33 @@ mod tests {
             ("same\n", "same"),
             ("same", "same\n"),
             ("old", "new"),
+            ("original\n", "trailing\r\r\n"),
+            ("old\r", "new\r"),
         ] {
             let file = changed(old, new, FileStatus::Modified);
-            let files = parse_file(&file, old, new, ["100644"; 2]).unwrap();
-            cx.update(|cx| {
-                let state = cx.new(|cx| DiffState::new(files, cx));
-                state.update(cx, |state, cx| {
-                    for (side, source) in [(DiffSide::Original, old), (DiffSide::Modified, new)] {
-                        state.set_selected_lines(
-                            Some(DiffLineRange::new(
-                                "file.txt",
-                                side,
-                                1,
-                                source.lines().count(),
-                            )),
-                            cx,
-                        );
-                        assert_eq!(state.selected_text(cx), source);
-                    }
+            for files in [
+                parse_file(&file, old, new, ["100644"; 2]).unwrap(),
+                parse_snapshot(&file).unwrap(),
+            ] {
+                cx.update(|cx| {
+                    let state = cx.new(|cx| DiffState::new(files, cx));
+                    state.update(cx, |state, cx| {
+                        for (side, source) in [(DiffSide::Original, old), (DiffSide::Modified, new)]
+                        {
+                            state.set_selected_lines(
+                                Some(DiffLineRange::new(
+                                    "file.txt",
+                                    side,
+                                    1,
+                                    source.lines().count(),
+                                )),
+                                cx,
+                            );
+                            assert_eq!(state.selected_text(cx), source);
+                        }
+                    });
                 });
-            });
+            }
         }
         let old = (1..=60).map(|n| format!("line {n}\n")).collect::<String>();
         let new = old.replace("line 30\n", "changed 30\n");
@@ -334,5 +387,48 @@ mod tests {
                 .unwrap()
                 .contains("does not match its source")
         );
+    }
+
+    #[test]
+    fn snapshot_without_source_rows_stays_changed_and_explains_why() {
+        use super::super::model::UnavailableReason;
+        for (content, explanation) in [
+            (
+                FileContent::Unavailable(UnavailableReason::Binary),
+                "Binary file",
+            ),
+            (
+                FileContent::Unavailable(UnavailableReason::TooLarge),
+                "too large",
+            ),
+            (
+                FileContent::Text {
+                    hunks: vec![],
+                    truncated: true,
+                },
+                "Diff truncated",
+            ),
+            (
+                FileContent::Text {
+                    hunks: vec![],
+                    truncated: false,
+                },
+                "File changed",
+            ),
+        ] {
+            let mut file = changed("old\n", "new\n", FileStatus::Modified);
+            file.content = content;
+            let parsed = parse_snapshot(&file).unwrap();
+            assert!(
+                parsed[0].has_changes(),
+                "must not be presented as unchanged"
+            );
+            assert!(
+                parsed[0]
+                    .extended_headers()
+                    .iter()
+                    .any(|header| header.contains(explanation))
+            );
+        }
     }
 }
