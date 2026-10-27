@@ -314,7 +314,7 @@ pub(crate) struct HomeView {
     /// (sessions, projects, Add project, then inbox items). `None` outside navigation mode;
     /// `Enter` activates the cursor item once and exits the mode.
     navigation_cursor: Option<usize>,
-    /// Full-color harness logos for the Recent Activity session cards,
+    /// Full-color harness logos for the Recent Sessions cards,
     /// rasterized once at creation (the harness set is fixed).
     agent_icon_tiles: std::rc::Rc<crate::agent_icons::AgentIconTiles>,
 }

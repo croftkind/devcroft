@@ -274,7 +274,7 @@ impl HomeView {
                 h_flex()
                     .justify_between()
                     .gap_2()
-                    .child(section_title("Recent activity", self.sessions.len(), cx))
+                    .child(section_title("Recent Sessions", self.sessions.len(), cx))
                     .child(
                         Button::new("refresh-home-sessions")
                             .ghost()
