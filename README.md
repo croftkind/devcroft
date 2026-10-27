@@ -106,6 +106,8 @@ mise run check
 mise run test
 ```
 
+`mise run ci` runs both `check` and `test`.
+
 Ordinary builds use GPUI Fast. The default feature switches Kit and the macOS
 WebView wrapper together so they share GPUI types.
 

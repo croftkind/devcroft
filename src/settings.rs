@@ -2692,9 +2692,12 @@ mod tests {
             window.render_frame(cx);
             let sidebar = window.find("settings-section-General").bounds();
             let first_card = window.find("default-editor-built_in").bounds();
+            // Scroll past the end; the container clamps the offset to its
+            // content height, so this reaches the bottom regardless of how
+            // many language-server cards the Editor section renders.
             window.scroll(
                 "default-editor-built_in",
-                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-500.))),
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-10_000.))),
                 cx,
             );
             assert_eq!(window.find("settings-section-General").bounds(), sidebar);
