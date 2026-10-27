@@ -951,6 +951,21 @@ impl NativeEditor {
             .unwrap_or_default()
     }
 
+    fn expand_parent_directories(&mut self, path: &Path) {
+        let Ok(relative) = path.strip_prefix(&self.canonical_root) else {
+            return;
+        };
+        for parent in relative.ancestors().skip(1) {
+            self.expanded_dirs.insert(
+                parent
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
+    }
+
     fn open_new_file_dialog(
         &mut self,
         directory: &str,
@@ -1121,21 +1136,11 @@ impl NativeEditor {
         let relative = target
             .strip_prefix(&canonical_root)
             .context("Created file escaped checkout")?;
-        let canonical_parts: Vec<String> = relative
+        let label = relative
             .components()
-            .map(|component| component.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        self.expanded_dirs.insert(String::new());
-        let label = canonical_parts.join("/");
-        let mut prefix = String::new();
-        for part in &canonical_parts[..canonical_parts.len().saturating_sub(1)] {
-            prefix = if prefix.is_empty() {
-                part.clone()
-            } else {
-                format!("{prefix}/{part}")
-            };
-            self.expanded_dirs.insert(prefix.clone());
-        }
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
         if self.browser == BrowserMode::Closed {
             self.browser = BrowserMode::Tree;
         }
@@ -1522,6 +1527,8 @@ impl NativeEditor {
                     .is_some_and(|origin| origin.position.line != line.saturating_sub(1) as u32)
             });
             self.record_origin(origin, moved, cx);
+            self.expand_parent_directories(&canonical);
+            cx.notify();
             return Ok(());
         }
         let opened_new_tab = !self.inactive_documents.contains_key(&canonical);
@@ -1572,6 +1579,8 @@ impl NativeEditor {
         if opened_new_tab && self.browser == BrowserMode::Buffers {
             self.refresh_buffer_finder(cx);
         }
+        self.expand_parent_directories(&canonical);
+        cx.notify();
         Ok(())
     }
 
@@ -4206,10 +4215,69 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn opening_files_expands_parents_for_new_current_and_existing_tabs(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        fs::create_dir(dir.path().join("invalid")).unwrap();
+        let nested = dir.path().join("src/nested/module.txt");
+        let root_file = dir.path().join("root.txt");
+        let invalid = dir.path().join("invalid/binary.txt");
+        fs::write(&nested, "nested\n").unwrap();
+        fs::write(&root_file, "root\n").unwrap();
+        fs::write(&invalid, [0]).unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.update_in(test_cx, |view, window, cx| {
+            let initial = HashSet::from([String::new(), "other".into()]);
+            let expanded = HashSet::from([
+                String::new(),
+                "other".into(),
+                "src".into(),
+                "src/nested".into(),
+            ]);
+            view.expanded_dirs = initial.clone();
+            view.open(&nested, None, window, cx).unwrap();
+            assert_eq!(view.expanded_dirs, expanded);
+            assert!(
+                tree_rows(&view.files, &view.expanded_dirs, &view.tree_limits)
+                    .iter()
+                    .any(|row| row.key == "src/nested/module.txt" && row.file.is_some())
+            );
+            let document = view.editor.entity_id();
+
+            // Opening the current file again re-expands manually collapsed parents.
+            view.expanded_dirs = initial.clone();
+            view.open(&nested, None, window, cx).unwrap();
+            assert_eq!(view.expanded_dirs, expanded);
+            assert_eq!(view.editor.entity_id(), document);
+
+            // Switching to an existing tab also reveals its parent folders.
+            view.open(&root_file, None, window, cx).unwrap();
+            view.expanded_dirs = initial.clone();
+            view.browser = BrowserMode::Closed;
+            view.open(&nested, None, window, cx).unwrap();
+            assert_eq!(view.expanded_dirs, expanded);
+            assert_eq!(view.editor.entity_id(), document);
+            assert_eq!(view.browser, BrowserMode::Closed);
+
+            // A rejected file leaves both the active file and folder state intact.
+            view.expanded_dirs = initial.clone();
+            assert!(view.open(&invalid, None, window, cx).is_err());
+            assert_eq!(view.expanded_dirs, initial);
+            assert_eq!(view.editor.entity_id(), document);
+            assert_eq!(view.path, Some(nested.canonicalize().unwrap()));
+        });
+    }
+
+    #[gpui_kit::test]
     fn file_finder_controls_open_a_checkout_file(cx: &mut gpui_kit::TestAppContext) {
         cx.update(gpui_kit::init);
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("hello world.txt");
+        fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        let file = dir.path().join("src/nested/hello world.txt");
         fs::write(&file, "hello\n").unwrap();
         let (view, test_cx) = test_editor(cx, dir.path());
         test_cx.run_until_parked();
@@ -4233,6 +4301,8 @@ mod tests {
             );
             assert_eq!(view.editor.read(cx).value().as_ref(), "hello\n");
             assert_eq!(view.browser, BrowserMode::Tree);
+            assert!(view.expanded_dirs.contains("src"));
+            assert!(view.expanded_dirs.contains("src/nested"));
         });
     }
 
