@@ -96,7 +96,8 @@ fn editor_completion(text: &Rope, mut response: CompletionResponse) -> Completio
         CompletionResponse::Array(items) => items,
         CompletionResponse::List(list) => &mut list.items,
     };
-    // The engine applies one replacement, not workspace/import edits or snippets.
+    // Snippet placeholders were expanded by the client. The engine applies
+    // one replacement, so suggestions needing additional edits remain excluded.
     items.retain(|item| {
         item.additional_text_edits
             .as_ref()

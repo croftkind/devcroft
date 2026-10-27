@@ -43,15 +43,15 @@ impl Installation {
             .or_else(|| managed.as_ref().map(|managed| managed.executable.clone()))
             .or_else(|| crate::editor::find_executable(server.executable()));
         let required_runtime = match server {
-            ServerId::Rust => None,
+            ServerId::Rust | ServerId::Clangd | ServerId::Swift => None,
             ServerId::Go => Some(("go", "Go")),
-            ServerId::TypeScript => Some(("node", "Node.js")),
             ServerId::Python
                 if (pref.executable.is_none() && managed.is_some()) || pref.runtime.is_some() =>
             {
                 Some(("node", "Node.js"))
             }
             ServerId::Python => None,
+            _ => Some(("node", "Node.js")),
         };
         let missing_runtime = required_runtime.and_then(|(command, label)| {
             let runtime = pref
@@ -361,13 +361,16 @@ impl LanguageServers {
                         .child(format!("Executable: {}", path.display())),
                 )
             })
+            .when(server == ServerId::Swift, |fields| fields.child(
+                div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("SourceKit-LSP is included with Xcode and Swift toolchains. Install a Swift toolchain from swift.org/install, then select its sourcekit-lsp executable below. For cross-module support, build your Swift package first.")))
             .child(
                 v_flex()
                     .gap_1()
                     .child(div().text_xs().child("Server executable"))
                     .child(Input::new(&row.executable)),
             )
-            .when(server != ServerId::Rust, |fields| fields.child(
+            .when(server.uses_node() || server == ServerId::Go, |fields| fields.child(
                 v_flex().gap_1()
                     .child(div().text_xs().child(if server == ServerId::Go { "Go runtime" } else { "Node.js runtime" }))
                     .child(Input::new(&row.runtime))))
@@ -535,27 +538,32 @@ impl LanguageServers {
                     .gap_2()
                     .items_center()
                     .flex_wrap()
-                    .when(!installed && !installation.custom, |actions| {
-                        actions.child(
-                            Button::new(format!("lsp-install-{}", server.id()))
-                                .small()
-                                .label(if installation.managed.is_some() {
-                                    "Reinstall"
-                                } else {
-                                    "Install"
-                                })
-                                .disabled(busy || self.data.is_none())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.action(server, Action::Install, cx)
-                                })),
-                        )
-                    })
+                    .when(
+                        !installed && !installation.custom && server.has_managed_install(),
+                        |actions| {
+                            actions.child(
+                                Button::new(format!("lsp-install-{}", server.id()))
+                                    .small()
+                                    .label(if installation.managed.is_some() {
+                                        "Reinstall"
+                                    } else {
+                                        "Install"
+                                    })
+                                    .disabled(busy || self.data.is_none())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.action(server, Action::Install, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         Button::new(format!("lsp-existing-{}", server.id()))
                             .small()
                             .ghost()
                             .label(if !installed && installation.custom {
                                 "Fix executable path".into()
+                            } else if !installed && server == ServerId::Swift {
+                                "Set up Swift".into()
                             } else if installed && let Some(runtime) = installation.missing_runtime
                             {
                                 format!("Set up {runtime}")

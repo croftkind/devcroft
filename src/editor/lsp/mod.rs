@@ -1,7 +1,6 @@
-//! Bounded, opt-in Rust language support. NativeEditor owns one client per
-//! checkout; transport I/O and process initialization/teardown run off the UI
-//! thread. References, document symbols, custom repository commands, and
-//! additional language servers are deferred. Failures leave plain editing usable.
+//! Bounded, opt-in language support. NativeEditor shares clients by checkout,
+//! server, and project root; transport I/O and process initialization/teardown
+//! run off the UI thread. Failures leave plain editing usable.
 
 pub(crate) mod catalog;
 pub(crate) mod client;
@@ -10,6 +9,7 @@ pub(crate) mod manager;
 pub(crate) mod process;
 pub(crate) mod providers;
 pub(crate) mod settings;
+mod snippet;
 pub(crate) mod transport;
 
 pub(crate) use client::{Client, DiagnosticEvent};

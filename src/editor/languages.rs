@@ -23,18 +23,20 @@ pub(crate) fn detect(path: &Path) -> Language {
             "tsx" => ("tsx", "typescriptreact", Some(ServerId::TypeScript)),
             "py" | "pyi" => ("python", "python", Some(ServerId::Python)),
             "toml" => ("toml", "toml", None),
-            "sh" | "bash" => ("bash", "shellscript", None),
+            "sh" | "bash" => ("bash", "shellscript", Some(ServerId::Bash)),
             ext if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
                 ("markdown", "markdown", None)
             }
-            "html" => ("html", "html", None),
-            "css" => ("css", "css", None),
-            "json" => ("json", "json", None),
-            "yml" | "yaml" => ("yaml", "yaml", None),
-            "c" | "h" => ("c", "c", None),
-            "cc" | "cpp" | "hpp" => ("cpp", "cpp", None),
+            "html" | "htm" => ("html", "html", Some(ServerId::Html)),
+            "css" => ("css", "css", Some(ServerId::Css)),
+            "json" => ("json", "json", Some(ServerId::Json)),
+            "yml" | "yaml" => ("yaml", "yaml", Some(ServerId::Yaml)),
+            "c" | "h" => ("c", "c", Some(ServerId::Clangd)),
+            "C" | "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "H" => {
+                ("cpp", "cpp", Some(ServerId::Clangd))
+            }
             "java" => ("java", "java", None),
-            "swift" | "swiftinterface" => ("swift", "swift", None),
+            "swift" | "swiftinterface" => ("swift", "swift", Some(ServerId::Swift)),
             // No protobuf language server is wired, so the id is not sent
             // anywhere yet.
             "proto" => ("proto", "protobuf", None),
@@ -67,6 +69,39 @@ mod tests {
     }
 
     #[test]
+    fn common_languages_route_to_their_servers_and_grammars() {
+        for (names, grammar, id, server) in [
+            ("main.c api.h", "c", "c", ServerId::Clangd),
+            (
+                "main.cpp main.cc main.cxx main.C api.hpp api.hh api.hxx api.H main.c++ api.h++",
+                "cpp",
+                "cpp",
+                ServerId::Clangd,
+            ),
+            ("index.html index.htm", "html", "html", ServerId::Html),
+            ("styles.css", "css", "css", ServerId::Css),
+            ("package.json", "json", "json", ServerId::Json),
+            ("config.yaml config.yml", "yaml", "yaml", ServerId::Yaml),
+            ("run.sh run.bash", "bash", "shellscript", ServerId::Bash),
+            (
+                "main.swift Module.swiftinterface",
+                "swift",
+                "swift",
+                ServerId::Swift,
+            ),
+        ] {
+            for name in names.split_whitespace() {
+                let language = detect(Path::new(name));
+                assert_eq!(
+                    (language.grammar, language.id, language.server),
+                    (grammar, id, Some(server)),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn protobuf_files_use_the_bundled_grammar() {
         let language = detect(Path::new("proto/fleet.proto"));
         assert_eq!(language.grammar, "proto");
@@ -79,8 +114,9 @@ mod tests {
         let language = detect(Path::new("Sources/ContentView.swift"));
         assert_eq!(language.grammar, "swift");
         assert_eq!(language.id, "swift");
-        assert!(language.server.is_none());
+        assert_eq!(language.server, Some(ServerId::Swift));
         let interface = detect(Path::new("Module.swiftinterface"));
         assert_eq!(interface.grammar, "swift");
+        assert_eq!(interface.server, Some(ServerId::Swift));
     }
 }

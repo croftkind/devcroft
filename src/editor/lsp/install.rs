@@ -47,6 +47,11 @@ pub(crate) fn version(server: ServerId) -> &'static str {
         ServerId::Go => "0.23.0",
         ServerId::TypeScript => "6.0.1-ts6.0.3",
         ServerId::Python => "1.40.2",
+        ServerId::Clangd => "23.1.0",
+        ServerId::Html | ServerId::Css | ServerId::Json => "4.10.0",
+        ServerId::Yaml => "2.0.0",
+        ServerId::Bash => "5.8.1",
+        ServerId::Swift => "toolchain",
     }
 }
 fn platform() -> String {
@@ -141,6 +146,12 @@ fn entry(server: ServerId) -> PathBuf {
     match server {
         ServerId::TypeScript => "node_modules/typescript-language-server/lib/cli.mjs".into(),
         ServerId::Python => "node_modules/basedpyright/langserver.index.js".into(),
+        ServerId::Html | ServerId::Css | ServerId::Json => {
+            PathBuf::from("node_modules/vscode-langservers-extracted/bin").join(server.executable())
+        }
+        ServerId::Yaml => "node_modules/yaml-language-server/bin/yaml-language-server".into(),
+        ServerId::Clangd => PathBuf::from("bin").join(binary_name(server)),
+        ServerId::Bash => "node_modules/bash-language-server/out/cli.js".into(),
         _ => binary_name(server).into(),
     }
 }
@@ -238,13 +249,14 @@ pub(crate) fn resolve(
     };
     let mut args = server.args();
     let mut env = Vec::new();
-    let program = if managed && matches!(server, ServerId::TypeScript | ServerId::Python) {
+    let program = if managed && server.uses_node() {
         let node = runtime("node", pref, checkout)?;
         env.push(("PATH".into(), prepend_path(&node)?));
         args.insert(0, path.clone().into_os_string());
         node
     } else {
-        if server == ServerId::TypeScript || (server == ServerId::Python && pref.runtime.is_some())
+        if (server.uses_node() && server != ServerId::Python)
+            || (server == ServerId::Python && pref.runtime.is_some())
         {
             let node = runtime("node", pref, checkout)?;
             env.push(("PATH".into(), prepend_path(&node)?));
@@ -422,6 +434,10 @@ fn run(command: &mut Command, job: &Job) -> Result<()> {
     )
 }
 fn install(root: &Path, server: ServerId, job: &Job) -> Result<()> {
+    ensure!(
+        server.has_managed_install(),
+        "SourceKit-LSP is included with Xcode and Swift toolchains. Install a Swift toolchain, then select sourcekit-lsp in Advanced settings."
+    );
     ensure!(!job.cancel.load(Ordering::SeqCst), "Cancelled");
     let pref = preferences(Some(root), server);
     let previous = receipt(root, server)?;
@@ -449,6 +465,7 @@ fn install(root: &Path, server: ServerId, job: &Job) -> Result<()> {
     let stage = staging.path();
     match server {
         ServerId::Rust => install_rust(stage, job)?,
+        ServerId::Clangd => install_clangd(stage, job)?,
         ServerId::Go => {
             let go = runtime("go", &pref, stage)?;
             run(
@@ -468,7 +485,7 @@ fn install(root: &Path, server: ServerId, job: &Job) -> Result<()> {
                 job,
             )?;
         }
-        ServerId::TypeScript | ServerId::Python => {
+        server if server.uses_node() => {
             let node = runtime("node", &pref, stage)?;
             let mut npm = npm_command(&node)?;
             let (manifest, lock) = npm_files(server);
@@ -489,6 +506,7 @@ fn install(root: &Path, server: ServerId, job: &Job) -> Result<()> {
                 job,
             )?;
         }
+        _ => unreachable!("all catalog servers have an installation recipe"),
     }
     ensure!(!job.cancel.load(Ordering::SeqCst), "Cancelled");
     ensure!(
@@ -496,26 +514,40 @@ fn install(root: &Path, server: ServerId, job: &Job) -> Result<()> {
         "Package did not contain its expected executable"
     );
     // Probe before publication, from a neutral directory, with no project configuration.
-    let probe = if matches!(server, ServerId::TypeScript | ServerId::Python) {
+    let probe = if server.uses_node() {
         runtime("node", &pref, stage)?
     } else {
         stage.join(entry(server))
     };
     let mut cmd = Command::new(probe);
     cmd.current_dir(stage);
-    if matches!(server, ServerId::TypeScript | ServerId::Python) {
-        // The Python language-server entry does not expose a version flag; use its CLI sibling.
-        cmd.arg(if server == ServerId::Python {
-            stage.join("node_modules/basedpyright/index.js")
+    if matches!(
+        server,
+        ServerId::Html | ServerId::Css | ServerId::Json | ServerId::Yaml | ServerId::Bash
+    ) {
+        // These servers have no version CLI. Check that Node can load the
+        // installed package before publishing; protocol checks use the live test.
+        cmd.args(["-e", "console.log(require(process.argv[1]).version)"])
+            .arg(stage.join(match server {
+                ServerId::Yaml => "node_modules/yaml-language-server/package.json",
+                ServerId::Bash => "node_modules/bash-language-server/package.json",
+                _ => "node_modules/vscode-langservers-extracted/package.json",
+            }));
+    } else {
+        if server.uses_node() {
+            // The Python language-server entry does not expose a version flag; use its CLI sibling.
+            cmd.arg(if server == ServerId::Python {
+                stage.join("node_modules/basedpyright/index.js")
+            } else {
+                stage.join(entry(server))
+            });
+        }
+        cmd.arg(if server == ServerId::Go {
+            "version"
         } else {
-            stage.join(entry(server))
+            "--version"
         });
     }
-    cmd.arg(if server == ServerId::Go {
-        "version"
-    } else {
-        "--version"
-    });
     process::run(
         &mut cmd,
         &job.cancel,
@@ -568,12 +600,98 @@ fn npm_files(server: ServerId) -> (&'static str, &'static str) {
             include_str!("../../../assets/language-servers/typescript/package.json"),
             include_str!("../../../assets/language-servers/typescript/package-lock.json"),
         ),
-        _ => (
+        ServerId::Python => (
             include_str!("../../../assets/language-servers/python/package.json"),
             include_str!("../../../assets/language-servers/python/package-lock.json"),
         ),
+        ServerId::Html | ServerId::Css | ServerId::Json => (
+            include_str!("../../../assets/language-servers/web/package.json"),
+            include_str!("../../../assets/language-servers/web/package-lock.json"),
+        ),
+        ServerId::Yaml => (
+            include_str!("../../../assets/language-servers/yaml/package.json"),
+            include_str!("../../../assets/language-servers/yaml/package-lock.json"),
+        ),
+        ServerId::Bash => (
+            include_str!("../../../assets/language-servers/bash/package.json"),
+            include_str!("../../../assets/language-servers/bash/package-lock.json"),
+        ),
+        _ => unreachable!("native servers do not have npm packages"),
     }
 }
+
+fn clangd_asset() -> Result<(&'static str, &'static str)> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        // The official mac archive contains a universal binary.
+        ("macos", "aarch64" | "x86_64") => Ok((
+            "mac",
+            "1082e6638223b785ca2daf0939f13afcd0bb95c84ee9a4bbaff4745365159253",
+        )),
+        ("linux", "x86_64") => Ok((
+            "linux",
+            "e53b1a96196095faedb7642cf64964f7fb9ad4a0c1f00dd2c172a3d9dcbafdfd",
+        )),
+        _ => bail!(
+            "Managed clangd is not available for this platform; install clangd and select its executable in Advanced settings"
+        ),
+    }
+}
+
+fn install_clangd(stage: &Path, job: &Job) -> Result<()> {
+    let (platform, sha) = clangd_asset()?;
+    let curl = find_executable("curl").context("curl is required to download clangd")?;
+    let unzip = find_executable("unzip").context("unzip is required to install clangd")?;
+    let archive = stage.join("server.zip");
+    run(
+        Command::new(curl)
+            .current_dir(stage)
+            .args([
+                "--fail",
+                "--location",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-time",
+                "300",
+                "--max-filesize",
+                "536870912",
+                "--output",
+            ])
+            .arg(&archive)
+            .arg(format!(
+                "https://github.com/clangd/clangd/releases/download/{0}/clangd-{platform}-{0}.zip",
+                version(ServerId::Clangd)
+            )),
+        job,
+    )?;
+    use sha2::{Digest, Sha256};
+    let mut file = File::open(&archive)?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut file, &mut digest)?;
+    ensure!(
+        format!("{:x}", digest.finalize()) == sha,
+        "clangd checksum mismatch"
+    );
+    // Only extract the pinned, checksum-verified official archive, into neutral
+    // staging. Keep its resource headers beside bin/clangd for stdlib analysis.
+    run(
+        Command::new(unzip)
+            .current_dir(stage)
+            .arg("-q")
+            .arg(&archive),
+        job,
+    )?;
+    fs::remove_file(archive)?;
+    let unpacked = stage.join(format!("clangd_{}", version(ServerId::Clangd)));
+    for item in fs::read_dir(&unpacked)? {
+        let item = item?;
+        fs::rename(item.path(), stage.join(item.file_name()))?;
+    }
+    fs::remove_dir(unpacked)?;
+    Ok(())
+}
+
 fn install_rust(stage: &Path, job: &Job) -> Result<()> {
     let (target, sha) = rust_asset()?;
     let url = format!(
@@ -649,6 +767,61 @@ fn rust_asset() -> Result<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn common_managed_servers_resolve_the_expected_entry_and_runtime() {
+        let data = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let node = data.path().join("node");
+        fs::write(&node, "fixture").unwrap();
+        for server in [
+            ServerId::Clangd,
+            ServerId::Html,
+            ServerId::Css,
+            ServerId::Json,
+            ServerId::Yaml,
+            ServerId::Bash,
+        ] {
+            let package = package(data.path(), server, version(server)).unwrap();
+            let executable = package.join(entry(server));
+            fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            fs::write(&executable, "fixture").unwrap();
+            publish(
+                data.path(),
+                server,
+                &Receipt {
+                    active: version(server).into(),
+                    previous: None,
+                },
+            )
+            .unwrap();
+            let mut pref = Preference {
+                runtime: Some(node.clone()),
+                ..Default::default()
+            };
+            let launch = resolve(Some(data.path()), checkout.path(), server, &pref).unwrap();
+            if server.uses_node() {
+                assert_eq!(launch.program, node);
+                assert_eq!(
+                    launch.args,
+                    vec![
+                        executable.into_os_string(),
+                        if server == ServerId::Bash {
+                            "start"
+                        } else {
+                            "--stdio"
+                        }
+                        .into()
+                    ]
+                );
+                pref.runtime = Some(data.path().join("missing-node"));
+                assert!(resolve(Some(data.path()), checkout.path(), server, &pref).is_err());
+            } else {
+                assert_eq!(launch.program, executable);
+                assert!(launch.args.is_empty());
+            }
+            assert!(launch.lease.is_some());
+        }
+    }
     /// Opt-in network/install test. Packages and projects live only in a disposable
     /// directory (or the explicitly supplied test cache), never the user's store.
     #[test]
@@ -724,7 +897,7 @@ mod tests {
 
     #[test]
     fn npm_locks_pin_every_download_to_integrity_checked_registry_tarballs() {
-        for server in [ServerId::TypeScript, ServerId::Python] {
+        for server in ServerId::ALL.into_iter().filter(|s| s.uses_node()) {
             let (_, lock) = npm_files(server);
             let lock: Value = serde_json::from_str(lock).unwrap();
             for (name, package) in lock["packages"].as_object().unwrap() {
@@ -748,6 +921,235 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "downloads pinned packages and requires curl/unzip, Node/npm, and a Swift toolchain"]
+    fn common_servers_live_smoke() {
+        // YAML's glob matcher excludes dot directories. tempfile's default
+        // .tmp prefix would prevent an ordinary *.yaml schema from matching.
+        let temp = tempfile::Builder::new()
+            .prefix("devcroft-lsp-smoke-")
+            .tempdir()
+            .unwrap();
+        let root = std::env::var_os("DEVCROFT_LSP_SMOKE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().join("data"));
+        fs::create_dir_all(&root).unwrap();
+        // A version-manager shim can exist without an installed tool.
+        let shellcheck_available = find_executable("shellcheck").is_some_and(|path| {
+            process::run(
+                Command::new(path).arg("--version").current_dir(temp.path()),
+                &AtomicBool::new(false),
+                Duration::from_secs(5),
+                Log::default(),
+            )
+            .is_ok()
+        });
+        for (server, name, text, hover_token, completion_text, invalid) in [
+            (
+                ServerId::Clangd,
+                "main.cpp",
+                "int add(int value) { return value; }\nint main() { return add(1); }\n",
+                "add(1)",
+                "int main() { ret",
+                Some("int main() { int value = ; }\n"),
+            ),
+            (
+                ServerId::Clangd,
+                "main.c",
+                "int add(int value) { return value; }\nint main() { return add(1); }\n",
+                "add(1)",
+                "int main() { ret",
+                Some("int main() { int value = ; }\n"),
+            ),
+            (
+                ServerId::Html,
+                "index.html",
+                "<html><body><button title=\"hello\">Hello</button></body></html>\n",
+                "button",
+                "<html><body><bu",
+                None,
+            ),
+            (
+                ServerId::Css,
+                "style.css",
+                "button { color: red; }\n",
+                "color",
+                "button { col",
+                Some("button { color red; }\n"),
+            ),
+            (
+                ServerId::Json,
+                "config.json",
+                "{\"enabled\": true}\n",
+                "enabled",
+                "{\"ena",
+                Some("{\"enabled\": \"wrong type\"}\n"),
+            ),
+            (
+                ServerId::Yaml,
+                "config.yaml",
+                "enabled: true\n",
+                "enabled",
+                "ena",
+                Some("enabled: wrong-type\n"),
+            ),
+            (
+                ServerId::Bash,
+                "run.sh",
+                "greet() { echo hello; }\ngreet\n",
+                "greet\n",
+                "greet() { echo hello; }\ngre",
+                Some("if then\n"),
+            ),
+            (
+                ServerId::Swift,
+                "main.swift",
+                "func add(_ value: Int) -> Int { return value }\nlet result = add(1)\n",
+                "add(1)",
+                "func add(_ value: Int) -> Int { return value }\nlet result = ad",
+                Some("let value: Int = \"wrong type\"\n"),
+            ),
+        ] {
+            // Bash delegates diagnostics to the optional ShellCheck binary.
+            let invalid = invalid.filter(|_| server != ServerId::Bash || shellcheck_available);
+            let job = Job {
+                busy: true,
+                cancellable: true,
+                status: String::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                log: Log::default(),
+            };
+            if server.has_managed_install() {
+                let lock = operation_lock(&root, server).unwrap();
+                install(&root, server, &job)
+                    .unwrap_or_else(|e| panic!("{} installation: {e:#}", server.id()));
+                drop(lock);
+            }
+            let project = temp.path().join(name.replace('.', "-"));
+            fs::create_dir_all(&project).unwrap();
+            let project = project.canonicalize().unwrap();
+            let path = project.join(name);
+            fs::write(&path, text).unwrap();
+            let schema = serde_json::json!({"type":"object", "properties":{"enabled":{"type":"boolean", "description":"Enable this feature"}}});
+            let settings = if server == ServerId::Json {
+                serde_json::json!({"json":{"schemas":[{"fileMatch":["*.json"],"schema":schema}]}})
+            } else if server == ServerId::Yaml {
+                let schema_path = project.join("schema.json");
+                fs::write(&schema_path, schema.to_string()).unwrap();
+                let uri = super::super::file_uri(&schema_path).unwrap();
+                serde_json::json!({"yaml":{"schemas":{uri.as_str():["*.yaml"]}}})
+            } else {
+                Value::Null
+            };
+            let pref = Preference {
+                settings,
+                ..Default::default()
+            };
+            let spec = resolve(Some(&root), &project, server, &pref).unwrap();
+            let (tx, rx) = async_channel::bounded(128);
+            let client = super::super::Client::launch(spec, &project, tx)
+                .unwrap_or_else(|e| panic!("{} initialize: {e:#}", server.id()));
+            let uri = super::super::file_uri(&path).unwrap();
+            client
+                .did_open(&uri, crate::editor::languages::detect(&path).id, text)
+                .unwrap();
+            let position = |source: &str, offset: usize| {
+                let prefix = &source[..offset];
+                lsp_types::Position::new(
+                    prefix.bytes().filter(|b| *b == b'\n').count() as u32,
+                    prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
+                )
+            };
+            let at = position(text, text.find(hover_token).unwrap() + 1);
+            let mut hovered = false;
+            for _ in 0..40 {
+                if client
+                    .hover(&uri, client.doc_version(uri.as_str()), at)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    hovered = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if !hovered {
+                let mut diagnostics = Vec::new();
+                while let Ok(event) = rx.try_recv() {
+                    diagnostics.push(format!("{:?}", event.diagnostics));
+                }
+                panic!(
+                    "{name}: hover missing; settings={:?}; diagnostics={diagnostics:?}; error={:?}; logs={}",
+                    pref.settings,
+                    client.last_error(),
+                    client.logs()
+                );
+            }
+            if matches!(server, ServerId::Clangd | ServerId::Swift) {
+                assert!(
+                    !client
+                        .definition(&uri, client.doc_version(uri.as_str()), at)
+                        .unwrap()
+                        .is_empty(),
+                    "{name}: definition missing"
+                );
+            }
+            let version = client.did_change(uri.as_str(), completion_text).unwrap();
+            let completion = client
+                .completion(
+                    &uri,
+                    version,
+                    position(completion_text, completion_text.len()),
+                    lsp_types::CompletionContext {
+                        trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                        trigger_character: None,
+                    },
+                )
+                .unwrap();
+            assert!(
+                match completion {
+                    lsp_types::CompletionResponse::Array(items) => !items.is_empty(),
+                    lsp_types::CompletionResponse::List(list) => !list.items.is_empty(),
+                },
+                "{name}: completion empty: {}",
+                client.logs()
+            );
+            if let Some(invalid) = invalid {
+                let version = client.did_change(uri.as_str(), invalid).unwrap();
+                let until = std::time::Instant::now() + Duration::from_secs(15);
+                let mut diagnostic = false;
+                while std::time::Instant::now() < until {
+                    if let Ok(event) = rx.try_recv()
+                        && event.uri == uri.as_str()
+                        && event.version.is_none_or(|v| v == version)
+                        && !event.diagnostics.is_empty()
+                    {
+                        diagnostic = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                assert!(diagnostic, "{name}: diagnostics missing: {}", client.logs());
+            }
+            client.did_close(uri.as_str());
+            client.shutdown();
+            eprintln!(
+                "{name}: {}, initialize, hover, completion{} passed",
+                if server.has_managed_install() {
+                    "managed install"
+                } else {
+                    "toolchain launch"
+                },
+                if invalid.is_some() {
+                    ", diagnostics"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "downloads pinned language servers and needs Node/npm, Go and curl"]
     fn managed_servers_live_smoke() {
         let temp = tempfile::tempdir().unwrap();
@@ -755,7 +1157,12 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(|| temp.path().join("data"));
         fs::create_dir_all(&root).unwrap();
-        for server in ServerId::ALL {
+        for server in [
+            ServerId::Rust,
+            ServerId::Go,
+            ServerId::TypeScript,
+            ServerId::Python,
+        ] {
             let job = Job {
                 busy: true,
                 cancellable: true,
@@ -796,6 +1203,7 @@ mod tests {
                     "def add(a: int) -> int:\n    return a\n\nvalue = add(1)\n",
                     ("pyrightconfig.json", "{\"typeCheckingMode\":\"standard\"}"),
                 ),
+                _ => unreachable!("new servers have their own capability-specific smoke test"),
             };
             fs::write(project.join(manifest.0), manifest.1).unwrap();
             let path = project.join(name);

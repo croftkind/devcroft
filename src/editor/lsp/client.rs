@@ -218,7 +218,7 @@ impl Client {
                     "workspace": {"configuration":true,"workspaceFolders":true},
                     "textDocument": {
                         "synchronization": {"didSave": true},
-                        "completion": { "contextSupport": true },
+                        "completion": { "contextSupport": true, "completionItem": {"snippetSupport": true} },
                         "hover": { "contentFormat": ["markdown", "plaintext"] },
                         "definition": {},
                         "publishDiagnostics": {
@@ -517,7 +517,14 @@ impl Client {
         if result.is_null() {
             return Ok(lsp_types::CompletionResponse::Array(Vec::new()));
         }
-        serde_json::from_value(result).context("Language server sent an invalid completion")
+        let mut response: lsp_types::CompletionResponse =
+            serde_json::from_value(result).context("Language server sent an invalid completion")?;
+        let items = match &mut response {
+            lsp_types::CompletionResponse::Array(items) => items,
+            lsp_types::CompletionResponse::List(list) => &mut list.items,
+        };
+        items.retain_mut(super::snippet::normalize);
+        Ok(response)
     }
 
     /// Best-effort `shutdown` + `exit`. The transport's drop kills and reaps

@@ -3215,154 +3215,156 @@ impl Render for NativeEditor {
         let browser = self.render_browser(window, cx);
         let tabs = self.render_tabs(cx);
         let actions = self.render_editor_menu(cx).into_any_element();
-        let code =
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .min_h_0()
-                .overflow_hidden()
-                .bg(rgb(0x0c0e10))
-                .child(
+        let code = v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .min_h_0()
+            .overflow_hidden()
+            .bg(rgb(0x0c0e10))
+            .child(
+                h_flex()
+                    .debug_selector(|| "native-toolbar".into())
+                    .h(px(44.))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(rgb(0x202328))
+                    .child(tabs)
+                    .when(self.supports_markdown_preview(), |bar| {
+                        bar.child(
+                            Button::new("native-markdown-preview-toggle")
+                                .debug_selector(|| "native-markdown-preview-toggle".into())
+                                .small()
+                                .ghost()
+                                .label(if self.markdown_preview.is_some() {
+                                    "Code"
+                                } else {
+                                    "Preview"
+                                })
+                                .accessibility_label("Toggle Markdown preview (navigation mode: p)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_markdown_preview(window, cx)
+                                })),
+                        )
+                    })
+                    .child(actions),
+            )
+            .when_some(self.close_pending.clone(), |view, path| {
+                view.child(
                     h_flex()
-                        .debug_selector(|| "native-toolbar".into())
-                        .h(px(44.))
-                        .flex_shrink_0()
-                        .border_b_1()
-                        .border_color(rgb(0x202328))
-                        .child(tabs)
-                        .when(self.supports_markdown_preview(), |bar| {
-                            bar.child(
-                                Button::new("native-markdown-preview-toggle")
-                                    .debug_selector(|| "native-markdown-preview-toggle".into())
-                                    .small()
-                                    .ghost()
-                                    .label(if self.markdown_preview.is_some() {
-                                        "Code"
-                                    } else {
-                                        "Preview"
-                                    })
-                                    .accessibility_label(
-                                        "Toggle Markdown preview (navigation mode: p)",
-                                    )
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_markdown_preview(window, cx)
-                                    })),
-                            )
-                        })
-                        .child(actions),
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_sm().child(format!(
+                            "Save changes to {} before closing?",
+                            path.display()
+                        )))
+                        .child(
+                            Button::new("native-close-save")
+                                .label("Save")
+                                .primary()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(CloseChoice::Save, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-close-discard")
+                                .label("Discard")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(CloseChoice::Discard, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-close-cancel")
+                                .label("Cancel")
+                                .ghost()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_close(CloseChoice::Cancel, window, cx)
+                                })),
+                        ),
                 )
-                .when_some(self.close_pending.clone(), |view, path| {
-                    view.child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_sm().child(format!(
-                                "Save changes to {} before closing?",
-                                path.display()
-                            )))
-                            .child(
-                                Button::new("native-close-save")
-                                    .label("Save")
-                                    .primary()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.confirm_close(CloseChoice::Save, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("native-close-discard")
-                                    .label("Discard")
-                                    .outline()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.confirm_close(CloseChoice::Discard, window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("native-close-cancel")
-                                    .label("Cancel")
-                                    .ghost()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.confirm_close(CloseChoice::Cancel, window, cx)
-                                    })),
-                            ),
-                    )
-                })
-                .when_some(self.error.clone(), |view, error| {
-                    view.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
-                })
-                .when_some(self.disk_notice.clone(), |view, notice| {
-                    view.child(div().text_sm().text_color(rgb(0x60a5fa)).child(notice))
-                })
-                .when(self.conflict, |view| {
-                    view.child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().text_sm().text_color(rgb(0xfbbf24)).child(
+            })
+            .when_some(self.error.clone(), |view, error| {
+                view.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
+            })
+            .when_some(self.disk_notice.clone(), |view, notice| {
+                view.child(div().text_sm().text_color(rgb(0x60a5fa)).child(notice))
+            })
+            .when(self.conflict, |view| {
+                view.child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div().text_sm().text_color(rgb(0xfbbf24)).child(
                                 "This file changed on disk and the buffer has unsaved changes.",
-                            ))
-                            .child(
-                                Button::new("native-reload-file")
-                                    .label("Reload from disk")
-                                    .outline()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.reload_from_disk(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("native-compare-file")
-                                    .label("Compare")
-                                    .outline()
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| this.compare_with_disk(cx)),
-                                    ),
                             ),
-                    )
-                })
-                .when_some(self.disk_comparison.clone(), |view, comparison| {
-                    view.child(
-                        v_flex()
-                            .max_h(px(220.))
-                            .overflow_y_scrollbar()
-                            .p_2()
-                            .border_1()
-                            .border_color(rgb(0x454545))
-                            .child(div().text_sm().child("Disk → draft"))
-                            .child(div().text_xs().child(comparison)),
-                    )
-                })
-                .child(
-                    div()
-                        .debug_selector(|| "native-code-pane".into())
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .when(self.markdown_preview.is_none(), |pane| pane.pt_2())
-                        .child(if let Some(preview) = &self.markdown_preview {
-                            preview.clone().into_any_element()
-                        } else {
-                            Editor::new(&self.editor)
-                                .h_full()
-                                .appearance(false)
-                                .into_any_element()
-                        }),
+                        )
+                        .child(
+                            Button::new("native-reload-file")
+                                .label("Reload from disk")
+                                .outline()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reload_from_disk(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-compare-file")
+                                .label("Compare")
+                                .outline()
+                                .on_click(cx.listener(|this, _, _, cx| this.compare_with_disk(cx))),
+                        ),
                 )
-                .when_some(self.installation_offer(), |v, server| {
-                    let job = self
-                        .lsp_data_root
-                        .as_deref()
-                        .and_then(|r| install::job(r, server));
-                    let busy = job.as_ref().is_some_and(|j| j.busy);
-                    v.child(
-                        h_flex()
-                            .gap_2()
-                            .px_3()
-                            .py_2()
-                            .child(div().text_xs().child(job.map(|j| j.status).unwrap_or_else(
-                                || format!("Add {} completion and diagnostics?", server.label()),
-                            )))
-                            .child(
+            })
+            .when_some(self.disk_comparison.clone(), |view, comparison| {
+                view.child(
+                    v_flex()
+                        .max_h(px(220.))
+                        .overflow_y_scrollbar()
+                        .p_2()
+                        .border_1()
+                        .border_color(rgb(0x454545))
+                        .child(div().text_sm().child("Disk → draft"))
+                        .child(div().text_xs().child(comparison)),
+                )
+            })
+            .child(
+                div()
+                    .debug_selector(|| "native-code-pane".into())
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .when(self.markdown_preview.is_none(), |pane| pane.pt_2())
+                    .child(if let Some(preview) = &self.markdown_preview {
+                        preview.clone().into_any_element()
+                    } else {
+                        Editor::new(&self.editor)
+                            .h_full()
+                            .appearance(false)
+                            .into_any_element()
+                    }),
+            )
+            .when_some(self.installation_offer(), |v, server| {
+                let job = self
+                    .lsp_data_root
+                    .as_deref()
+                    .and_then(|r| install::job(r, server));
+                let busy = job.as_ref().is_some_and(|j| j.busy);
+                v.child(
+                    h_flex()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .child(job.map(|j| j.status).unwrap_or_else(|| {
+                                    format!("Add {} completion and diagnostics?", server.label())
+                                })),
+                        )
+                        .when(server.has_managed_install(), |offer| {
+                            offer.child(
                                 Button::new("install-language-server")
                                     .small()
                                     .label(if busy { "Installing…" } else { "Install" })
@@ -3373,62 +3375,67 @@ impl Render for NativeEditor {
                                         cx.notify();
                                     })),
                             )
-                            .child(
-                                Button::new("use-existing-language-server")
-                                    .small()
-                                    .ghost()
-                                    .label("Use existing")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_language_servers(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("dismiss-language-server")
-                                    .small()
-                                    .ghost()
-                                    .label("Not now")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.lsp_dismissed.insert(server);
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                })
-                .child(
-                    h_flex()
-                        .h(px(24.))
-                        .flex_shrink_0()
-                        .px_3()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(rgb(0x727985))
-                        .border_t_1()
-                        .border_color(rgb(0x202328))
-                        .child(div().flex_1().min_w_0().overflow_hidden().child(label))
-                        .when(self.dirty, |row| row.child("Modified"))
+                        })
                         .child(
-                            div()
-                                .max_w(px(420.))
-                                .text_ellipsis()
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        if !this.lsp_trusted
-                                            && this.path.as_ref().is_some_and(|p| {
-                                                super::languages::detect(p).server.is_some()
-                                            })
-                                        {
-                                            this.open_trust_dialog(window, cx);
-                                        } else {
-                                            this.open_language_servers(window, cx);
-                                        }
-                                    }),
-                                )
-                                .child(self.lsp_status.clone()),
+                            Button::new("use-existing-language-server")
+                                .small()
+                                .ghost()
+                                .label(if server == ServerId::Swift {
+                                    "Set up Swift"
+                                } else {
+                                    "Use existing"
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_language_servers(window, cx)
+                                })),
                         )
-                        .child("UTF-8"),
-                );
+                        .child(
+                            Button::new("dismiss-language-server")
+                                .small()
+                                .ghost()
+                                .label("Not now")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.lsp_dismissed.insert(server);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(
+                h_flex()
+                    .h(px(24.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(0x727985))
+                    .border_t_1()
+                    .border_color(rgb(0x202328))
+                    .child(div().flex_1().min_w_0().overflow_hidden().child(label))
+                    .when(self.dirty, |row| row.child("Modified"))
+                    .child(
+                        div()
+                            .max_w(px(420.))
+                            .text_ellipsis()
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    if !this.lsp_trusted
+                                        && this.path.as_ref().is_some_and(|p| {
+                                            super::languages::detect(p).server.is_some()
+                                        })
+                                    {
+                                        this.open_trust_dialog(window, cx);
+                                    } else {
+                                        this.open_language_servers(window, cx);
+                                    }
+                                }),
+                            )
+                            .child(self.lsp_status.clone()),
+                    )
+                    .child("UTF-8"),
+            );
         let finder = self.render_file_finder(cx);
         h_flex()
             .relative()

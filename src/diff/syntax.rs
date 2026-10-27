@@ -233,6 +233,15 @@ pub(super) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("");
+    // Keep C/C++ header and alternate suffix identities consistent with the
+    // editor, including uppercase .C (C++, unlike lowercase .c).
+    match extension {
+        "c" | "h" => return syntax_by_name("C"),
+        "C" | "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "H" => {
+            return syntax_by_name("C++");
+        }
+        _ => {}
+    }
     SYNTAXES
         .find_syntax_by_extension(file_name)
         .or_else(|| SYNTAXES.find_syntax_by_extension(extension))
@@ -383,6 +392,109 @@ mod tests {
                 Some("TypeScriptReact"),
                 "{path} must resolve to TSX"
             );
+        }
+    }
+
+    #[test]
+    fn common_languages_highlight_review_changes_in_both_themes() {
+        for (paths, name, old, new, token) in [
+            (
+                "run.sh run.bash",
+                "Bourne Again Shell (bash)",
+                "if true; then echo \"before\"; fi\n",
+                "if true; then echo \"after\"; fi\n",
+                "if",
+            ),
+            (
+                "main.swift Module.swiftinterface",
+                "Swift",
+                "func before() -> Int { return 1 }\n",
+                "func after() -> Int { return 2 }\n",
+                "func",
+            ),
+            (
+                "main.c api.h",
+                "C",
+                "int main() { return 1; }\n",
+                "int main() { return 2; }\n",
+                "return",
+            ),
+            (
+                "main.cpp main.cc main.cxx main.C api.hpp api.hh api.hxx api.H main.c++ api.h++",
+                "C++",
+                "class Before { public: int value; };\n",
+                "class After { public: int value; };\n",
+                "class",
+            ),
+            (
+                "index.html index.htm",
+                "HTML",
+                "<button title=\"before\">Old</button>\n",
+                "<button title=\"after\">New</button>\n",
+                "button",
+            ),
+            (
+                "styles.css",
+                "CSS",
+                "button { color: red; }\n",
+                "button { color: blue; }\n",
+                "button",
+            ),
+            (
+                "package.json",
+                "JSON",
+                "{\"enabled\": false, \"count\": 1}\n",
+                "{\"enabled\": true, \"count\": 2}\n",
+                "enabled",
+            ),
+            (
+                "config.yaml config.yml",
+                "YAML",
+                "enabled: false\n",
+                "enabled: true\n",
+                "enabled",
+            ),
+        ] {
+            for path in paths.split_whitespace() {
+                assert_eq!(
+                    syntax_for_path(path).map(|s| s.name.as_str()),
+                    Some(name),
+                    "{path}"
+                );
+                let mut diff = rust_diff();
+                let (hunks, truncated) = super::super::model::diff_text(old, new);
+                diff.files[0].path = path.into();
+                diff.files[0].content = FileContent::Text { hunks, truncated };
+                let highlights = highlight(&diff);
+                let FileContent::Text { hunks, .. } = &diff.files[0].content else {
+                    unreachable!()
+                };
+                for dark in [false, true] {
+                    for (index, line) in hunks[0].lines.iter().enumerate() {
+                        assert!(matches!(line.tag, LineTag::Addition | LineTag::Deletion));
+                        let spans = highlights.line(dark, 0, 0, index);
+                        let start = line.text.find(token).unwrap();
+                        assert!(
+                            spans.iter().any(|span| span.range.start <= start
+                                && span.range.end >= start + token.len()),
+                            "{path} dark={dark} {:?}: {token} must be colored: {spans:?}",
+                            line.tag
+                        );
+                        for span in spans {
+                            assert!(line.text.get(span.range.clone()).is_some());
+                        }
+                    }
+                    assert!(
+                        !highlight_source(name, new, dark).is_empty(),
+                        "{name} Kit highlighting"
+                    );
+                }
+                assert_ne!(
+                    highlights.line(false, 0, 0, 0),
+                    highlights.line(true, 0, 0, 0),
+                    "{path} theme colors"
+                );
+            }
         }
     }
 

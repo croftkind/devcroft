@@ -12,16 +12,57 @@ pub(crate) enum ServerId {
     Go,
     TypeScript,
     Python,
+    Clangd,
+    Html,
+    Css,
+    Json,
+    Yaml,
+    Bash,
+    Swift,
 }
 
 impl ServerId {
-    pub const ALL: [Self; 4] = [Self::Rust, Self::Go, Self::TypeScript, Self::Python];
+    pub const ALL: [Self; 11] = [
+        Self::Rust,
+        Self::Go,
+        Self::TypeScript,
+        Self::Python,
+        Self::Clangd,
+        Self::Html,
+        Self::Css,
+        Self::Json,
+        Self::Yaml,
+        Self::Bash,
+        Self::Swift,
+    ];
+    pub fn uses_node(self) -> bool {
+        matches!(
+            self,
+            Self::TypeScript
+                | Self::Python
+                | Self::Html
+                | Self::Css
+                | Self::Json
+                | Self::Yaml
+                | Self::Bash
+        )
+    }
+    pub fn has_managed_install(self) -> bool {
+        self != Self::Swift
+    }
     pub fn id(self) -> &'static str {
         match self {
             Self::Rust => "rust-analyzer",
             Self::Go => "gopls",
             Self::TypeScript => "typescript-language-server",
             Self::Python => "basedpyright",
+            Self::Clangd => "clangd",
+            Self::Html => "vscode-html-language-server",
+            Self::Css => "vscode-css-language-server",
+            Self::Json => "vscode-json-language-server",
+            Self::Yaml => "yaml-language-server",
+            Self::Bash => "bash-language-server",
+            Self::Swift => "sourcekit-lsp",
         }
     }
     pub fn label(self) -> &'static str {
@@ -30,6 +71,13 @@ impl ServerId {
             Self::Go => "Go",
             Self::TypeScript => "JavaScript / TypeScript",
             Self::Python => "Python",
+            Self::Clangd => "C / C++",
+            Self::Html => "HTML",
+            Self::Css => "CSS",
+            Self::Json => "JSON",
+            Self::Yaml => "YAML",
+            Self::Bash => "Bash",
+            Self::Swift => "Swift",
         }
     }
     pub fn executable(self) -> &'static str {
@@ -40,7 +88,8 @@ impl ServerId {
     }
     pub fn args(self) -> Vec<std::ffi::OsString> {
         match self {
-            Self::TypeScript | Self::Python => vec!["--stdio".into()],
+            Self::Bash => vec!["start".into()],
+            server if server.uses_node() => vec!["--stdio".into()],
             _ => vec![],
         }
     }
@@ -57,6 +106,16 @@ impl ServerId {
             Self::Rust => json!({"rust-analyzer": self.initialization()}),
             Self::Python => {
                 json!({"basedpyright": {"analysis": {"diagnosticMode": "openFilesOnly"}}})
+            }
+            // The CSS server requests the whole section during validation;
+            // its upstream validator does not accept a null section.
+            Self::Css => json!({"css": {}}),
+            Self::Json => json!({"json": {"validate": {"enable": true}}}),
+            // Catalog downloads block YAML's configuration promise, including
+            // hover/completion, on slow or offline connections. Explicit schema
+            // associations work without them; users can opt into either catalog.
+            Self::Yaml => {
+                json!({"yaml": {"schemaStore": {"enable": false}, "kubernetesCRDStore": {"enable": false}}})
             }
             _ => json!({}),
         }
@@ -115,6 +174,17 @@ pub(crate) fn root_for(
                 "setup.cfg",
                 "setup.py",
             ],
+            ServerId::Clangd => &[
+                "compile_commands.json",
+                "compile_flags.txt",
+                ".clangd",
+                "CMakeLists.txt",
+            ],
+            ServerId::Html | ServerId::Css => &["package.json"],
+            ServerId::Swift => &["Package.swift", "compile_commands.json"],
+            // Config files commonly span a whole checkout; package manifests
+            // inside it do not establish a different JSON/YAML workspace.
+            ServerId::Json | ServerId::Yaml | ServerId::Bash => &[],
         };
         if nearest.is_none() && markers.iter().any(|m| dir.join(m).is_file()) {
             nearest = Some(dir.to_owned());
@@ -178,7 +248,7 @@ pub(crate) fn root_for(
                     })
                     .is_some_and(|a| a.iter().filter_map(Value::as_str).any(matches))
             }
-            ServerId::Python => false,
+            _ => false,
         };
         if workspace {
             return dir.to_owned();
@@ -200,6 +270,63 @@ pub(crate) fn merge_settings(base: &mut Value, extra: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn web_server_defaults_keep_validation_enabled() {
+        assert!(ServerId::Css.settings()["css"].is_object());
+        assert_eq!(
+            ServerId::Yaml.settings()["yaml"]["schemaStore"]["enable"],
+            false
+        );
+        assert_eq!(
+            ServerId::Yaml.settings()["yaml"]["kubernetesCRDStore"]["enable"],
+            false
+        );
+        assert_eq!(
+            ServerId::Json.settings()["json"]["validate"]["enable"],
+            true
+        );
+        assert!(!ServerId::Swift.has_managed_install());
+        assert!(!ServerId::Swift.uses_node());
+        assert_eq!(
+            ServerId::Bash.args(),
+            vec![std::ffi::OsString::from("start")]
+        );
+    }
+    #[test]
+    fn common_server_roots_are_bounded_and_respect_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let project = root.join("packages/app");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("CMakeLists.txt"), "project(fixture)").unwrap();
+        std::fs::write(project.join("package.json"), "{}").unwrap();
+        std::fs::write(project.join("Package.swift"), "// swift-tools-version: 6.0").unwrap();
+        for server in [
+            ServerId::Clangd,
+            ServerId::Html,
+            ServerId::Css,
+            ServerId::Json,
+            ServerId::Yaml,
+            ServerId::Bash,
+            ServerId::Swift,
+        ] {
+            let file = project.join("src/file");
+            let mut pref = Preference::default();
+            assert_eq!(
+                root_for(server, &file, &root, &pref),
+                if matches!(server, ServerId::Json | ServerId::Yaml | ServerId::Bash) {
+                    &root
+                } else {
+                    &project
+                }
+                .to_owned()
+            );
+            pref.roots.insert(root.clone(), project.join("src"));
+            assert_eq!(root_for(server, &file, &root, &pref), project.join("src"));
+            pref.roots.insert(root.clone(), std::env::temp_dir());
+            assert!(root_for(server, &file, &root, &pref).starts_with(&root));
+        }
+    }
     #[test]
     fn cargo_excluded_project_is_not_owned_by_ancestor_workspace() {
         let d = tempfile::tempdir().unwrap();

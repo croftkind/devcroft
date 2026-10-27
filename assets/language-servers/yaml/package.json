@@ -1,0 +1,8 @@
+{
+  "name": "devcroft-yaml-language-server",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "yaml-language-server": "2.0.0"
+  }
+}
