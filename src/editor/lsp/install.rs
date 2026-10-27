@@ -279,6 +279,30 @@ pub(crate) fn installed(root: &Path, server: ServerId) -> Result<Option<String>>
     Ok(receipt(root, server)?.map(|r| r.active))
 }
 
+pub(crate) struct ManagedInstallation {
+    pub version: String,
+    pub executable: PathBuf,
+    pub previous_version: Option<String>,
+}
+
+pub(crate) fn managed_installation(
+    root: &Path,
+    server: ServerId,
+) -> Result<Option<ManagedInstallation>> {
+    let Some(receipt) = receipt(root, server)? else {
+        return Ok(None);
+    };
+    let executable = package(root, server, &receipt.active)?.join(entry(server));
+    let previous_version = receipt.previous.filter(|version| {
+        package(root, server, version).is_ok_and(|dir| dir.join(entry(server)).is_file())
+    });
+    Ok(Some(ManagedInstallation {
+        version: receipt.active,
+        executable,
+        previous_version,
+    }))
+}
+
 #[derive(Clone)]
 pub(crate) struct Job {
     pub busy: bool,
@@ -905,5 +929,31 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve(None, d.path(), ServerId::Rust, &p).is_err());
+    }
+    #[test]
+    fn managed_installation_tracks_active_files_and_available_previous_version() {
+        let root = tempfile::tempdir().unwrap();
+        let server = ServerId::Rust;
+        publish(
+            root.path(),
+            server,
+            &Receipt {
+                active: "current".into(),
+                previous: Some("previous".into()),
+            },
+        )
+        .unwrap();
+        let missing = managed_installation(root.path(), server).unwrap().unwrap();
+        assert!(!missing.executable.is_file());
+        assert!(missing.previous_version.is_none());
+        for version in ["current", "previous"] {
+            let dir = package(root.path(), server, version).unwrap();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(entry(server)), "fixture").unwrap();
+        }
+        let installed = managed_installation(root.path(), server).unwrap().unwrap();
+        assert!(installed.executable.is_file());
+        assert_eq!(installed.version, "current");
+        assert_eq!(installed.previous_version.as_deref(), Some("previous"));
     }
 }

@@ -1364,13 +1364,7 @@ impl Workspace {
             view.set_workspace(workspace);
             view.refresh_from_disk(window, cx);
         });
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("Settings")
-                .w(px(920.))
-                .h(px(600.))
-                .child(settings.clone().into_any_element())
-        });
+        crate::settings::SettingsView::open(settings, window, cx);
     }
 
     /// Open a developer tool as a modal dialog. The view is created once per

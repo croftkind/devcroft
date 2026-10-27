@@ -15,13 +15,14 @@
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
+use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::component::{StyledExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -169,6 +170,21 @@ pub(crate) struct SettingsView {
 }
 
 impl SettingsView {
+    pub(crate) fn open(settings: Entity<Self>, window: &mut Window, cx: &mut App) {
+        window.open_dialog(cx, move |dialog, _, _| {
+            let settings = settings.clone();
+            dialog
+                .title("Settings")
+                .w(px(920.))
+                .h(px(600.))
+                // Settings owns its scrolling. The default dialog body would
+                // scroll the sidebar and section header along with the content.
+                .content(move |content, _, _| {
+                    content.min_h_0().overflow_hidden().child(settings.clone())
+                })
+        });
+    }
+
     pub(crate) fn new(
         window: &mut Window,
         data_root: Option<DataRoot>,
@@ -1180,6 +1196,8 @@ impl SettingsView {
             .children(SettingsSection::ALL.into_iter().map(|section| {
                 let selected = section == self.active_section;
                 div()
+                    .id(format!("settings-section-{}", section.label()))
+                    .test_support()
                     .px_3()
                     .py_1p5()
                     .rounded_md()
@@ -1226,6 +1244,7 @@ impl SettingsView {
         v_flex()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .h_full()
             .overflow_hidden()
             .child(
@@ -2611,6 +2630,8 @@ impl Render for SettingsView {
         let track = self.focus_handle.clone();
         h_flex()
             .size_full()
+            .min_h_0()
+            .overflow_hidden()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .track_focus(&track)
@@ -2628,6 +2649,63 @@ impl Render for SettingsView {
 mod tests {
     use super::*;
     use gpui_kit::test::TestWindowExt as _;
+
+    struct DialogTestHost;
+    impl Render for DialogTestHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui_kit::test]
+    fn settings_sidebar_stays_fixed_while_editor_content_scrolls(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let settings = cx.new(|cx| {
+                SettingsView::new(
+                    window,
+                    None,
+                    DEFAULT_APP_FONT_SIZE,
+                    SyncTracker::default(),
+                    cx,
+                )
+            });
+            settings.update(cx, |settings, _| {
+                settings.active_section = SettingsSection::Editor
+            });
+            *slot.borrow_mut() = Some(settings);
+            let host = cx.new(|_| DialogTestHost);
+            gpui_kit::component::Root::new(host, window, cx)
+        });
+        test_cx.simulate_resize(gpui_kit::size(px(1000.), px(700.)));
+        let settings = holder.borrow().clone().unwrap();
+        test_cx.update(|window, cx| {
+            SettingsView::open(settings.clone(), window, cx);
+            window.render_frame(cx);
+            let sidebar = window.find("settings-section-General").bounds();
+            let first_card = window.find("default-editor-built_in").bounds();
+            window.scroll(
+                "default-editor-built_in",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-500.))),
+                cx,
+            );
+            assert_eq!(window.find("settings-section-General").bounds(), sidebar);
+            assert!(window.find("settings-section-Keybindings").visible());
+            assert!(window.find("default-editor-built_in").bounds().origin.y < first_card.origin.y);
+            assert!(window.find("check-external-editors").visible());
+            window.click("settings-section-General", cx);
+            assert_eq!(settings.read(cx).active_section, SettingsSection::General);
+            assert_eq!(window.find("settings-section-General").bounds(), sidebar);
+        });
+    }
 
     #[gpui_kit::test]
     fn editor_cards_preserve_selection_when_neovim_is_unavailable(
