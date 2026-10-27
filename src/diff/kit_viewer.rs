@@ -24,6 +24,21 @@ pub(crate) struct PreparedKitDiff {
 }
 
 impl PreparedKitDiff {
+    pub(crate) fn from_snapshot(file: &ChangedFile) -> Result<Vec<DiffFile>, String> {
+        Ok(Self::with_languages(patch::parse_snapshot(file)?))
+    }
+
+    fn with_languages(files: Vec<DiffFile>) -> Vec<DiffFile> {
+        files
+            .into_iter()
+            .map(|parsed| {
+                let language = syntax::syntax_for_path(parsed.path())
+                    .filter(|syntax| syntax.name != "Plain Text")
+                    .map_or("text", |syntax| syntax.name.as_str());
+                parsed.with_language(language)
+            })
+            .collect()
+    }
     #[cfg(test)]
     pub(crate) fn files(&self) -> &[DiffFile] {
         &self.files
@@ -35,17 +50,7 @@ impl PreparedKitDiff {
         new: &str,
         modes: [&str; 2],
     ) -> Result<Self, String> {
-        let files = patch::parse_file(&file, old, new, modes)?
-            .into_iter()
-            .map(|parsed| {
-                // Resolve exactly as Review does, including aliases Kit's
-                // built-in detector doesn't know and our vendored syntaxes.
-                let language = syntax::syntax_for_path(parsed.path())
-                    .filter(|syntax| syntax.name != "Plain Text")
-                    .map_or("text", |syntax| syntax.name.as_str());
-                parsed.with_language(language)
-            })
-            .collect();
+        let files = Self::with_languages(patch::parse_file(&file, old, new, modes)?);
         Ok(Self { file, files })
     }
 }
@@ -60,7 +65,6 @@ enum ViewerState {
 pub(crate) struct KitDiffViewer {
     diff: Entity<DiffState>,
     state: ViewerState,
-    wrap: bool,
     external_header: bool,
     syntax_dark: bool,
 }
@@ -68,7 +72,8 @@ pub(crate) struct KitDiffViewer {
 impl KitDiffViewer {
     #[cfg(test)]
     pub(crate) fn display_settings(&self, cx: &App) -> (DiffMode, bool) {
-        (self.diff.read(cx).mode(), self.wrap)
+        let mode = self.diff.read(cx).mode();
+        (mode, mode == DiffMode::Split)
     }
 
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
@@ -82,7 +87,6 @@ impl KitDiffViewer {
                     })
             }),
             state: ViewerState::Empty,
-            wrap: false,
             external_header: false,
             syntax_dark,
         }
@@ -146,18 +150,6 @@ impl KitDiffViewer {
                     .selected(mode == DiffMode::Split)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.set_mode(DiffMode::Split, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("git-diff-wrap")
-                    .small()
-                    .ghost()
-                    .label("Wrap")
-                    .selected(self.wrap)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.wrap = !this.wrap;
-                        this.focus_handle(cx).focus(window, cx);
-                        cx.notify();
                     })),
             )
             .child(
@@ -310,7 +302,7 @@ impl Render for KitDiffViewer {
                                 } else {
                                     Diff::new(&self.diff)
                                         .header_visible(!self.external_header)
-                                        .soft_wrap(self.wrap)
+                                        .soft_wrap(self.diff.read(cx).mode() == DiffMode::Split)
                                         .font_family(TERMINAL_FONT_FAMILY)
                                         .text_size(px(review_font_size()))
                                         .into_any_element()
@@ -440,12 +432,14 @@ mod tests {
             view.read_with(test_cx, |view, cx| {
                 assert_eq!(view.diff.entity_id(), diff_id);
                 assert_eq!(view.diff.read(cx).mode(), expected);
+                assert_eq!(
+                    view.display_settings(cx),
+                    (expected, expected == DiffMode::Split)
+                );
             });
             test_cx.update(|window, cx| assert!(view.read(cx).focus_handle(cx).is_focused(window)));
         }
-        test_cx.update(|window, cx| window.click("git-diff-wrap", cx));
-        test_cx.run_until_parked();
-        view.read_with(test_cx, |view, _| assert!(view.wrap));
+        test_cx.update(|window, _| assert!(window.try_find("git-diff-wrap").is_none()));
         test_cx.update(|window, cx| {
             window.click("git-diff-next", cx);
             window.press("home", cx);
@@ -477,7 +471,7 @@ mod tests {
                 assert_eq!(view.diff.entity_id(), diff_id);
                 assert_eq!(view.diff.read(cx).selected_lines(), Some(selection.clone()));
                 assert_eq!(view.diff.read(cx).mode(), DiffMode::Unified);
-                assert!(view.wrap);
+                assert_eq!(view.display_settings(cx), (DiffMode::Unified, false));
             });
         }
         let source = if selection.side() == DiffSide::Original {
@@ -514,7 +508,7 @@ mod tests {
             assert!(view.diff.read(cx).files().is_empty());
             assert!(view.diff.read(cx).selected_lines().is_none());
             assert_eq!(view.diff.read(cx).mode(), DiffMode::Unified);
-            assert!(view.wrap);
+            assert_eq!(view.display_settings(cx), (DiffMode::Unified, false));
         });
     }
 

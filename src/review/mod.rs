@@ -2,18 +2,19 @@
 //!
 //! [`git`] is the only module that talks to `gix`; [`model`] is the
 //! UI-ready diff model; [`tree`] builds the file-tree items; [`stream`]
-//! renders diff rows; [`icons`] resolves file-type icon art. [`ReviewView`]
-//! owns loading, scope selection, the tree/stream layout, viewed-file state,
+//! tracks logical comment-anchor rows; [`kit`] renders the diff; [`icons`]
+//! resolves file-type icon art. [`ReviewView`] owns loading, scope selection,
+//! the tree/diff layout, viewed-file state,
 //! and refresh.
 
 pub(crate) mod comments;
 mod feedback;
 pub(crate) mod git;
 pub(crate) mod icons;
+mod kit;
 pub(crate) mod model;
-// Crate-visible so the text diff tool renders and highlights its result with
-// the same rows and syntax machinery the review uses.
 pub(crate) mod stream;
+// Crate-visible for the text comparison tool's source highlighting.
 pub(crate) mod syntax;
 #[cfg(test)]
 mod tests;
@@ -21,14 +22,16 @@ mod tree;
 mod viewport;
 mod watch;
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName, StyledExt as _, h_flex,
+    ActiveTheme as _, Icon, IconName, StyledExt as _,
+    diff::{DiffFile, DiffState},
+    h_flex,
     list::ListItem,
     scroll::ScrollableElement as _,
     tab::{Tab, TabBar},
@@ -38,9 +41,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
-    MouseButton, ParentElement, Render, ScrollStrategy, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, div, img, list, px, rgb, svg,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement, Render,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    img, px, rgb, svg,
 };
 
 use crate::command_palette::{
@@ -50,7 +53,7 @@ use crate::command_palette::{
 use self::git::{ReviewScope, load_review, suggest_base_branch};
 use self::icons::{FALLBACK, ICON_PX, IconTiles, ensure_tiles, icon_key};
 use self::model::ReviewDiff;
-use self::stream::{RowRenderOptions, file_header_row, flatten, render_row, status_color};
+use self::stream::{flatten, status_color};
 use self::tree::{TreeRowMeta, build_file_tree, file_item_id, file_path_from_id};
 
 /// Lucide `message-square` outline, inlined because `gpui-kit-assets`
@@ -74,21 +77,20 @@ enum ReviewState {
 ///
 /// `rows` flattens every file section once per load (or per collapse toggle);
 /// `file_row_start[file]` is that file's first row (its header), so
-/// tree↔stream scrolling maps between file indices and row indices. `diff`
-/// and `syntax` are shared across collapse rebuilds so toggling a file never
-/// re-clones file text or highlight spans.
+/// comment anchors map between file indices and row indices. `diff`
+/// is shared across collapse rebuilds so toggling a file never re-clones text.
 #[derive(Clone)]
 pub(crate) struct LoadedReview {
     pub(crate) diff: Rc<ReviewDiff>,
     pub(crate) rows: Vec<stream::StreamRow>,
     pub(crate) file_row_start: Vec<usize>,
-    pub(crate) syntax: Rc<syntax::SyntaxHighlights>,
 }
 
 pub(crate) struct ReviewView {
     pub(crate) focus_handle: FocusHandle,
     tree_focus: FocusHandle,
-    stream_focus: FocusHandle,
+    diff_state: Entity<DiffState>,
+    syntax_dark: bool,
     comments_focus: FocusHandle,
     /// True while the Files sidebar or the tree inside it holds focus. The
     /// sidebar wrapper tracks `tree_focus`, but keyboard traversal focuses
@@ -121,11 +123,6 @@ pub(crate) struct ReviewView {
     /// every row render. Rasterizing here (not per frame) keeps scrolling
     /// smooth; the `Rc` lets the virtualized row closures share the cache.
     icon_tiles: Rc<IconTiles>,
-    list_handle: ListState,
-    editor_row: Cell<Option<usize>>,
-    comment_layout: RefCell<Vec<(String, u64)>>,
-    /// First visible logical row from ListState, used for tree scroll sync.
-    stream_top: Rc<Cell<usize>>,
     last_scrolled: Option<String>,
     /// Monotonic load id; stale background loads never overwrite newer state.
     generation: u64,
@@ -147,15 +144,12 @@ impl EventEmitter<OpenReviewFile> for ReviewView {}
 
 impl ReviewView {
     #[cfg(test)]
-    pub(crate) fn benchmark_list_state(&self) -> Option<(ListState, usize)> {
+    pub(crate) fn benchmark_file_count(&self) -> Option<usize> {
         match &self.state {
-            ReviewState::Loaded(loaded) => {
-                Some((self.list_handle.clone(), loaded.diff.files.len()))
-            }
+            ReviewState::Loaded(loaded) => Some(loaded.diff.files.len()),
             _ => None,
         }
     }
-
     pub(crate) fn open_file(&self, path: &str, line: Option<usize>, cx: &mut Context<Self>) {
         cx.emit(OpenReviewFile {
             path: path.to_owned(),
@@ -180,7 +174,8 @@ impl ReviewView {
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             tree_focus: cx.focus_handle(),
-            stream_focus: cx.focus_handle(),
+            diff_state: cx.new(kit::new_diff_state),
+            syntax_dark: cx.theme().is_dark(),
             comments_focus: cx.focus_handle(),
             tree_contains_focus: false,
             focus_listeners: None,
@@ -196,10 +191,6 @@ impl ReviewView {
             collapsed: Rc::default(),
             review_key: None,
             icon_tiles: Rc::default(),
-            list_handle: ListState::new(0, ListAlignment::Top, px(300.)),
-            editor_row: Cell::new(None),
-            comment_layout: RefCell::default(),
-            stream_top: Rc::default(),
             last_scrolled: None,
             generation: 0,
             load_in_flight: false,
@@ -209,6 +200,25 @@ impl ReviewView {
             open_error: None,
             editor_open_available: false,
         };
+        cx.observe(&view.diff_state, |_, _, cx| cx.notify())
+            .detach();
+        cx.subscribe(&view.diff_state, |this, _, event, cx| {
+            use gpui_kit::component::diff::DiffEvent;
+            match event {
+                DiffEvent::FileCollapsed(path)
+                    if !this.collapsed.borrow().contains(path.as_str()) =>
+                {
+                    this.toggle_collapsed(path, cx);
+                }
+                DiffEvent::FileExpanded(path)
+                    if this.collapsed.borrow().contains(path.as_str()) =>
+                {
+                    this.toggle_collapsed(path, cx);
+                }
+                _ => {}
+            }
+        })
+        .detach();
         view.reload(cx);
         view
     }
@@ -292,15 +302,17 @@ impl ReviewView {
                     let relocated_draft = draft_snapshot
                         .map(|anchor| feedback::relocate_draft(&cwd, &diff, anchor))
                         .transpose()?;
-                    let syntax = previous
+                    let files = previous
                         .as_ref()
                         .is_none_or(|previous| previous.files != diff.files)
-                        .then(|| syntax::highlight(&diff));
+                        .then(|| kit::prepare_files(&diff))
+                        .transpose()
+                        .map_err(anyhow::Error::msg)?;
                     let feedback = comments::Store::open(&cwd, &base, &remote, &scope, &diff)
                         .and_then(|store| feedback::refresh_comments(store, &cwd, &diff));
                     anyhow::Ok(Some((
                         diff,
-                        syntax,
+                        files,
                         feedback,
                         relocated_draft,
                         source_changed,
@@ -313,7 +325,7 @@ impl ReviewView {
                 }
                 view.load_in_flight = false;
                 match loaded {
-                    Ok(Some((diff, syntax, feedback, relocated_draft, source_changed))) => {
+                    Ok(Some((diff, files, feedback, relocated_draft, source_changed))) => {
                         // A draft selected while loading needs its own source
                         // snapshot. Retry rather than attaching it to stale lines.
                         if source_changed
@@ -328,7 +340,7 @@ impl ReviewView {
                         let comments_changed = view.load_comments(feedback);
                         let draft_changed =
                             view.apply_draft_anchor(draft.as_ref(), relocated_draft);
-                        view.apply_diff(diff, syntax, cx);
+                        view.apply_diff(diff, files, cx);
                         if comments_changed || draft_changed {
                             cx.notify();
                         }
@@ -350,13 +362,13 @@ impl ReviewView {
         .detach();
     }
 
-    pub(crate) fn navigation_panes(&self, _: &App) -> Vec<(&'static str, FocusHandle)> {
+    pub(crate) fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
         if !matches!(self.state, ReviewState::Loaded(_)) {
             return vec![("Review", self.focus_handle.clone())];
         }
         let mut panes = vec![
             ("Files", self.tree_focus.clone()),
-            ("Diff", self.stream_focus.clone()),
+            ("Diff", self.diff_state.focus_handle(cx)),
         ];
         if self.show_comments {
             panes.push(("Comments", self.comments_focus.clone()));
@@ -376,7 +388,7 @@ impl ReviewView {
             0 => self
                 .tree_state
                 .update(cx, |tree, cx| tree.focus(window, cx)),
-            1 => self.stream_focus.focus(window, cx),
+            1 => self.diff_state.focus_handle(cx).focus(window, cx),
             2 if self.show_comments => self.comments_focus.focus(window, cx),
             _ => {}
         }
@@ -420,29 +432,33 @@ impl ReviewView {
         });
     }
 
-    /// Scroll the Diff stream a few rows for navigation-mode `j`/`k` while
-    /// the Diff pane holds navigation focus. Keeps the mode open for repeats.
-    pub(crate) fn move_diff_scroll(&mut self, down: bool, _: &mut Context<Self>) {
-        let ReviewState::Loaded(loaded) = &self.state else {
-            return;
-        };
-        let total = loaded.rows.len() + 1;
-        if total == 0 {
-            return;
-        }
-        let top = self.list_handle.logical_scroll_top();
-        let current = top.item_ix.min(total.saturating_sub(1));
-        let next = crate::navigation::move_index(current, total, down);
-        // Step by a few rows per press so long diffs move at a readable pace;
-        // clamping (not wrapping) matches pane movement.
-        let stepped = if down {
-            next.saturating_add(2).min(total.saturating_sub(1))
+    /// Route navigation-mode scrolling to the focused Kit body. Kit's actions
+    /// are registered by name even though their Rust module is private.
+    pub(crate) fn move_diff_scroll(
+        &mut self,
+        down: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = if down {
+            "diff::ScrollDown"
         } else {
-            next.saturating_sub(2)
+            "diff::ScrollUp"
         };
-        self.list_handle.scroll_to(ListOffset {
-            item_ix: stepped,
-            offset_in_item: px(0.),
+        if let Ok(action) = cx.build_action(name, None) {
+            self.diff_state
+                .focus_handle(cx)
+                .dispatch_action(action.as_ref(), window, cx);
+        }
+    }
+
+    fn navigate_change(&mut self, down: bool, cx: &mut Context<Self>) {
+        self.diff_state.update(cx, |diff, cx| {
+            if down {
+                diff.next_change(cx)
+            } else {
+                diff.previous_change(cx)
+            }
         });
     }
 
@@ -474,14 +490,13 @@ impl ReviewView {
     fn apply_diff(
         &mut self,
         diff: ReviewDiff,
-        syntax: Option<syntax::SyntaxHighlights>,
+        files: Option<Vec<DiffFile>>,
         cx: &mut Context<Self>,
     ) {
         let previous = match &self.state {
             ReviewState::Loaded(loaded) => Some(loaded.clone()),
             _ => None,
         };
-        let top = self.list_handle.logical_scroll_top();
         let previous_collapsed = self.collapsed.borrow().clone();
         let previous_viewed = self.viewed.borrow().clone();
         let key = self.review_identity(&diff);
@@ -526,39 +541,20 @@ impl ReviewView {
             {
                 Rc::make_mut(loaded).diff = Rc::new(diff);
             }
-            if self.editor_row.get().is_some() {
-                let editor = self.inline_editor_row();
-                let previous = self.editor_row.replace(editor);
-                if previous != editor {
-                    for ix in [previous, editor].into_iter().flatten() {
-                        self.list_handle.splice(ix..ix + 1, 1);
-                    }
-                    self.list_handle.scroll_to(top);
-                }
-            }
             if label_changed || previous_viewed != *self.viewed.borrow() {
                 cx.notify();
             }
             return;
         }
-        let editor_was_visible = self.editor_row.get().is_some();
         let (items, metas) = build_file_tree(&diff.files);
         let (rows, file_row_start) = flatten(&diff, &self.collapsed.borrow());
         let loaded = Rc::new(LoadedReview {
             diff: Rc::new(diff),
             rows,
             file_row_start,
-            syntax: syntax.map(Rc::new).unwrap_or_else(|| {
-                previous
-                    .as_ref()
-                    .map(|loaded| loaded.syntax.clone())
-                    .unwrap_or_default()
-            }),
         });
-        self.list_handle.reset(loaded.rows.len() + 1);
-        if same_review && let Some(previous) = &previous {
-            self.list_handle
-                .scroll_to(viewport::restore(previous, &loaded, top));
+        if let Some(files) = files {
+            self.replace_diff_files(files, &loaded, same_review, cx);
         }
         let mut tiles = (*self.icon_tiles).clone();
         ensure_tiles(
@@ -568,11 +564,11 @@ impl ReviewView {
         );
         self.icon_tiles = Rc::new(tiles);
         self.tree_metas = Rc::new(metas);
-        let top = self.list_handle.logical_scroll_top().item_ix;
-        let selected = loaded
-            .rows
-            .get(top)
-            .map(|row| loaded.diff.files[row.file()].path.clone());
+        let selected = self
+            .last_scrolled
+            .clone()
+            .filter(|path| same_review && loaded.diff.files.iter().any(|file| &file.path == path))
+            .or_else(|| loaded.diff.files.first().map(|file| file.path.clone()));
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
             if let Some(path) = &selected {
@@ -581,14 +577,8 @@ impl ReviewView {
             }
         });
         self.last_scrolled = selected;
-        self.stream_top.set(top);
         self.state = ReviewState::Loaded(loaded);
-        // Reanchoring an existing draft is not a request to scroll to it.
-        self.editor_row.set(if same_review && editor_was_visible {
-            self.inline_editor_row()
-        } else {
-            None
-        });
+        self.sync_collapsed(cx);
         cx.notify();
     }
 
@@ -622,7 +612,8 @@ impl ReviewView {
                 collapsed.remove(path);
             }
         }
-        self.rebuild_rows_around(path, cx);
+        self.sync_collapsed(cx);
+        self.rebuild_rows(cx);
     }
 
     pub(crate) fn toggle_collapsed(&mut self, path: &str, cx: &mut Context<Self>) {
@@ -632,43 +623,20 @@ impl ReviewView {
                 collapsed.insert(path.to_owned());
             }
         }
-        self.rebuild_rows_around(path, cx);
+        self.sync_collapsed(cx);
+        self.rebuild_rows(cx);
     }
 
-    /// Re-flatten `rows` from the loaded diff plus the current `collapsed`
-    /// set, then restore the viewport on the given file header.
-    fn rebuild_rows_around(&mut self, path: &str, cx: &mut Context<Self>) {
-        let ReviewState::Loaded(loaded) = &self.state else {
-            cx.notify();
-            return;
-        };
-        let collapsed = self.collapsed.borrow().clone();
-        let (rows, file_row_start) = flatten(&loaded.diff, &collapsed);
-        let scroll_to = loaded
-            .diff
-            .files
-            .iter()
-            .position(|file| file.path == path)
-            .map(|file_ix| file_row_start[file_ix]);
-        self.state = ReviewState::Loaded(Rc::new(LoadedReview {
-            diff: loaded.diff.clone(),
-            rows,
-            file_row_start,
-            syntax: loaded.syntax.clone(),
-        }));
-        // The row count changed; reset virtualization then restore context on
-        // the toggled file header so the viewport doesn't jump elsewhere.
-        self.editor_row.set(None);
+    /// Logical rows are retained only for comment anchor lookup. Kit owns
+    /// the actual virtualized rows and preserves its viewport during folding.
+    fn rebuild_rows(&mut self, cx: &mut Context<Self>) {
         if let ReviewState::Loaded(loaded) = &self.state {
-            self.list_handle.reset(loaded.rows.len() + 1);
-            if let Some(item_ix) = scroll_to {
-                self.list_handle.scroll_to(ListOffset {
-                    item_ix,
-                    offset_in_item: px(0.),
-                });
-                self.stream_top.set(item_ix);
-                self.last_scrolled = Some(path.to_owned());
-            }
+            let (rows, file_row_start) = flatten(&loaded.diff, &self.collapsed.borrow());
+            self.state = ReviewState::Loaded(Rc::new(LoadedReview {
+                diff: loaded.diff.clone(),
+                rows,
+                file_row_start,
+            }));
         }
         cx.notify();
     }
@@ -721,20 +689,6 @@ impl ReviewView {
         }
     }
 
-    fn summary(&self) -> String {
-        match &self.state {
-            ReviewState::Loaded(loaded) => {
-                let additions: u32 = loaded.diff.files.iter().map(|file| file.additions).sum();
-                let deletions: u32 = loaded.diff.files.iter().map(|file| file.deletions).sum();
-                format!(
-                    "{} files · +{additions} −{deletions}",
-                    loaded.diff.files.len()
-                )
-            }
-            _ => String::new(),
-        }
-    }
-
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let scope_index = self.scope_tab as usize;
         let comment_tint = rgb(if self.show_comments {
@@ -779,16 +733,9 @@ impl ReviewView {
                     .child(self.base_label()),
             )
             .child(div().flex_1())
+            .child(self.render_diff_controls(cx))
             .map(|bar| {
                 bar.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_xs()
-                        .text_color(rgb(0x737878))
-                        .child(self.summary()),
-                )
-                .child(
                     h_flex()
                         .px_2()
                         .py_1()
@@ -960,16 +907,7 @@ impl ReviewView {
         .size_full()
     }
 
-    /// Keep tree selection and stream scroll in sync, in both directions.
-    ///
-    /// A fresh tree selection (click/keyboard) wins and scrolls the stream
-    /// to the file's first row. Otherwise the viewport wins: the file owning
-    /// the recorded top row becomes the tree selection (scroll-spy), and the
-    /// stream branch claims `last_scrolled` immediately — pinning the stream
-    /// to a lagging selection would yank the viewport backwards mid-scroll,
-    /// so the tree branch only ever fires for genuine tree interaction. The
-    /// two branches converge within one extra frame because each only fires
-    /// on a change.
+    /// A file selected in the tree scrolls the retained Kit diff directly.
     fn sync_tree_and_stream(&mut self, cx: &mut Context<Self>) {
         let selected = self
             .tree_state
@@ -977,210 +915,20 @@ impl ReviewView {
             .selected_entry()
             .and_then(|entry| file_path_from_id(&entry.item().id).map(str::to_owned));
         if selected != self.last_scrolled {
-            if let ReviewState::Loaded(loaded) = &self.state
-                && let Some(path) = &selected
-                && let Some(file) = loaded.diff.files.iter().position(|file| &file.path == path)
-            {
-                self.list_handle.scroll_to(ListOffset {
-                    item_ix: loaded.file_row_start[file],
-                    offset_in_item: px(0.),
-                });
+            if let Some(path) = &selected {
+                self.diff_state
+                    .update(cx, |diff, cx| diff.scroll_to_file(path, cx));
             }
             self.last_scrolled = selected;
-            return;
         }
-        if let ReviewState::Loaded(loaded) = &self.state {
-            let top = loaded
-                .rows
-                .get(self.stream_top.get())
-                .map(|row| loaded.diff.files[row.file()].path.clone());
-            if top != selected
-                && let Some(path) = top
-            {
-                // The viewport is already showing this file: claim it without
-                // scrolling so fast flings never fight the user's direction.
-                self.last_scrolled = Some(path.clone());
-                let id: SharedString = file_item_id(&path).into();
-                self.tree_state.update(cx, |state, cx| {
-                    state.set_selected_index(state.index_of(&id), cx);
-                    state.reveal_item(&id, ScrollStrategy::Center, cx);
-                });
-            }
-        }
-    }
-
-    /// File whose header should stick to the top of the diff pane, if any.
-    ///
-    /// Returns `None` when the stream is empty or when the viewport sits
-    /// exactly on a file header (the in-flow header is fully visible, so a
-    /// duplicate sticky bar would just double-render). Otherwise returns the
-    /// file owning the top visible row, GitHub PR style.
-    fn sticky_file_ix(&self, loaded: &LoadedReview) -> Option<usize> {
-        let top = self.list_handle.logical_scroll_top();
-        let row = loaded.rows.get(top.item_ix)?;
-        let file = row.file();
-        let at_header_top =
-            matches!(row, stream::StreamRow::FileHeader { .. }) && top.offset_in_item == px(0.);
-        if at_header_top { None } else { Some(file) }
-    }
-
-    fn render_sticky_header(
-        &self,
-        loaded: &Rc<LoadedReview>,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let file_ix = self.sticky_file_ix(loaded)?;
-        let file = &loaded.diff.files[file_ix];
-        let view = cx.entity();
-        Some(
-            div()
-                .flex_none()
-                .w_full()
-                .child(file_header_row(
-                    file,
-                    self.viewed.borrow().contains(&file.path),
-                    self.collapsed.borrow().contains(&file.path),
-                    &view,
-                    self.editor_open_available,
-                ))
-                .into_any_element(),
-        )
-    }
-
-    /// The virtualized diff stream: only the visible row window is built.
-    ///
-    /// Variable-height virtualization lets the editor live below its anchor.
-    fn render_stream(&self, loaded: &Rc<LoadedReview>, cx: &mut Context<Self>) -> impl IntoElement {
-        let revisions = self.comment_revisions();
-        if *self.comment_layout.borrow() != revisions {
-            *self.comment_layout.borrow_mut() = revisions;
-            let top = self.list_handle.logical_scroll_top();
-            self.list_handle.reset(loaded.rows.len() + 1);
-            self.list_handle.scroll_to(top);
-        }
-        let editor = self.inline_editor_row();
-        let previous = self.editor_row.replace(editor);
-        if previous != editor {
-            for ix in [previous, editor].into_iter().flatten() {
-                if ix <= loaded.rows.len() {
-                    self.list_handle.splice(ix..ix + 1, 1);
-                }
-            }
-            if let Some(ix) = editor {
-                self.list_handle.scroll_to(ListOffset {
-                    item_ix: ix.saturating_sub(3),
-                    offset_in_item: px(0.),
-                });
-            }
-        }
-        let loaded = loaded.clone();
-        let dark = cx.theme().is_dark();
-        let editor_open_available = self.editor_open_available;
-        let viewed = self.viewed.clone();
-        let collapsed = self.collapsed.clone();
-        let thread_groups = self.inline_thread_groups();
-        let view = cx.entity();
-        let weak = view.downgrade();
-        self.list_handle.set_scroll_handler(move |_, _, cx| {
-            let _ = weak.update(cx, |_, cx| cx.notify());
-        });
-        list(self.list_handle.clone(), move |ix, _window, cx| {
-            if ix == loaded.rows.len() {
-                return view.update(cx, |this, cx| {
-                    v_flex()
-                        .w_full()
-                        .p_3()
-                        .child(div().text_xs().text_color(rgb(0x858989)).child(
-                            if loaded.rows.is_empty() {
-                                "No changes in this scope. Saved review comments:"
-                            } else {
-                                "Comments outside the current diff"
-                            },
-                        ))
-                        .child(
-                            this.render_inline_threads(
-                                thread_groups
-                                    .get(&ix)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or_default(),
-                                cx,
-                            ),
-                        )
-                        .when(editor == Some(ix) && this.is_new_comment(), |item| {
-                            item.child(this.render_comment_editor(cx))
-                        })
-                        .into_any_element()
-                });
-            }
-            let row = loaded.rows[ix];
-            let (selected, count) = view.read(cx).line_feedback(row);
-            let target = view.clone();
-            let row_h = match row {
-                stream::StreamRow::FileHeader { .. } => stream::FILE_HEADER_H,
-                _ => stream::ROW_H,
-            };
-            let line = h_flex()
-                .debug_selector(move || format!("review-row-{ix}"))
-                .min_h(px(row_h))
-                .items_start()
-                .flex_none()
-                .w_full()
-                .when(selected, |d| d.bg(rgb(0x203442)))
-                .border_l_2()
-                .border_color(rgb(if selected {
-                    0x7dd3fc
-                } else if count > 0 {
-                    0xfbbf24
-                } else {
-                    0x090a0a
-                }))
-                .child(div().flex_1().min_w_0().child(render_row(
-                    &loaded,
-                    row,
-                    &viewed.borrow(),
-                    &collapsed.borrow(),
-                    &view,
-                    RowRenderOptions {
-                        selected,
-                        dark,
-                        editor_open_available,
-                    },
-                )))
-                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                    if matches!(row, stream::StreamRow::Line { .. }) {
-                        cx.stop_propagation();
-                        target.update(cx, |this, cx| {
-                            this.select_line(row, event.modifiers.shift, window, cx)
-                        });
-                    }
-                });
-            let mut item = v_flex().w_full().child(line);
-            let threads = view.update(cx, |this, cx| {
-                this.render_inline_threads(
-                    thread_groups
-                        .get(&ix)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default(),
-                    cx,
-                )
-            });
-            item = item.child(threads);
-            if editor == Some(ix) && view.read(cx).is_new_comment() {
-                let editor = view.update(cx, |this, cx| this.render_comment_editor(cx));
-                item = item.child(editor);
-            }
-            item.into_any_element()
-        })
-        .size_full()
     }
 }
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Sync scroll before borrowing the diff for the body below.
-        self.stream_top
-            .set(self.list_handle.logical_scroll_top().item_ix);
         self.sync_tree_and_stream(cx);
+        self.sync_diff_theme(cx);
         // Focus listeners need a Window, so they are installed on first
         // render rather than in `new`. They keep `tree_contains_focus`
         // fresh across every focus path (keyboard nav, mouse, palettes).
@@ -1203,7 +951,7 @@ impl Render for ReviewView {
         let focus = self.focus_handle.clone();
         let track = self.focus_handle.clone();
         let tree_focus = self.tree_focus.clone();
-        let stream_focus = self.stream_focus.clone();
+        let stream_focus = self.diff_state.focus_handle(cx);
         let comments_focus = self.comments_focus.clone();
         let body: AnyElement = match &self.state {
             ReviewState::Loading => div()
@@ -1252,7 +1000,8 @@ impl Render for ReviewView {
             }
             ReviewState::Loaded(loaded) => {
                 let file_count = loaded.diff.files.len();
-                let sticky = self.render_sticky_header(loaded, cx);
+                let additions: u32 = loaded.diff.files.iter().map(|file| file.additions).sum();
+                let deletions: u32 = loaded.diff.files.iter().map(|file| file.deletions).sum();
                 h_flex()
                     .flex_1()
                     .h_full()
@@ -1280,12 +1029,26 @@ impl Render for ReviewView {
                                     .flex()
                                     .flex_row()
                                     .items_center()
+                                    .gap_2()
                                     .text_xs()
                                     .font_semibold()
                                     .text_color(rgb(0x858989))
                                     .border_b_1()
                                     .border_color(rgb(0x1d1f1f))
-                                    .child(format!("Files · {file_count}")),
+                                    .child(format!("Files · {file_count}"))
+                                    .child(div().flex_1())
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(0x4ade80))
+                                            .child(format!("+{additions}")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(rgb(0xf87171))
+                                            .child(format!("−{deletions}")),
+                                    ),
                             )
                             .child(div().flex_1().min_h_0().child(self.render_tree(cx))),
                     )
@@ -1297,14 +1060,13 @@ impl Render for ReviewView {
                             .min_w_0()
                             .h_full()
                             .min_h_0()
-                            .when_some(sticky, |this, header| this.child(header))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_h_0()
                                     .min_w_0()
                                     .w_full()
-                                    .child(self.render_stream(loaded, cx)),
+                                    .child(self.render_kit_diff(loaded, cx)),
                             ),
                     )
                     .into_any_element()
@@ -1315,12 +1077,14 @@ impl Render for ReviewView {
             .bg(rgb(0x090a0a))
             .text_color(rgb(0xe7e7e7))
             .track_focus(&track)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_, _, window, cx| {
-                    focus.focus(window, cx);
-                }),
-            )
+            .when(!matches!(self.state, ReviewState::Loaded(_)), |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |_, _, window, cx| {
+                        focus.focus(window, cx);
+                    }),
+                )
+            })
             .on_key_down(cx.listener(Self::on_key_down))
             .child(self.render_toolbar(cx))
             .when_some(self.open_error.clone(), |this, error| {

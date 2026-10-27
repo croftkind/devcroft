@@ -2056,7 +2056,6 @@ mod tests {
             for control in [
                 "git-diff-unified",
                 "git-diff-split",
-                "git-diff-wrap",
                 "git-diff-previous",
                 "git-diff-next",
                 "git-open-selected-file",
@@ -2083,7 +2082,6 @@ mod tests {
                     .contains("tracked.txt")
             );
             window.click("git-diff-split", cx);
-            window.click("git-diff-wrap", cx);
             window.press("home", cx);
             window.press("shift-down", cx);
             window.press(

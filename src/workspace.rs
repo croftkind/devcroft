@@ -3467,7 +3467,7 @@ impl Workspace {
                         .update(cx, |view, cx| view.move_file_selection(down, cx)),
                     1 => self
                         .review
-                        .update(cx, |view, cx| view.move_diff_scroll(down, cx)),
+                        .update(cx, |view, cx| view.move_diff_scroll(down, window, cx)),
                     _ => {}
                 },
                 WorkspaceTab::Editor if self.editor_instance == Some(EditorChoice::BuiltIn) => {

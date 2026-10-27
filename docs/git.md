@@ -48,7 +48,8 @@ index-to-worktree, or empty-to-worktree content as appropriate. Renames show
 both paths. **Show more** exposes further files in large sections.
 
 Non-conflict Changes and History diffs support **Unified** and **Split**
-layouts, **Wrap** for long lines, and **Previous change / Next change**. These
+layouts and **Previous change / Next change**. Split view always wraps long
+lines to fit each column; Unified view scrolls horizontally. These
 controls share a single compact file header alongside the path and line counts;
 Changes also includes an editor button. Hover the path for the full comparison details.
 The up/down arrows jump between changes.

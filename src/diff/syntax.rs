@@ -21,7 +21,9 @@ use syntect::highlighting::{FontStyle, Style, Theme, ThemeSet};
 pub(crate) use syntect::parsing::SyntaxReference;
 use syntect::parsing::{SyntaxDefinition, SyntaxSet};
 
-use super::model::{FileContent, Hunk, LineTag, ReviewDiff};
+#[cfg(test)]
+use super::model::{FileContent, ReviewDiff};
+use super::model::{Hunk, LineTag};
 
 /// Verbatim copy of Swift-Next's `Swift.sublime-syntax` (see
 /// `assets/syntaxes/README.md`). `syntect`'s default set does not bundle
@@ -125,6 +127,7 @@ impl SyntaxHighlights {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn highlight(diff: &ReviewDiff) -> SyntaxHighlights {
     SyntaxHighlights {
         light: highlight_with_theme(diff, &THEMES.themes[LIGHT_THEME]),
@@ -159,7 +162,7 @@ pub(crate) fn syntax_by_name(name: &str) -> Option<&'static SyntaxReference> {
 
 /// Kit supplies one hunk side at a time. Keep its byte offsets across lines
 /// while using the same per-line styles and fresh parser state as Review.
-pub(super) fn highlight_source(
+pub(crate) fn highlight_source(
     language: &str,
     source: &str,
     dark: bool,
@@ -201,6 +204,7 @@ pub(crate) fn syntax_names() -> Vec<&'static str> {
     names
 }
 
+#[cfg(test)]
 fn highlight_with_theme(diff: &ReviewDiff, theme: &Theme) -> PaletteHighlights {
     let files = diff
         .files
@@ -335,12 +339,14 @@ mod tests {
                                 old_no: Some(1),
                                 new_no: None,
                                 text: "fn old() {}".into(),
+                                ending: "\n",
                             },
                             HunkLine {
                                 tag: LineTag::Addition,
                                 old_no: None,
                                 new_no: Some(1),
                                 text: "fn new() {}".into(),
+                                ending: "\n",
                             },
                         ],
                     }],
@@ -669,12 +675,14 @@ mod tests {
                                 old_no: Some(1),
                                 new_no: None,
                                 text: "def old():".into(),
+                                ending: "\n",
                             },
                             HunkLine {
                                 tag: LineTag::Addition,
                                 old_no: None,
                                 new_no: Some(1),
                                 text: "def new():".into(),
+                                ending: "\n",
                             },
                         ],
                     }],
@@ -730,12 +738,14 @@ mod tests {
                                 old_no: Some(1),
                                 new_no: None,
                                 text: "func old() {}".into(),
+                                ending: "\n",
                             },
                             HunkLine {
                                 tag: LineTag::Addition,
                                 old_no: None,
                                 new_no: Some(1),
                                 text: "func new() {}".into(),
+                                ending: "\n",
                             },
                         ],
                     }],

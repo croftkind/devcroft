@@ -1,8 +1,59 @@
 //! Keep the visible code anchored when a refreshed diff changes its row indices.
 use super::{LoadedReview, model::FileContent, stream::StreamRow};
+use gpui_kit::component::diff::{DiffLineRange, DiffSide};
 use gpui_kit::{ListOffset, px};
 use similar::{Algorithm, DiffOp, capture_diff_slices_by_key_deadline};
 use std::time::{Duration, Instant};
+
+/// Kit keeps its own viewport. On source replacement, preserve the selected
+/// source range using the same bounded line matching as Review's former list.
+pub(super) fn restore_selection(
+    old: &LoadedReview,
+    new: &LoadedReview,
+    range: &DiffLineRange,
+) -> Option<DiffLineRange> {
+    let map = |number, side| {
+        let old_row = old.rows.iter().position(|row| {
+            line_number(old, *row, side)
+                .is_some_and(|(path, line)| path == range.path().as_str() && line == number)
+        })?;
+        let top = restore(
+            old,
+            new,
+            ListOffset {
+                item_ix: old_row,
+                offset_in_item: px(0.),
+            },
+        );
+        let (path, number) = line_number(new, *new.rows.get(top.item_ix)?, side)?;
+        (path == range.path().as_str()).then_some(number)
+    };
+    Some(
+        DiffLineRange::new(
+            range.path().clone(),
+            range.side(),
+            map(range.start(), range.side())?,
+            map(range.end(), range.end_side())?,
+        )
+        .with_end_side(range.end_side()),
+    )
+}
+
+fn line_number(loaded: &LoadedReview, row: StreamRow, side: DiffSide) -> Option<(&str, usize)> {
+    let StreamRow::Line { file, hunk, line } = row else {
+        return None;
+    };
+    let file = &loaded.diff.files[file];
+    let FileContent::Text { hunks, .. } = &file.content else {
+        return None;
+    };
+    let line = &hunks[hunk].lines[line];
+    let number = match side {
+        DiffSide::Original => line.old_no,
+        DiffSide::Modified => line.new_no,
+    }?;
+    Some((&file.path, number as usize))
+}
 
 pub(super) fn restore(old: &LoadedReview, new: &LoadedReview, top: ListOffset) -> ListOffset {
     let Some(row) = old.rows.get(top.item_ix) else {

@@ -182,13 +182,28 @@ fn backend_benchmark_review_scroll(cx: &mut TestAppContext) {
     let dir = review_fixture();
     let view = cx.new(|cx| crate::review::ReviewView::new(dir.path(), cx));
     cx.run_until_parked();
-    let (list, files) = view
-        .read_with(cx, |view, _| view.benchmark_list_state())
+    let files = view
+        .read_with(cx, |view, _| view.benchmark_file_count())
         .expect("review fixture must finish loading successfully");
     assert_eq!(files, 20, "expected the complete review fixture");
     let (_, cx) = cx.add_window_view(move |window, cx| Root::new(view, window, cx));
     prepare_window(cx);
-    assert_scrolls(cx, &list);
+    let before = cx.update(|window, _| {
+        window
+            .find_all("source")
+            .first()
+            .map(|source| source.path().to_owned())
+    });
+    for i in 0..12 {
+        cx.update(|window, cx| scroll_frame(window, cx, i));
+    }
+    let after = cx.update(|window, _| {
+        window
+            .find_all("source")
+            .first()
+            .map(|source| source.path().to_owned())
+    });
+    assert_ne!(before, after, "wheel input must move the Kit diff viewport");
     measure("review-scroll-20-files-4000-changed-lines", |i| {
         cx.update(|window, cx| scroll_frame(window, cx, i));
     });

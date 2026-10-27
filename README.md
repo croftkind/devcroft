@@ -71,7 +71,7 @@ On Linux this installs `~/.local/bin/devcroft` plus a `devcroft.desktop` launche
 - **Editor** offers Neovim or the built-in editor (Settings → Editor; the default for new installations). The built-in editor covers file tabs, fuzzy finding, project search, syntax highlighting, and find/replace for small edits. See [editor setup and everyday use](docs/editor.md) and [language support](docs/language-support.md).
 - **Terminal** tabs own independent PTY sessions backed by your login shell, with bundled Nerd Font symbols and mouse/link support. See [Terminal](docs/terminal.md).
 - **Home** dashboard for recent projects, repository relationships, PRs, todos, and reading lists, partitioned by spaces. See [Home dashboard](docs/home.md).
-- **Review** tab with syntax highlighting and persistent line/range comments, plus a headless CLI for agents. See [review workflow and CLI](docs/review-comments.md).
+- **Review** tab with rich unified/split diffs, source selection/copy, syntax highlighting, and persistent line/range comments, plus a headless CLI for agents. See [review workflow and CLI](docs/review-comments.md).
 - **Resources** tab for repository plans, RFCs, notes, reviews, and visual tutorials with agent-accessible comments. See [Repository resources](docs/resources.md).
 - **Relationship graph** to connect providers to consumers across the active space. See [relationship graph](docs/relationships.md).
 - **Tools** (action palette → Tools): Format JSON, Diff Checker, Base64 encoder/decoder. See [Developer tools](docs/tools.md).
