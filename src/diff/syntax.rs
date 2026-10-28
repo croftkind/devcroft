@@ -13,6 +13,7 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
+use crate::editor::is_dotenv;
 use gpui_kit::{FontStyle as TextFontStyle, FontWeight, HighlightStyle, UnderlineStyle, px, rgba};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style, Theme, ThemeSet};
@@ -30,6 +31,10 @@ use super::model::{Hunk, LineTag};
 /// Swift, so without this `.swift` files resolve to nothing and the Review
 /// tab paints them plain.
 const SWIFT_SYNTAX: &str = include_str!("../../assets/syntaxes/Swift.sublime-syntax");
+/// Dotenv files have no usable extension (`.env`) or one that names their
+/// environment (`.env.local`), so syntect's extension lookup misses them. This
+/// definition from bat colors their assignment keys, comments, and values.
+const DOTENV_SYNTAX: &str = include_str!("../../assets/syntaxes/DotENV.sublime-syntax");
 // Syntect's defaults also omit TypeScript and TSX. These definitions are
 // vendored from bat's syntect-compatible bundle (see the same README).
 const TYPESCRIPT_SYNTAX: &str = include_str!("../../assets/syntaxes/TypeScript.sublime-syntax");
@@ -38,6 +43,7 @@ const TSX_SYNTAX: &str = include_str!("../../assets/syntaxes/TypeScriptReact.sub
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(|| {
     let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
     for (name, source) in [
+        ("DotENV", DOTENV_SYNTAX),
         ("Swift", SWIFT_SYNTAX),
         ("TypeScript", TYPESCRIPT_SYNTAX),
         ("TSX", TSX_SYNTAX),
@@ -237,6 +243,12 @@ pub(super) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("");
+    // Dotenv files have no usable extension (`.env`) or one that names their
+    // environment (`.env.local`), so route them by name rather than relying on
+    // the definition's extension list.
+    if is_dotenv(path) {
+        return syntax_by_name("DotENV");
+    }
     // Keep C/C++ header and alternate suffix identities consistent with the
     // editor, including uppercase .C (C++, unlike lowercase .c).
     match extension {
@@ -373,6 +385,53 @@ mod tests {
         assert_eq!(syntax_for_path("foo.py3").unwrap().name, "Python");
         assert!(syntax_for_path("Makefile").is_some());
         assert!(syntax_for_path("notes.unknown-extension").is_none());
+    }
+
+    #[test]
+    fn dotenv_files_resolve_to_the_dotenv_syntax() {
+        for path in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "config/.env.example",
+            "local.env",
+        ] {
+            assert_eq!(
+                syntax_for_path(path).map(|syntax| syntax.name.as_str()),
+                Some("DotENV"),
+                "{path}"
+            );
+        }
+        assert!(syntax_for_path(".environment").is_none());
+    }
+
+    #[test]
+    fn dotenv_assignments_and_comments_highlight_in_both_themes() {
+        let source =
+            "# Local development\nTOKEN=dev-secret\nDATABASE_URL=\"postgres://localhost/dev\"\n";
+        for dark in [false, true] {
+            let spans = highlight_source("DotENV", source, dark);
+            for token in ["# Local development", "postgres://localhost/dev"] {
+                let start = source.find(token).unwrap();
+                assert!(
+                    spans
+                        .iter()
+                        .any(|(range, _)| range.start < start + token.len() && range.end > start),
+                    "dark={dark}: {token} must be colored, got {spans:?}"
+                );
+            }
+        }
+        // The light theme leaves `variable.other` at the base foreground, so
+        // `highlight_source` filters the key as invisible; the dark theme gives
+        // it a distinct color.
+        let spans = highlight_source("DotENV", source, true);
+        let token = source.find("TOKEN").unwrap();
+        assert!(
+            spans
+                .iter()
+                .any(|(range, _)| { range.start <= token && range.end >= token + "TOKEN".len() }),
+            "the assignment key must carry a syntax color, got {spans:?}"
+        );
     }
 
     #[test]

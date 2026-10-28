@@ -1,7 +1,8 @@
 //! Quiet, bounded checks for newer stable GitHub releases. Never installs code.
 use std::process::{Command, Stdio};
 
-pub(crate) const INSTALL_COMMAND: &str = "curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash";
+pub(crate) const INSTALL_COMMAND: &str =
+    "curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash";
 #[cfg(any(target_os = "macos", test))]
 const HOMEBREW_COMMAND: &str = "brew upgrade --cask croftkind/tap/devcroft";
 const API_URL: &str = "https://api.github.com/repos/croftkind/devcroft/releases/latest";
