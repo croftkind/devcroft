@@ -27,7 +27,8 @@ use super::project::{self, ProjectFile, TextMatch};
 use crate::editor::{ExternalEditor, ExternalEditorKind};
 use anyhow::{Context as _, Result, bail};
 use gpui_kit::component::{
-    Icon, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{Confirm, DialogFooter},
     h_flex,
@@ -114,6 +115,13 @@ pub(crate) struct NativeEditor {
     text_query: Entity<InputState>,
     line_query: Entity<InputState>,
     new_file_query: Entity<InputState>,
+    /// Floating in-file find bar: query, replacement, and presentation state.
+    /// The matches live in the editor's own search session.
+    find_query: Entity<InputState>,
+    find_replacement: Entity<InputState>,
+    find_open: bool,
+    find_replace_mode: bool,
+    find_case_insensitive: bool,
     search_results: Vec<TextMatch>,
     browser: BrowserMode,
     indexing: bool,
@@ -392,7 +400,7 @@ impl NativeEditor {
                     .unwrap_or_else(|| draft.path.clone())
             });
             let document = cx.new(|cx| {
-                let mut editor = EditorState::new(window, cx);
+                let mut editor = EditorState::new(window, cx).searchable(false);
                 editor.set_highlighter(language_for(&draft.path), cx);
                 editor.set_value(draft.text.clone(), window, cx);
                 editor
@@ -416,7 +424,7 @@ impl NativeEditor {
             );
         }
         tabs.sort();
-        let editor = cx.new(|cx| EditorState::new(window, cx));
+        let editor = cx.new(|cx| EditorState::new(window, cx).searchable(false));
         cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.dirty = this.saved.as_ref().is_some_and(|saved| {
@@ -453,6 +461,30 @@ impl NativeEditor {
         .detach();
         let new_file_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("path/to/file.rs"));
+        let find_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find in file…"));
+        cx.subscribe(&find_query, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => {
+                let query = this.find_query.read(cx).value().to_string();
+                this.update_find_query(query, cx);
+            }
+            InputEvent::PressEnter { shift, .. } => {
+                this.step_find(if *shift { -1 } else { 1 }, cx);
+            }
+            _ => {}
+        })
+        .detach();
+        let find_replacement =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Replace with…"));
+        cx.subscribe_in(
+            &find_replacement,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.replace_find_match(window, cx);
+                }
+            },
+        )
+        .detach();
         let file_changes = project::FileChanges::new(root);
         let scan_root = root.to_owned();
         cx.spawn_in(window, async move |view, cx| {
@@ -591,6 +623,11 @@ impl NativeEditor {
             text_query,
             line_query,
             new_file_query,
+            find_query,
+            find_replacement,
+            find_open: false,
+            find_replace_mode: false,
+            find_case_insensitive: true,
             search_results: Vec::new(),
             browser: BrowserMode::Tree,
             indexing: true,
@@ -626,6 +663,9 @@ impl NativeEditor {
             return;
         }
         if self.markdown_preview.take().is_none() {
+            // The preview draws its own find bar; close the code editor's
+            // floating bar so Escape and the shortcut have one owner.
+            self.close_find(window, cx);
             let content = self.editor.read(cx).value().to_string();
             self.markdown_preview_source = content.clone();
             let preview = cx.new(|cx| crate::preview::PreviewView::for_editor(content.into(), cx));
@@ -649,6 +689,124 @@ impl NativeEditor {
         } else {
             self.editor.read(cx).focus_handle(cx)
         }
+    }
+
+    /// The floating find bar only covers the code pane: the Markdown preview
+    /// has its own find bar, and a tab without a file has nothing to search.
+    fn find_visible(&self) -> bool {
+        self.find_open && self.markdown_preview.is_none() && self.path.is_some()
+    }
+
+    /// Open the floating find bar over the code pane, or refocus it when it is
+    /// already showing. The query seeds from the editor selection, matching
+    /// the built-in editor search. The bar owns the input so it can float
+    /// above the code instead of taking a row in the pane layout.
+    fn open_find(&mut self, replace_mode: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.markdown_preview.is_some() || self.path.is_none() {
+            return;
+        }
+        let selection = self.editor.read(cx).selected_text().to_string();
+        let query = if selection.is_empty() {
+            self.find_query.read(cx).value().to_string()
+        } else {
+            selection
+        };
+        self.find_open = true;
+        self.find_replace_mode |= replace_mode;
+        self.find_query.update(cx, |input, cx| {
+            input.set_value(query.clone(), window, cx);
+            input.select_all(window, cx);
+        });
+        self.update_find_query(query, cx);
+        // Replace mode only reveals the replacement row; the query keeps
+        // focus so the user can type the search first, like gpui-kit's panel.
+        self.find_query.read(cx).focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Mirror the query input into the editor's search session. The editor is
+    /// deliberately not `searchable`, so this highlights matches without
+    /// showing gpui-kit's in-flow search panel.
+    fn update_find_query(&mut self, query: String, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        let case_insensitive = self.find_case_insensitive;
+        self.editor.update(cx, |editor, cx| {
+            if query.is_empty() {
+                editor.close_search(cx);
+            } else {
+                editor.set_search_query(query, case_insensitive, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn step_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            if delta < 0 {
+                editor.previous_search_match(cx);
+            } else {
+                editor.next_search_match(cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn toggle_find_case(&mut self, cx: &mut Context<Self>) {
+        self.find_case_insensitive = !self.find_case_insensitive;
+        let query = self.find_query.read(cx).value().to_string();
+        self.update_find_query(query, cx);
+    }
+
+    fn toggle_find_replace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_replace_mode = !self.find_replace_mode;
+        let focus = if self.find_replace_mode {
+            self.find_replacement.read(cx).focus_handle(cx)
+        } else {
+            self.find_query.read(cx).focus_handle(cx)
+        };
+        focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn replace_find_match(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let replacement = self.find_replacement.read(cx).value().to_string();
+        self.editor.update(cx, |editor, cx| {
+            editor.replace_current_search_match(&replacement, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn replace_all_find_matches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let replacement = self.find_replacement.read(cx).value().to_string();
+        self.editor.update(cx, |editor, cx| {
+            editor.replace_all_search_matches(&replacement, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        let focus_editor = self.path.is_some() && self.markdown_preview.is_none();
+        self.clear_find(cx);
+        if focus_editor {
+            self.editor_focus(cx).focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// End the find session without deciding where focus lands. Used when the
+    /// document behind the bar is swapped or closed.
+    fn clear_find(&mut self, cx: &mut Context<Self>) {
+        self.find_open = false;
+        self.find_replace_mode = false;
+        self.editor.update(cx, |editor, cx| editor.close_search(cx));
     }
 
     pub(crate) fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
@@ -1367,6 +1525,9 @@ impl NativeEditor {
         let Some(path) = self.path.take() else {
             return;
         };
+        // The find bar and its highlighted matches belong to the document
+        // being stashed; the next tab starts with a clean editor.
+        self.clear_find(cx);
         self.disk_comparison = None;
         self.clear_lsp_providers(cx);
         self.lsp.take();
@@ -1555,7 +1716,7 @@ impl NativeEditor {
             let contents = read_text_file(&canonical)?;
             let language = language_for(&canonical);
             let next_editor = cx.new(|cx| {
-                let mut editor = EditorState::new(window, cx);
+                let mut editor = EditorState::new(window, cx).searchable(false);
                 editor.set_highlighter(language, cx);
                 editor.set_value(contents.clone(), window, cx);
                 editor
@@ -1684,6 +1845,7 @@ impl NativeEditor {
         self.language_servers.close(path);
         self.tabs.retain(|tab| tab != path);
         if self.path.as_deref() == Some(path) {
+            self.clear_find(cx);
             self.disk_comparison = None;
             self.lsp.take();
             self.markdown_preview = None;
@@ -1700,7 +1862,7 @@ impl NativeEditor {
                     .err()
                     .map(|error| format!("{error:#}"));
             } else {
-                let editor = cx.new(|cx| EditorState::new(window, cx));
+                let editor = cx.new(|cx| EditorState::new(window, cx).searchable(false));
                 self.editor = editor;
                 self.subscribe_changes(&self.editor, cx);
             }
@@ -2652,9 +2814,167 @@ impl NativeEditor {
         });
     }
 
+    /// Floating find bar over the code pane. Absolute positioning keeps the
+    /// text from moving when it opens; it sits inside the pane's `relative`
+    /// wrapper so it stays clear of the toolbar without taking a layout row.
+    fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.find_visible() {
+            return None;
+        }
+        let query = self.find_query.read(cx).value();
+        let (has_matches, status) = {
+            let session = self.editor.read(cx).search_session();
+            let matcher = &session.matcher;
+            (
+                !matcher.is_empty(),
+                (!query.is_empty()).then(|| {
+                    if matcher.is_empty() {
+                        "No results".to_owned()
+                    } else {
+                        matcher.label()
+                    }
+                }),
+            )
+        };
+        let case_insensitive = self.find_case_insensitive;
+        let replace_mode = self.find_replace_mode;
+        Some(
+            v_flex()
+                .id("native-find")
+                .debug_selector(|| "native-find".into())
+                .test_support()
+                .occlude()
+                .absolute()
+                .top(px(8.))
+                .right(px(12.))
+                .w(px(if replace_mode { 430. } else { 360. }))
+                .max_w_full()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .shadow_lg()
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.close_find(window, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                    }
+                }))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Input::new(&self.find_query).small().appearance(false)),
+                        )
+                        .when_some(status, |row, status| {
+                            row.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(status),
+                            )
+                        })
+                        .child(
+                            Button::new("native-find-case")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::CaseSensitive)
+                                .selected(!case_insensitive)
+                                .tooltip(if case_insensitive {
+                                    "Match case"
+                                } else {
+                                    "Ignore case"
+                                })
+                                .accessibility_label("Match case")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_find_case(cx))),
+                        )
+                        .child(
+                            Button::new("native-find-prev")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ChevronUp)
+                                .disabled(!has_matches)
+                                .tooltip("Previous match")
+                                .accessibility_label("Previous match")
+                                .on_click(cx.listener(|this, _, _, cx| this.step_find(-1, cx))),
+                        )
+                        .child(
+                            Button::new("native-find-next")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::ChevronDown)
+                                .disabled(!has_matches)
+                                .tooltip("Next match")
+                                .accessibility_label("Next match")
+                                .on_click(cx.listener(|this, _, _, cx| this.step_find(1, cx))),
+                        )
+                        .child(
+                            Button::new("native-find-replace-toggle")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Replace)
+                                .selected(replace_mode)
+                                .tooltip("Toggle replace")
+                                .accessibility_label("Toggle replace")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_find_replace(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("native-find-close")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Close find")
+                                .accessibility_label("Close find")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.close_find(window, cx)),
+                                ),
+                        ),
+                )
+                .when(replace_mode, |bar| {
+                    bar.child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().flex_1().min_w_0().child(
+                                Input::new(&self.find_replacement).small().appearance(false),
+                            ))
+                            .child(
+                                Button::new("native-find-replace")
+                                    .small()
+                                    .label("Replace")
+                                    .disabled(!has_matches)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.replace_find_match(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("native-find-replace-all")
+                                    .small()
+                                    .label("Replace All")
+                                    .disabled(!has_matches)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.replace_all_find_matches(window, cx)
+                                    })),
+                            ),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_editor_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let has_file = self.path.is_some();
+        let can_find = has_file && self.markdown_preview.is_none();
         let dirty = self.dirty;
         let external_editors = self.external_editors.clone();
         let can_go_back = self.has_jump_history();
@@ -2677,8 +2997,8 @@ impl NativeEditor {
                         .disabled(!can_complete),
                 );
                 for (label, action, enabled) in [
-                    ("Find in file", 0, has_file),
-                    ("Replace in file", 1, has_file),
+                    ("Find in file", 0, can_find),
+                    ("Replace in file", 1, can_find),
                     ("Go to line", 2, has_file),
                     ("Go back", 12, can_go_back),
                     ("Go forward", 13, can_go_forward),
@@ -2697,9 +3017,7 @@ impl NativeEditor {
                     menu = menu.item(PopupMenuItem::new(label).disabled(!enabled).on_click(
                         move |_, window, cx| {
                             view.update(cx, |this, cx| match action {
-                                0 | 1 => this
-                                    .editor
-                                    .update(cx, |editor, cx| editor.open_search(action == 1, cx)),
+                                0 | 1 => this.open_find(action == 1, window, cx),
                                 2 => this.show_browser(BrowserMode::Line, window, cx),
                                 3 => this.save(window, cx),
                                 4 => this.save_as(window, cx),
@@ -3356,6 +3674,7 @@ impl Render for NativeEditor {
             .child(
                 div()
                     .debug_selector(|| "native-code-pane".into())
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
@@ -3368,7 +3687,8 @@ impl Render for NativeEditor {
                             .h_full()
                             .appearance(false)
                             .into_any_element()
-                    }),
+                    })
+                    .children(self.render_find_bar(cx)),
             )
             .when_some(self.installation_offer(), |v, server| {
                 let job = self
@@ -3488,6 +3808,39 @@ impl Render for NativeEditor {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // The editor's own `Input` bindings only fire while the text
+                // area has focus. Opening a file from the sidebar leaves focus
+                // there, so handle the find/replace chords for the whole
+                // built-in editor pane. The editor's search panel is disabled
+                // (`searchable(false)`) so these actions bubble to this pane
+                // instead of drawing gpui-kit's in-flow panel. The markdown
+                // preview owns its own find bar.
+                if this.markdown_preview.is_none() && this.path.is_some() && !this.finder_open() {
+                    if crate::command_palette::is_find_shortcut(
+                        &event.keystroke.key,
+                        event.keystroke.modifiers.platform,
+                        event.keystroke.modifiers.control,
+                        event.keystroke.modifiers.shift,
+                        event.keystroke.modifiers.alt,
+                    ) {
+                        this.open_find(false, window, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if crate::command_palette::is_replace_shortcut(
+                        &event.keystroke.key,
+                        event.keystroke.modifiers.platform,
+                        event.keystroke.modifiers.control,
+                        event.keystroke.modifiers.shift,
+                        event.keystroke.modifiers.alt,
+                    ) {
+                        this.open_find(true, window, cx);
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 if event.keystroke.key == "escape"
                     && (matches!(
                         this.browser,
@@ -3507,6 +3860,12 @@ impl Render for NativeEditor {
                     window.prevent_default();
                     cx.stop_propagation();
                     cx.notify();
+                    return;
+                }
+                if this.find_visible() && event.keystroke.key == "escape" {
+                    this.close_find(window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
                 }
             }))
             .when_some(browser, |row, browser| row.child(browser))
@@ -4969,6 +5328,136 @@ mod tests {
         test_cx.run_until_parked();
         view.read_with(test_cx, |view, _| assert!(!view.dirty));
         assert_eq!(fs::read_to_string(&file).unwrap(), "after ctrl\n");
+    }
+
+    #[gpui_kit::test]
+    fn find_shortcut_opens_the_editor_search_from_the_sidebar(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        fs::write(&file, "alpha beta alpha\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx).unwrap();
+                view.editor
+                    .update(cx, |editor, cx| editor.set_selected_range(6..10, cx));
+                // Opening a file from the sidebar leaves focus there; the find
+                // shortcut must still find in the file that is open.
+                view.sidebar_focus.focus(window, cx);
+            })
+            .unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-f"
+        } else {
+            "ctrl-f"
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        assert!(
+            test_cx.debug_bounds("native-find").is_some(),
+            "the find bar must float over the code pane"
+        );
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.find_open, "the find shortcut must open the bar");
+            assert!(!view.find_replace_mode);
+            assert_eq!(
+                view.find_query.read(cx).value().as_ref(),
+                "beta",
+                "the find bar seeds from the editor selection"
+            );
+            let editor = view.editor.read(cx);
+            assert!(
+                !editor.search_session().open,
+                "the in-flow gpui-kit search panel must not render"
+            );
+            assert!(editor.search_session().is_active());
+            assert_eq!(editor.search_session().matcher.len(), 1);
+        });
+
+        // The bar owns focus, so typing replaces the seeded selection without
+        // touching the document.
+        test_cx.simulate_keystrokes("g a m m a");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.find_query.read(cx).value().as_ref(), "gamma");
+            assert!(
+                view.editor.read(cx).search_session().matcher.is_empty(),
+                "typing a new query must refresh the matches"
+            );
+            assert_eq!(view.editor.read(cx).value().as_ref(), "alpha beta alpha\n");
+        });
+
+        // `ctrl-f` is the user's habit on macOS too, and the built-in editor
+        // never forwards keys to a pty, so both chords find in the file.
+        view.update_in(test_cx, |view, window, cx| {
+            view.editor
+                .update(cx, |editor, cx| editor.focus(window, cx));
+        });
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("ctrl-f");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.find_open, "Ctrl-F must also open the find bar");
+            assert_eq!(
+                view.editor.read(cx).value().as_ref(),
+                "alpha beta alpha\n",
+                "the find shortcut must not insert its control character"
+            );
+            assert!(!view.editor.read(cx).search_session().open);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn floating_find_bar_replaces_all_matches(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(crate::bind_app_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        fs::write(&file, "alpha beta alpha\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.downgrade()
+            .update_in(test_cx, |view, window, cx| {
+                view.open(&file, None, window, cx).unwrap();
+                view.open_find(true, window, cx);
+                view.find_query
+                    .update(cx, |input, cx| input.set_value("alpha", window, cx));
+                view.update_find_query("alpha".into(), cx);
+                view.find_replacement
+                    .update(cx, |input, cx| input.set_value("gamma", window, cx));
+            })
+            .unwrap();
+        test_cx.run_until_parked();
+        test_cx.update(|window, cx| window.render_frame(cx));
+        assert!(test_cx.debug_bounds("native-find").is_some());
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.find_replace_mode);
+            assert_eq!(view.editor.read(cx).search_session().matcher.len(), 2);
+        });
+        test_cx.update(|window, cx| window.click("native-find-replace-all", cx));
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(
+                view.editor.read(cx).value().as_ref(),
+                "gamma beta gamma\n",
+                "Replace All must rewrite every match"
+            );
+            assert!(view.dirty, "a replacement dirties the tab");
+            assert_eq!(view.editor.read(cx).search_session().matcher.len(), 0);
+        });
+
+        // Escape closes the bar and restores editing focus.
+        test_cx.update(|window, cx| window.render_frame(cx));
+        test_cx.simulate_keystrokes("escape");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert!(!view.find_open);
+            assert!(!view.editor.read(cx).search_session().is_active());
+        });
     }
 
     #[gpui_kit::test]
