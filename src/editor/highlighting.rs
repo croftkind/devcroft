@@ -172,6 +172,53 @@ service FleetService {
         );
     }
 
+    const DOTENV_SOURCE: &str = r#"# Local development
+TOKEN=dev-secret
+DATABASE_URL="postgres://localhost/dev"
+"#;
+
+    #[test]
+    fn dotenv_documents_highlight_keys_comments_and_quoted_values() {
+        assert_eq!(language_for(Path::new(".env")), "bash");
+        let mut highlighter = SyntaxHighlighter::new("bash");
+        let text = Rope::from_str(DOTENV_SOURCE);
+        assert!(
+            highlighter.update(None, &text, None),
+            "the bash highlighter must parse a dotenv document"
+        );
+        assert_eq!(
+            highlighter.language().as_ref(),
+            "bash",
+            "the highlighter must not fall back to plain text"
+        );
+        let theme = HighlightTheme::default_dark();
+        let styles = highlighter.styles(&(0..text.len()), &*theme);
+        assert!(
+            styles.len() > 1,
+            "dotenv must produce distinct styled spans, got {styles:?}"
+        );
+        let colored = |from: usize, through: usize| {
+            styles.iter().any(|(range, style)| {
+                range.start <= from && range.end >= through && style.color.is_some()
+            })
+        };
+        let token = DOTENV_SOURCE.find("TOKEN").unwrap();
+        assert!(
+            colored(token, token + "TOKEN".len()),
+            "the `TOKEN` key must carry a syntax color, got {styles:?}"
+        );
+        let comment_end = DOTENV_SOURCE.find('\n').unwrap();
+        assert!(
+            colored(0, comment_end),
+            "the comment must carry a syntax color, got {styles:?}"
+        );
+        let url = DOTENV_SOURCE.find("postgres://localhost/dev").unwrap();
+        assert!(
+            colored(url, url + "postgres://localhost/dev".len()),
+            "the quoted value must carry a syntax color, got {styles:?}"
+        );
+    }
+
     const SWIFT_SOURCE: &str = r#"// The fleet's vehicles.
 import Foundation
 

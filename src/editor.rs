@@ -4,6 +4,7 @@ mod drafts;
 mod finder;
 pub(crate) mod highlighting;
 mod languages;
+pub(crate) use languages::is_dotenv;
 pub(crate) mod lsp;
 pub(crate) mod native;
 mod project;

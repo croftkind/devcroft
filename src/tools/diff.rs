@@ -143,6 +143,7 @@ pub(crate) const EDITOR_LANGUAGES: &[(&str, &str)] = &[
     ("C++", "cpp"),
     ("CSS", "css"),
     ("Diff", "diff"),
+    ("DotENV", "bash"),
     ("Go", "go"),
     ("HTML", "html"),
     ("Java", "java"),
