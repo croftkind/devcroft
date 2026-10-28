@@ -9,10 +9,30 @@ pub(crate) struct Language {
     pub server: Option<ServerId>,
 }
 
+/// Dotenv files: `.env`, `.env.local`, `.env.production`, and `local.env`.
+///
+/// Their `KEY=value` assignments, comments, and quoted values share bash's
+/// syntax, but a dotenv file is configuration rather than a script, so it
+/// deliberately gets no shell language server.
+pub(crate) fn is_dotenv(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name == ".env"
+        || name.starts_with(".env.")
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("env"))
+}
+
 pub(crate) fn detect(path: &Path) -> Language {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let (grammar, id, server) = if path.file_name().is_some_and(|n| n == "Cargo.lock") {
         ("toml", "toml", None)
+    } else if is_dotenv(path) {
+        ("bash", "dotenv", None)
     } else {
         match ext {
             "rs" => ("rust", "rust", Some(ServerId::Rust)),
@@ -98,6 +118,26 @@ mod tests {
                     "{name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dotenv_files_use_the_bash_grammar_without_a_server() {
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            "config/.env.example",
+            "local.env",
+            ".ENV",
+        ] {
+            let language = detect(Path::new(name));
+            assert_eq!(language.grammar, "bash", "{name}");
+            assert_eq!(language.id, "dotenv", "{name}");
+            assert!(language.server.is_none(), "{name}");
+        }
+        for name in [".environment", "env", "notes.env.txt"] {
+            assert_eq!(detect(Path::new(name)).grammar, "", "{name}");
         }
     }
 

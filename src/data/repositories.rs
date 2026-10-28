@@ -1245,10 +1245,7 @@ mod tests {
         assert!(binding.checkout_path.as_deref().is_some());
         assert_eq!(binding.remote_name.as_deref(), Some("origin"));
         // Creating stamps recency so the new repo survives the palette cap.
-        assert_eq!(
-            state.last_repository.as_deref(),
-            Some("croftkind-devcroft")
-        );
+        assert_eq!(state.last_repository.as_deref(), Some("croftkind-devcroft"));
         let opened = binding
             .last_opened_at
             .clone()

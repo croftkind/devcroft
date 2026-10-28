@@ -227,6 +227,7 @@ struct TreeRow {
     depth: usize,
     file: Option<PathBuf>,
     more: bool,
+    ignored: bool,
 }
 
 impl TreeRow {
@@ -273,6 +274,7 @@ fn merge_created_files(
                 .map(|component| component.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/"),
+            ignored: false,
         });
     }
 }
@@ -334,6 +336,7 @@ fn tree_rows(
                         depth,
                         file: None,
                         more: true,
+                        ignored: false,
                     });
                 }
                 break;
@@ -346,6 +349,7 @@ fn tree_rows(
                     depth,
                     file: Some(file.path.clone()),
                     more: false,
+                    ignored: file.ignored,
                 });
             } else if seen_dirs.insert(key.clone()) {
                 rows.push(TreeRow {
@@ -354,6 +358,7 @@ fn tree_rows(
                     depth,
                     file: None,
                     more: false,
+                    ignored: false,
                 });
             }
             parent = key;
@@ -1154,6 +1159,7 @@ impl NativeEditor {
             self.files.push(ProjectFile {
                 path: target.clone(),
                 label,
+                ignored: false,
             });
             sort_tree_files(&mut self.files);
         }
@@ -2821,7 +2827,11 @@ impl NativeEditor {
                             .h(px(28.))
                             .w_full()
                             .p_0()
-                            .accessibility_label(item.label.clone())
+                            .accessibility_label(if item.ignored {
+                                format!("{} (gitignored)", item.label)
+                            } else {
+                                item.label.clone()
+                            })
                             .when(selected, |row| row.bg(rgb(0x222b36)))
                             .when(cursor == Some(index), |row| {
                                 row.border_1().border_color(rgb(0x61afef))
@@ -2832,7 +2842,13 @@ impl NativeEditor {
                                     .gap_2()
                                     .pl(px(10. + item.depth as f32 * 16.))
                                     .pr_2()
-                                    .text_color(rgb(if selected { 0x61afef } else { 0xa4a9b2 }))
+                                    .text_color(rgb(if selected {
+                                        0x61afef
+                                    } else if item.ignored {
+                                        0x737983
+                                    } else {
+                                        0xa4a9b2
+                                    }))
                                     .child(icon)
                                     .child(
                                         div()
@@ -3518,6 +3534,7 @@ mod tests {
         .map(|label| ProjectFile {
             path: PathBuf::from(label),
             label: label.into(),
+            ignored: false,
         })
         .collect();
         sort_tree_files(&mut files);
@@ -3557,12 +3574,14 @@ mod tests {
                 ProjectFile {
                     path: PathBuf::from(&label),
                     label,
+                    ignored: false,
                 }
             })
             .collect();
         files.push(ProjectFile {
             path: "zfolder/child.txt".into(),
             label: "zfolder/child.txt".into(),
+            ignored: false,
         });
         sort_tree_files(&mut files);
         let rows = tree_rows(&files, &HashSet::from([String::new()]), &HashMap::new());
@@ -3592,11 +3611,13 @@ mod tests {
             .map(|index| ProjectFile {
                 path: PathBuf::from(format!("a/{index:03}.txt")),
                 label: format!("a/{index:03}.txt"),
+                ignored: false,
             })
             .collect();
         files.push(ProjectFile {
             path: PathBuf::from("z/last.txt"),
             label: "z/last.txt".into(),
+            ignored: false,
         });
         let expanded = HashSet::from([String::new(), "a".into()]);
         let rows = tree_rows(&files, &expanded, &HashMap::new());
@@ -3959,7 +3980,11 @@ mod tests {
                 let label = format!("src/file-{index:03}.txt");
                 let path = dir.path().join(&label);
                 fs::write(&path, "hello\nworld\n").unwrap();
-                ProjectFile { path, label }
+                ProjectFile {
+                    path,
+                    label,
+                    ignored: false,
+                }
             })
             .collect();
         let (view, test_cx) = test_editor(cx, dir.path());
@@ -4035,6 +4060,7 @@ mod tests {
                     ProjectFile {
                         path: dir.path().join(&label),
                         label,
+                        ignored: false,
                     }
                 })
                 .collect();
@@ -4347,7 +4373,12 @@ mod tests {
                 view.preview_editor.read(cx).value().as_ref(),
                 "unsaved buffer\nsecond\n"
             );
-            assert!(!view.files.iter().any(|file| file.label == "navigation.txt"));
+            assert!(
+                view.files
+                    .iter()
+                    .any(|file| file.label == "navigation.txt" && file.ignored),
+                "ignored open tabs stay in the project index"
+            );
         });
         test_cx.simulate_keystrokes("n a v i g a t o n");
         test_cx.run_until_parked();
@@ -4502,6 +4533,7 @@ mod tests {
             view.file_matches.push(ProjectFile {
                 path: file.canonicalize().unwrap(),
                 label: "hello.txt".into(),
+                ignored: false,
             });
             view.accept_file(cx);
             assert!(view.pending_open.is_none());
@@ -4526,6 +4558,51 @@ mod tests {
             .advance_clock(Duration::from_millis(100));
         cx.run_until_parked();
         cx.update(|window, cx| window.render_frame(cx));
+    }
+
+    #[gpui_kit::test]
+    fn tree_and_finder_include_gitignored_files(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "local.env\nbuild/\n").unwrap();
+        fs::write(dir.path().join("local.env"), "TOKEN=dev\n").unwrap();
+        fs::write(dir.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        fs::create_dir(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/generated.rs"), "fn generated() {}\n").unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            let ignored = |label: &str| {
+                view.files
+                    .iter()
+                    .find(|file| file.label == label)
+                    .is_some_and(|file| file.ignored)
+            };
+            assert!(ignored("local.env"));
+            assert!(ignored("build/generated.rs"));
+            assert!(!ignored("visible.rs"));
+            let rows = tree_rows(&view.files, &view.expanded_dirs, &view.tree_limits);
+            assert!(rows.iter().any(|row| row.key == "local.env" && row.ignored));
+            assert!(rows.iter().any(|row| row.key == "build"));
+        });
+        test_cx.update(|window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("native-tree-file-local.env").visible());
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            view.open_file_finder(window, cx)
+        });
+        test_cx.run_until_parked();
+        test_cx.simulate_keystrokes("l o c a l");
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            assert!(
+                view.file_matches
+                    .iter()
+                    .any(|file| file.label == "local.env"),
+                "ignored files stay findable"
+            );
+        });
     }
 
     #[gpui_kit::test]
