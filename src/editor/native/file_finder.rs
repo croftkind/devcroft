@@ -25,6 +25,7 @@ impl NativeEditor {
                     ProjectFile {
                         path: m.path.clone(),
                         label: m.label.clone(),
+                        ignored: false,
                     },
                     Some(m.line),
                 )
@@ -73,6 +74,7 @@ impl NativeEditor {
                         .map(|part| part.as_os_str().to_string_lossy())
                         .collect::<Vec<_>>()
                         .join("/"),
+                    ignored: false,
                 })
             })
             .collect::<Vec<_>>();

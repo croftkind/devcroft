@@ -1,8 +1,11 @@
 //! Bounded checkout discovery for the built-in editor. The same index feeds
-//! the file tree, fuzzy opener, and text search, so all three honor ignores.
+//! the file tree, fuzzy opener, and text search. Git-ignored files stay
+//! visible in the tree and finder, but project text search skips them so
+//! build output and local configuration are never read in bulk.
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use std::{
+    collections::HashSet,
     fs,
     io::Read as _,
     path::{Path, PathBuf},
@@ -13,6 +16,8 @@ use std::{
 };
 
 const MAX_FILES: usize = 100_000;
+const MAX_IGNORED_FILES: usize = 10_000;
+const MAX_IGNORED_DIR_FILES: usize = 1_000;
 const MAX_SEARCH_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_RESULTS: usize = 200;
 
@@ -20,23 +25,15 @@ const MAX_RESULTS: usize = 200;
 pub(super) struct ProjectFile {
     pub path: PathBuf,
     pub label: String,
+    /// Matched by `.gitignore`, a global exclude, or `info/exclude`. Kept in
+    /// the tree and finder, but skipped by project text search.
+    pub ignored: bool,
 }
 
 pub(super) fn is_git_component(part: &std::ffi::OsStr) -> bool {
     part.to_string_lossy()
         .trim_end_matches(['.', ' '])
         .eq_ignore_ascii_case(".git")
-}
-
-fn build_gitignore(checkout: &Path, exclude_files: &[PathBuf]) -> ignore::gitignore::Gitignore {
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(checkout);
-    let _ = builder.add(checkout.join(".gitignore"));
-    for exclude in exclude_files {
-        let _ = builder.add(exclude);
-    }
-    builder
-        .build()
-        .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
 }
 
 pub(super) struct FileChanges {
@@ -59,15 +56,14 @@ impl FileChanges {
             .collect();
         let watched_checkout = checkout.clone();
         let watched_git_dirs = git_dirs.clone();
-        let mut gitignore = build_gitignore(&checkout, &exclude_files);
+        let watched_exclude_files = exclude_files.clone();
         let watcher = (|| -> notify::Result<RecommendedWatcher> {
             let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
                 if event.map_or(true, |event| {
                     affects_project(
                         &watched_checkout,
                         &watched_git_dirs,
-                        &exclude_files,
-                        &mut gitignore,
+                        &watched_exclude_files,
                         &event,
                     )
                 }) {
@@ -108,7 +104,6 @@ fn affects_project(
     checkout: &Path,
     git_dirs: &[PathBuf],
     exclude_files: &[PathBuf],
-    gitignore: &mut ignore::gitignore::Gitignore,
     event: &Event,
 ) -> bool {
     if matches!(event.kind, EventKind::Access(_)) {
@@ -117,46 +112,20 @@ fn affects_project(
     if event.paths.is_empty() {
         return true;
     }
-    if event.paths.iter().any(|path| {
-        path.file_name().is_some_and(|name| name == ".gitignore")
-            || exclude_files.iter().any(|exclude| path == exclude)
-    }) {
-        *gitignore = build_gitignore(checkout, exclude_files);
-        return true;
-    }
-    let is_dir_event = matches!(
-        event.kind,
-        EventKind::Create(notify::event::CreateKind::Folder)
-            | EventKind::Remove(notify::event::RemoveKind::Folder)
-    );
     event.paths.iter().any(|path| {
+        // `info/exclude` may live in a git directory outside the checkout.
+        if exclude_files.iter().any(|exclude| path == exclude) {
+            return true;
+        }
         if git_dirs.iter().any(|dir| path.starts_with(dir)) {
             return false;
         }
-        if let Ok(relative) = path.strip_prefix(checkout) {
-            if relative
+        if let Ok(relative) = path.strip_prefix(checkout)
+            && relative
                 .components()
                 .any(|component| is_git_component(component.as_os_str()))
-            {
-                return false;
-            }
-            // A top-level ignored directory (such as `target/` or `node_modules/`)
-            // is pruned at the root by `WalkBuilder` and cannot be re-included by a
-            // nested `.gitignore`. A root-level file has no nested `.gitignore`
-            // below it either.
-            let mut components = relative.components();
-            if let Some(first) = components.next() {
-                let is_nested = components.next().is_some();
-                if gitignore
-                    .matched(
-                        Path::new(first.as_os_str()),
-                        is_nested || is_dir_event || path.is_dir(),
-                    )
-                    .is_ignore()
-                {
-                    return false;
-                }
-            }
+        {
+            return false;
         }
         true
     })
@@ -235,14 +204,55 @@ impl<F: Fn() -> bool> fff_grep::Sink for TextSink<'_, F> {
 /// `ignore` applies .gitignore, global excludes, and parent rules. Hidden
 /// source files remain visible; repository metadata and nested checkouts do
 /// not enter the index. Symlinks are deliberately not followed.
+///
+/// The tree and finder also include ignored files: files matched directly,
+/// files inside visible folders, and small ignored folders. Huge ignored
+/// folders (build output, dependencies) are left out so they cannot crowd
+/// real source files out of `MAX_FILES` or make every refresh reindex them.
+/// Search filters ignored entries out again.
 pub(super) fn scan(root: &Path) -> Vec<ProjectFile> {
     let Ok(root) = root.canonicalize() else {
         return Vec::new();
     };
     let root = root.as_path();
+    let mut files = collect_visible(root);
+    if files.len() < MAX_FILES {
+        let visible_files: HashSet<PathBuf> = files.iter().map(|file| file.path.clone()).collect();
+        let visible_dirs = visible_dirs(root, &files);
+        let (ignored, ignored_dirs) =
+            collect_ignored_in_visible_dirs(root, &visible_files, visible_dirs, MAX_IGNORED_FILES);
+        let mut budget = MAX_IGNORED_FILES.min(MAX_FILES - files.len());
+        for file in ignored {
+            if budget == 0 {
+                break;
+            }
+            files.push(file);
+            budget -= 1;
+        }
+        let mut attempts = MAX_IGNORED_FILES;
+        for dir in ignored_dirs {
+            if budget == 0 || attempts == 0 {
+                break;
+            }
+            let limit = MAX_IGNORED_DIR_FILES.min(budget).min(attempts);
+            match collect_ignored_dir(root, &dir, limit) {
+                Some(dir_files) => {
+                    budget -= dir_files.len();
+                    files.extend(dir_files);
+                }
+                None => attempts = attempts.saturating_sub(limit + 1),
+            }
+        }
+    }
+    files.sort_unstable_by(|a, b| a.label.cmp(&b.label));
+    files
+}
+
+fn collect_visible(root: &Path) -> Vec<ProjectFile> {
     let filter_root = root.to_owned();
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
+        .ignore(true)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
@@ -270,15 +280,144 @@ pub(super) fn scan(root: &Path) -> Vec<ProjectFile> {
         };
         files.push(ProjectFile {
             path: entry.path().to_owned(),
-            label: relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/"),
+            label: relative_label(relative),
+            ignored: false,
         });
     }
-    files.sort_unstable_by(|a, b| a.label.cmp(&b.label));
     files
+}
+
+/// Every directory that contains a visible file, plus the checkout root.
+fn visible_dirs(root: &Path, files: &[ProjectFile]) -> HashSet<PathBuf> {
+    let mut dirs = HashSet::from([root.to_owned()]);
+    for file in files {
+        let mut parent = file.path.parent();
+        while let Some(dir) = parent {
+            if dir == root || !dir.starts_with(root) || !dirs.insert(dir.to_owned()) {
+                break;
+            }
+            parent = dir.parent();
+        }
+    }
+    dirs
+}
+
+/// Walk only visible directories to find ignored files and the topmost ignored
+/// directory on each branch. Ignored directories are not descended into here;
+/// `scan` revisits the small ones with a bounded walk.
+fn collect_ignored_in_visible_dirs(
+    root: &Path,
+    visible_files: &HashSet<PathBuf>,
+    visible_dirs: HashSet<PathBuf>,
+    limit: usize,
+) -> (Vec<ProjectFile>, Vec<PathBuf>) {
+    let candidates = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let discovered = Arc::clone(&candidates);
+    let filter_root = root.to_owned();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .require_git(false)
+        .filter_entry(move |entry| {
+            if is_git_component(entry.file_name()) {
+                return false;
+            }
+            if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                return true;
+            }
+            if entry.path() == filter_root {
+                return true;
+            }
+            if entry.path().join(".git").exists() {
+                return false;
+            }
+            if !visible_dirs.contains(entry.path()) {
+                discovered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(entry.path().to_owned());
+                return false;
+            }
+            true
+        })
+        .build();
+    let mut files = Vec::new();
+    for entry in walker.flatten() {
+        if files.len() >= limit {
+            break;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_file())
+            || visible_files.contains(entry.path())
+        {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        files.push(ProjectFile {
+            path: entry.path().to_owned(),
+            label: relative_label(relative),
+            ignored: true,
+        });
+    }
+    let candidates = candidates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (files, candidates)
+}
+
+/// Collect an ignored directory only when it fits in `limit` files. A huge
+/// directory is abandoned early instead of filling the index with build output.
+fn collect_ignored_dir(root: &Path, dir: &Path, limit: usize) -> Option<Vec<ProjectFile>> {
+    let filter_root = dir.to_owned();
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
+        .require_git(false)
+        .filter_entry(move |entry| {
+            if is_git_component(entry.file_name()) {
+                return false;
+            }
+            !(entry.file_type().is_some_and(|kind| kind.is_dir())
+                && entry.path() != filter_root
+                && entry.path().join(".git").exists())
+        })
+        .build();
+    let mut files = Vec::new();
+    for entry in walker.flatten() {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        files.push(ProjectFile {
+            path: entry.path().to_owned(),
+            label: relative_label(relative),
+            ignored: true,
+        });
+        if files.len() > limit {
+            return None;
+        }
+    }
+    Some(files)
+}
+
+fn relative_label(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Search only indexed files and cap memory, per-file I/O, and result count.
@@ -312,6 +451,9 @@ pub(super) fn search_text(
     let searcher = fff_grep::SearcherBuilder::new().line_number(true).build();
     let mut out = TextMatches::default();
     for file in files {
+        if file.ignored {
+            continue;
+        }
         if cancelled() {
             return None;
         }
@@ -461,22 +603,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovery_and_search_respect_ignores() {
+    fn discovery_includes_ignored_files_but_search_skips_them() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            "ignored.txt\nbuild/\n*.log\n",
+        )
+        .unwrap();
         fs::write(dir.path().join("visible.rs"), "let needle = 1;\n").unwrap();
         fs::write(dir.path().join("ignored.txt"), "needle\n").unwrap();
         fs::create_dir(dir.path().join("nested")).unwrap();
         fs::write(dir.path().join("nested/child.rs"), "child\n").unwrap();
+        fs::write(dir.path().join("nested/local.log"), "needle\n").unwrap();
+        fs::create_dir(dir.path().join("build")).unwrap();
+        fs::write(dir.path().join("build/generated.rs"), "needle\n").unwrap();
         let files = scan(dir.path());
         assert!(files.iter().any(|file| file.label == "visible.rs"));
         assert!(files.iter().any(|file| file.label == "nested/child.rs"));
-        assert!(!files.iter().any(|file| file.label == "ignored.txt"));
+        for ignored in ["ignored.txt", "nested/local.log", "build/generated.rs"] {
+            assert!(
+                files
+                    .iter()
+                    .find(|file| file.label == ignored)
+                    .is_some_and(|file| file.ignored),
+                "expected {ignored} to be indexed as ignored"
+            );
+        }
+        assert!(files.iter().filter(|file| !file.ignored).all(|file| {
+            !["ignored.txt", "nested/local.log", "build/generated.rs"]
+                .contains(&file.label.as_str())
+        }));
         let matches = search_text(dir.path(), &files, "needle", || false)
             .unwrap()
             .items;
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].line, 1);
+    }
+
+    #[test]
+    fn large_ignored_directories_stay_out_of_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "build/\n.env\n").unwrap();
+        fs::write(dir.path().join(".env"), "TOKEN=dev\n").unwrap();
+        fs::write(dir.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        fs::create_dir(dir.path().join("build")).unwrap();
+        for index in 0..=MAX_IGNORED_DIR_FILES {
+            fs::write(
+                dir.path()
+                    .join("build")
+                    .join(format!("generated-{index}.rs")),
+                "fn generated() {}\n",
+            )
+            .unwrap();
+        }
+        let files = scan(dir.path());
+        assert!(
+            files
+                .iter()
+                .find(|file| file.label == ".env")
+                .is_some_and(|file| file.ignored)
+        );
+        assert!(files.iter().any(|file| file.label == "visible.rs"));
+        assert!(
+            !files.iter().any(|file| file.label.starts_with("build/")),
+            "large ignored directories must not flood the index"
+        );
     }
 
     #[test]
@@ -589,63 +780,39 @@ mod tests {
     }
 
     #[test]
-    fn project_watch_ignores_reads_git_internals_and_ignored_build_outputs_but_tracks_worktree() {
+    fn project_watch_tracks_worktree_and_ignored_entries_but_skips_reads_and_git_internals() {
         use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join(".gitignore"), "/target/\n*.log\nignored.txt\n").unwrap();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
         let git_dirs = [root.join(".git")];
         let exclude_files = [root.join(".git/info/exclude")];
-        let mut gitignore = ignore::gitignore::Gitignore::empty();
         for access_path in ["src/main.rs", ".gitignore", ".git/info/exclude"] {
             assert!(!affects_project(
                 root,
                 &git_dirs,
                 &exclude_files,
-                &mut gitignore,
                 &Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)))
                     .add_path(root.join(access_path))
             ));
         }
-        assert!(
-            !gitignore
-                .matched(Path::new("ignored.txt"), false)
-                .is_ignore(),
-            "Access(Open) on .gitignore must not rebuild the matcher"
-        );
-        assert!(affects_project(
-            root,
-            &git_dirs,
-            &exclude_files,
-            &mut gitignore,
-            &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(".gitignore"))
-        ));
-        assert!(
-            gitignore
-                .matched(Path::new("ignored.txt"), false)
-                .is_ignore(),
-            "non-access event on .gitignore rebuilds the matcher"
-        );
-        for ignored in [
-            ".git/index",
-            ".GIT/config",
-            "target/debug/deps/app.d",
-            "ignored.txt",
-        ] {
+        for ignored in [".git/index", ".GIT/config"] {
             assert!(
                 !affects_project(
                     root,
                     &git_dirs,
                     &exclude_files,
-                    &mut gitignore,
                     &Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join(ignored))
                 ),
                 "expected {ignored} to be ignored by watcher"
             );
         }
         for tracked in [
-            "src/new.rs",
+            "ignored.txt",
+            "target",
+            "target/debug/deps/app.d",
             "src/keep.log",
+            "src/new.rs",
             ".gitignore",
             ".git/info/exclude",
         ] {
@@ -654,7 +821,6 @@ mod tests {
                     root,
                     &git_dirs,
                     &exclude_files,
-                    &mut gitignore,
                     &Event::new(EventKind::Create(CreateKind::Any)).add_path(root.join(tracked))
                 ),
                 "expected {tracked} to trigger project refresh"

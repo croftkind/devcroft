@@ -1,4 +1,5 @@
-//! fff ranking over the editor's bounded, ignore-aware checkout index.
+//! fff ranking over the editor's bounded checkout index. Ignored files are
+//! indexed but ranked after non-ignored matches.
 
 use std::{collections::HashMap, path::Path};
 
@@ -91,7 +92,10 @@ impl Finder {
             );
         }
         ranked.sort_unstable_by(|(a_score, a), (b_score, b)| {
-            b_score.cmp(a_score).then_with(|| a.label.cmp(&b.label))
+            a.ignored
+                .cmp(&b.ignored)
+                .then_with(|| b_score.cmp(a_score))
+                .then_with(|| a.label.cmp(&b.label))
         });
         Some(Matches {
             total,
@@ -253,6 +257,24 @@ mod tests {
                 .iter()
                 .all(|file| files.iter().any(|allowed| allowed.label == file.label))
         );
+        let ignored = files
+            .iter()
+            .find(|file| file.label == "ignored.rs")
+            .expect("ignored files stay in the finder index");
+        assert!(ignored.ignored);
+        assert_eq!(
+            finder
+                .search("ignored.rs", || false)
+                .unwrap()
+                .files
+                .first()
+                .map(|file| file.label.as_str()),
+            Some("ignored.rs")
+        );
+        assert!(
+            all.files.last().is_some_and(|file| file.ignored),
+            "ignored files rank after visible files"
+        );
         assert_eq!(
             preview(dir.path(), &results.files[0], None, 0).text,
             "fn navigation() {}\n"
@@ -267,6 +289,7 @@ mod tests {
         let file = ProjectFile {
             path,
             label: "long.txt".into(),
+            ignored: false,
         };
         let result = preview(dir.path(), &file, Some(2), prefix.len());
         assert_eq!(result.first_line, 2);
@@ -305,6 +328,7 @@ mod tests {
         let file = ProjectFile {
             path: path.clone(),
             label: "long.txt".into(),
+            ignored: false,
         };
         let prefix = "é".repeat(50_000);
         for query in [" ", "…"] {
@@ -328,7 +352,11 @@ mod tests {
             let label = format!("file-{index:04}.rs");
             let path = dir.path().join(&label);
             fs::write(&path, "fn main() {}\n").unwrap();
-            files.push(ProjectFile { path, label });
+            files.push(ProjectFile {
+                path,
+                label,
+                ignored: false,
+            });
         }
         let finder = Finder::new(&files).unwrap();
         assert_eq!(finder.search("", || false).unwrap().total, 1030);
@@ -350,6 +378,7 @@ mod tests {
             files.push(ProjectFile {
                 path,
                 label: name.to_string_lossy().into_owned(),
+                ignored: false,
             });
         }
         let finder = Finder::new(&files).unwrap();
