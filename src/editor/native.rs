@@ -677,6 +677,24 @@ impl NativeEditor {
                 },
             )
             .detach();
+            let directory = self
+                .path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .unwrap()
+                .to_owned();
+            cx.subscribe_in(
+                &preview,
+                window,
+                move |this, _, event: &crate::preview::OpenRelativeFile, window, cx| {
+                    this.error = this
+                        .open(&directory.join(&event.0), None, window, cx)
+                        .err()
+                        .map(|error| format!("Could not open reference: {error:#}"));
+                    cx.notify();
+                },
+            )
+            .detach();
             self.markdown_preview = Some(preview);
         }
         self.editor_focus(cx).focus(window, cx);
@@ -4596,6 +4614,77 @@ mod tests {
                     .1,
                 1
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn markdown_relative_reference_opens_tab_and_preserves_source_draft(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        let source = root.join("docs/source.md");
+        let target = root.join("My Notes.txt");
+        fs::write(&source, "# Saved\n").unwrap();
+        fs::write(&target, "Target\n").unwrap();
+        fs::write(dir.path().join("outside.txt"), "Outside\n").unwrap();
+        let (view, test_cx) = test_editor(cx, &root);
+        test_cx.run_until_parked();
+        let preview = view.update_in(test_cx, |view, window, cx| {
+            view.open(&source, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.set_value("# Draft\n\n[Target](../My%20Notes.txt)\n", window, cx);
+            });
+            view.dirty = true;
+            view.toggle_markdown_preview(window, cx);
+            view.markdown_preview.clone().unwrap()
+        });
+        // Missing files and paths outside the checkout keep the source open.
+        for path in ["missing.txt", "../../outside.txt"] {
+            preview.update(test_cx, |_, cx| {
+                cx.emit(crate::preview::OpenRelativeFile(path.into()));
+            });
+            test_cx.run_until_parked();
+            view.read_with(test_cx, |view, _| {
+                assert_eq!(view.path, Some(source.canonicalize().unwrap()));
+                assert_eq!(view.tabs.len(), 1);
+                assert!(view.markdown_preview.is_some());
+                assert!(
+                    view.error
+                        .as_ref()
+                        .unwrap()
+                        .contains("Could not open reference")
+                );
+            });
+        }
+        preview.update(test_cx, |_, cx| {
+            cx.emit(crate::preview::OpenRelativeFile("../My Notes.txt".into()));
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert_eq!(view.path, Some(target.canonicalize().unwrap()));
+            assert_eq!(view.tabs.len(), 2);
+            assert!(view.error.is_none());
+            let draft = &view.inactive_documents[&source.canonicalize().unwrap()];
+            assert!(draft.dirty);
+            assert!(draft.editor.read(cx).value().starts_with("# Draft"));
+            assert_eq!(fs::read_to_string(&source).unwrap(), "# Saved\n");
+        });
+        // Following the same reference again selects the existing target tab.
+        let preview = view.update_in(test_cx, |view, window, cx| {
+            view.open(&source, None, window, cx).unwrap();
+            view.toggle_markdown_preview(window, cx);
+            view.markdown_preview.clone().unwrap()
+        });
+        preview.update(test_cx, |_, cx| {
+            cx.emit(crate::preview::OpenRelativeFile("../My Notes.txt".into()));
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, _| {
+            assert_eq!(view.path, Some(target.canonicalize().unwrap()));
+            assert_eq!(view.tabs.len(), 2);
         });
     }
 

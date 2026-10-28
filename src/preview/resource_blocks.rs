@@ -177,7 +177,22 @@ impl PreviewView {
             })
             .on_link_click({
                 let open = self.reference_handler(cx);
+                let view = cx.entity().downgrade();
+                let editor_preview = self.editor_preview;
                 move |url, event, window, cx| {
+                    if editor_preview && let Some(path) = relative_file_path(url) {
+                        let activate = match event {
+                            gpui_kit::ClickEvent::Mouse(click) => {
+                                matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+                            }
+                            gpui_kit::ClickEvent::Keyboard(_) => true,
+                            gpui_kit::ClickEvent::Touch(click) => !click.long_press,
+                        };
+                        if activate {
+                            let _ = view.update(cx, |_, cx| cx.emit(OpenRelativeFile(path)));
+                        }
+                        return;
+                    }
                     crate::markdown_references::open_link(url, event, window, cx, &open)
                 }
             })

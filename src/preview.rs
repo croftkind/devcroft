@@ -359,6 +359,42 @@ impl EventEmitter<TocActive> for PreviewView {}
 pub(crate) struct OpenReference(pub crate::markdown_references::Reference);
 impl EventEmitter<OpenReference> for PreviewView {}
 
+pub(crate) struct OpenRelativeFile(pub std::path::PathBuf);
+impl EventEmitter<OpenRelativeFile> for PreviewView {}
+
+/// URL paths are relative to the source document, with query/fragment suffixes
+/// excluded from the filename. Leave absolute URLs and in-document anchors to
+/// the existing link handler.
+fn relative_file_path(url: &str) -> Option<std::path::PathBuf> {
+    let path = url.split(['?', '#']).next()?;
+    if path.is_empty() || path.starts_with(['/', '\\']) || path.split('/').next()?.contains(':') {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut input = path.bytes();
+    while let Some(byte) = input.next() {
+        bytes.push(if byte == b'%' {
+            let high = (input.next()? as char).to_digit(16)?;
+            let low = (input.next()? as char).to_digit(16)?;
+            ((high << 4) | low) as u8
+        } else {
+            byte
+        });
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
+    if decoded.starts_with(['/', '\\']) || decoded.chars().any(char::is_control) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(decoded);
+    if matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(_))
+    ) {
+        return None;
+    }
+    Some(path)
+}
+
 impl PreviewView {
     #[cfg(test)]
     pub(crate) fn benchmark_list_state(&self, cx: &App) -> (gpui_kit::ListState, usize) {
@@ -1010,6 +1046,48 @@ impl Render for PreviewView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_file_links_decode_paths_and_exclude_url_suffixes() {
+        for (url, expected) in [
+            ("file.md", "file.md"),
+            ("./src/main.rs", "./src/main.rs"),
+            ("../notes.md#heading", "../notes.md"),
+            ("notes.md?view=1#heading", "notes.md"),
+            ("folder/My%20Notes%23%3F.md", "folder/My Notes#?.md"),
+            ("%E6%97%A5%E6%9C%AC.md", "日本.md"),
+            ("a+b.md", "a+b.md"),
+        ] {
+            assert_eq!(relative_file_path(url), Some(expected.into()), "{url}");
+        }
+        for url in [
+            "",
+            "#heading",
+            "?view=1",
+            "/absolute.md",
+            "//example.com/file.md",
+            "https://example.com/file.md",
+            "mailto:me@example.com",
+            "devcroft:repository/test",
+            "file:///tmp/file.md",
+            "C:/file.md",
+            "\\\\server\\file.md",
+            "%2Fabsolute.md",
+            "bad%",
+            "bad%GG.md",
+            "%FF.md",
+            "bad%00.md",
+        ] {
+            assert_eq!(relative_file_path(url), None, "{url}");
+        }
+        #[cfg(not(windows))]
+        assert_eq!(
+            relative_file_path("report%3A2026.md"),
+            Some("report:2026.md".into())
+        );
+        #[cfg(windows)]
+        assert_eq!(relative_file_path("C%3A/file.md"), None);
+    }
 
     #[gpui_kit::test]
     fn editor_preview_stays_comment_free_after_content_updates(cx: &mut gpui_kit::TestAppContext) {
