@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install/update the latest binary: curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/install.sh | bash
+# Install/update the latest binary: curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash
 set -euo pipefail
-repo="https://github.com/hossainemruz/devcroft"
+repo="https://github.com/croftkind/devcroft"
 version=""
 fail() { echo "devcroft: $*" >&2; exit 1; }
 while [[ $# -gt 0 ]]; do
@@ -101,7 +101,7 @@ if [[ "$target" == *-apple-darwin ]]; then
   for caskroom in /opt/homebrew/Caskroom /usr/local/Caskroom "${HOMEBREW_PREFIX:-/opt/homebrew}/Caskroom"; do
     for cask_app in "$caskroom"/devcroft/*/Devcroft.app; do
       if [[ -e "$dest" && "$cask_app" -ef "$dest" ]]; then
-        fail 'This app is managed by Homebrew. Run: brew upgrade --cask hossainemruz/tap/devcroft'
+        fail 'This app is managed by Homebrew. Run: brew upgrade --cask croftkind/tap/devcroft'
       fi
     done
   done

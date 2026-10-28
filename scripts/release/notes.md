@@ -1,7 +1,7 @@
 Install or update Devcroft:
 
 ```sh
-curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash
 ```
 
 Packages: Linux x86-64 (Ubuntu 24.04 or compatible glibc 2.39+ systems), macOS 13+ on Apple Silicon. Linux requires a working Vulkan driver, fontconfig, ALSA, X11/Wayland and xkbcommon runtime libraries. Git and your chosen agent harness must be on PATH. The installer verifies SHA-256 checksums before replacing the application. Restart Devcroft after updating.
@@ -11,7 +11,7 @@ macOS packages are ad-hoc signed, not Apple notarized. If macOS blocks a manuall
 Homebrew on macOS (once the tap has been enabled):
 
 ```sh
-brew install --cask hossainemruz/tap/devcroft
+brew install --cask croftkind/tap/devcroft
 brew upgrade --cask devcroft
 ```
 

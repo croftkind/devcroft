@@ -1120,8 +1120,8 @@ mod tests {
     #[test]
     fn key_normalization_matches_electron() {
         assert_eq!(
-            normalize_repository_key("HossainEmruz-Devcroft"),
-            "hossainemruz-devcroft"
+            normalize_repository_key("CroftKind-Devcroft"),
+            "croftkind-devcroft"
         );
         assert_eq!(normalize_repository_key("  owner / name  "), "owner-name");
         assert_eq!(normalize_repository_key("a__b..c"), "a__b..c");
@@ -1133,8 +1133,8 @@ mod tests {
     #[test]
     fn key_suggestion_prefers_owner_name() {
         assert_eq!(
-            suggest_repository_key("hossainemruz", "Devcroft"),
-            "hossainemruz-devcroft"
+            suggest_repository_key("croftkind", "Devcroft"),
+            "croftkind-devcroft"
         );
         assert_eq!(suggest_repository_key("", "Devcroft"), "devcroft");
         assert_eq!(suggest_repository_key("  ", "My Repo!"), "my-repo");
@@ -1142,7 +1142,7 @@ mod tests {
 
     #[test]
     fn key_validation_rejects_without_normalizing() {
-        assert!(require_repository_key("hossainemruz-devcroft").is_ok());
+        assert!(require_repository_key("croftkind-devcroft").is_ok());
         assert!(require_repository_key("a").is_ok());
         assert!(require_repository_key("a.b_c-d9").is_ok());
         assert!(require_repository_key("").is_err());
@@ -1157,12 +1157,12 @@ mod tests {
 
     #[test]
     fn remote_identity_parses_url_and_scp_forms() {
-        let https = parse_remote_identity(Some("https://github.com/hossainemruz/devcroft.git"));
-        assert_eq!(https.owner.as_deref(), Some("hossainemruz"));
+        let https = parse_remote_identity(Some("https://github.com/croftkind/devcroft.git"));
+        assert_eq!(https.owner.as_deref(), Some("croftkind"));
         assert_eq!(https.name.as_deref(), Some("devcroft"));
 
-        let scp = parse_remote_identity(Some("git@github.com:hossainemruz/devcroft.git"));
-        assert_eq!(scp.owner.as_deref(), Some("hossainemruz"));
+        let scp = parse_remote_identity(Some("git@github.com:croftkind/devcroft.git"));
+        assert_eq!(scp.owner.as_deref(), Some("croftkind"));
         assert_eq!(scp.name.as_deref(), Some("devcroft"));
 
         let nested = parse_remote_identity(Some("https://host.com/a/b/c"));
@@ -1189,7 +1189,7 @@ mod tests {
                 "remote",
                 "add",
                 "origin",
-                "git@github.com:hossainemruz/devcroft.git",
+                "git@github.com:croftkind/devcroft.git",
             ],
         );
 
@@ -1197,12 +1197,12 @@ mod tests {
         assert_eq!(inspection.remote_name, "origin");
         assert_eq!(
             inspection.clone_url.as_deref(),
-            Some("git@github.com:hossainemruz/devcroft.git")
+            Some("git@github.com:croftkind/devcroft.git")
         );
-        assert_eq!(inspection.owner.as_deref(), Some("hossainemruz"));
+        assert_eq!(inspection.owner.as_deref(), Some("croftkind"));
         assert_eq!(inspection.name, "devcroft");
         assert_eq!(inspection.base_branch, "main");
-        assert_eq!(inspection.suggested_key, "hossainemruz-devcroft");
+        assert_eq!(inspection.suggested_key, "croftkind-devcroft");
     }
 
     #[test]
@@ -1220,7 +1220,7 @@ mod tests {
 
         let created = create_repository(
             &root,
-            "hossainemruz-devcroft",
+            "croftkind-devcroft",
             checkout.path(),
             &NewRepositoryInput {
                 display_name: Some("Devcroft".to_owned()),
@@ -1228,26 +1228,26 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(created.key, "hossainemruz-devcroft");
+        assert_eq!(created.key, "croftkind-devcroft");
 
         // Portable record is camelCase for Electron parity.
         let text = std::fs::read_to_string(&created.repository_path).unwrap();
         assert!(text.contains("\"displayName\""), "{text}");
         assert!(text.contains("\"baseBranch\""), "{text}");
         let metadata: RepositoryMetadata = serde_json::from_str(&text).unwrap();
-        assert_eq!(metadata.key.as_deref(), Some("hossainemruz-devcroft"));
+        assert_eq!(metadata.key.as_deref(), Some("croftkind-devcroft"));
         assert_eq!(metadata.display_name.as_deref(), Some("Devcroft"));
         assert_eq!(metadata.base_branch.as_deref(), Some("main"));
 
         // Device binding points at the real checkout root.
         let state = DeviceStore::new(&root).load().unwrap();
-        let binding = state.repositories.as_ref().unwrap()["hossainemruz-devcroft"].clone();
+        let binding = state.repositories.as_ref().unwrap()["croftkind-devcroft"].clone();
         assert!(binding.checkout_path.as_deref().is_some());
         assert_eq!(binding.remote_name.as_deref(), Some("origin"));
         // Creating stamps recency so the new repo survives the palette cap.
         assert_eq!(
             state.last_repository.as_deref(),
-            Some("hossainemruz-devcroft")
+            Some("croftkind-devcroft")
         );
         let opened = binding
             .last_opened_at

@@ -104,15 +104,15 @@ impl RepositoryForm {
             })
         };
         Self {
-            key: input(&draft.key, "e.g. hossainemruz-devcroft", cx),
+            key: input(&draft.key, "e.g. croftkind-devcroft", cx),
             display_name: input(&draft.display_name, "e.g. Devcroft", cx),
-            owner: input(&draft.owner, "e.g. hossainemruz", cx),
+            owner: input(&draft.owner, "e.g. croftkind", cx),
             name: input(&draft.name, "e.g. devcroft", cx),
             description: input(&draft.description, "What is this repository for?", cx),
             tags: input(&draft.tags, "Comma-separated, e.g. rust, desktop", cx),
             clone_url: input(
                 &draft.clone_url,
-                "e.g. git@github.com:hossainemruz/devcroft.git",
+                "e.g. git@github.com:croftkind/devcroft.git",
                 cx,
             ),
             base_branch: input(&draft.base_branch, "e.g. main", cx),

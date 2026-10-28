@@ -7,7 +7,7 @@
 After the tap is enabled and the first release is published:
 
 ```sh
-brew install --cask hossainemruz/tap/devcroft
+brew install --cask croftkind/tap/devcroft
 brew upgrade --cask devcroft
 ```
 
@@ -20,7 +20,7 @@ When switching from a source or shell installation, quit Devcroft and move the e
 Once a release has been published, run:
 
 ```sh
-curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash
 ```
 
 The same command installs a fresh copy or replaces an existing install. It downloads the installer from the latest stable GitHub release, resolves that release's version, downloads the matching architecture archive and `SHA256SUMS`, checks its SHA-256 hash, and verifies the executable version before replacing the app. No Rust/Zig compiler, source checkout, GitHub login, or sudo is needed. You need Bash, curl, tar, and either `sha256sum` or `shasum`.
@@ -33,20 +33,20 @@ Add `~/.local/bin` to your PATH for CLI use, then launch **Devcroft** from your 
 To pin a version, including an intentional downgrade:
 
 ```sh
-curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/install.sh | bash -s -- --version v1.2.3
+curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash -s -- --version v1.2.3
 ```
 
 Optional absolute-path overrides: `DEVCROFT_BIN_DIR` for the CLI, `DEVCROFT_APP_DIR` for the macOS bundle parent, and `XDG_DATA_HOME` for Linux launcher/icon files. Pass installer environment variables to `bash`, for example `curl ... | DEVCROFT_APP_DIR="$HOME/Applications" bash`. An install into a custom location must be updated with the same overrides.
 
 Ubuntu 24.04 users can alternatively download the `.deb` and run `sudo apt install ./devcroft-vX.Y.Z-x86_64-unknown-linux-gnu.deb`. This installs the CLI and desktop launcher system-wide and declares runtime dependencies. Choose one installation method to avoid duplicate launchers or PATH entries.
 
-Archives and checksums are also available directly on the [GitHub Releases page](https://github.com/hossainemruz/devcroft/releases). Checksums detect corrupt or mismatched downloads; they are distributed through the same GitHub release as the binaries.
+Archives and checksums are also available directly on the [GitHub Releases page](https://github.com/croftkind/devcroft/releases). Checksums detect corrupt or mismatched downloads; they are distributed through the same GitHub release as the binaries.
 
 ## New-release notice
 
 The desktop checks the public GitHub latest-release endpoint in a background task at startup and every six hours while running. It only offers a strictly newer `vX.Y.Z` stable release. Drafts, prereleases, malformed responses, timeouts and network/rate-limit errors are ignored. It needs `curl` on PATH and sends no workspace data or credentials.
 
-The Home notice has **Release notes**, **Copy update command**, and **Dismiss** actions. Dismissal lasts for the current Home view/app session and only hides that version. For Homebrew-managed bundles, the copied command is `brew upgrade --cask hossainemruz/tap/devcroft`; other installs receive the shell installer command above. Detection checks installed cask links under `/opt/homebrew`, `/usr/local`, and `HOMEBREW_PREFIX` when provided, without running Homebrew. The shell installer also refuses to replace a bundle owned by Homebrew. Updating is explicitly run by the user in their terminal. System `.deb` installs show **Download update** instead, opening the release assets so users can install the newer package through apt. Set `DEVCROFT_DISABLE_UPDATE_CHECK=1` in the desktop process environment to disable checks.
+The Home notice has **Release notes**, **Copy update command**, and **Dismiss** actions. Dismissal lasts for the current Home view/app session and only hides that version. For Homebrew-managed bundles, the copied command is `brew upgrade --cask croftkind/tap/devcroft`; other installs receive the shell installer command above. Detection checks installed cask links under `/opt/homebrew`, `/usr/local`, and `HOMEBREW_PREFIX` when provided, without running Homebrew. The shell installer also refuses to replace a bundle owned by Homebrew. Updating is explicitly run by the user in their terminal. System `.deb` installs show **Download update** instead, opening the release assets so users can install the newer package through apt. Set `DEVCROFT_DISABLE_UPDATE_CHECK=1` in the desktop process environment to disable checks.
 
 ## Publish a release
 
@@ -77,9 +77,9 @@ When resuming a draft created by older tooling, the publisher removes its retire
 
 ## Enable the Homebrew tap
 
-Create the public GitHub repository `hossainemruz/homebrew-tap` with an initial commit (a README is sufficient). In the **Devcroft application repository**, configure:
+Create the public GitHub repository `croftkind/homebrew-tap` with an initial commit (a README is sufficient). In the **Devcroft application repository**, configure:
 
-- Actions variable `HOMEBREW_TAP`: `hossainemruz/homebrew-tap`.
+- Actions variable `HOMEBREW_TAP`: `croftkind/homebrew-tap`.
 - Actions secret `HOMEBREW_TAP_TOKEN`: a fine-grained token restricted to that tap repository with **Contents: read and write**. A GitHub App token may be used instead with the corresponding workflow setup.
 
 The first successful release creates `Casks/devcroft.rb`; no manual version/checksum edits are needed. Until the variable is configured, the tap job is skipped and normal releases continue. An enabled but failed tap update marks that job failed while leaving the already-published release intact; rerun the job after correcting its configuration. The release workflow does not create repositories or credentials.
@@ -87,7 +87,7 @@ The first successful release creates `Casks/devcroft.rb`; no manual version/chec
 The cask template lives at `packaging/homebrew/devcroft.rb.in`. To generate a cask manually from a published release:
 
 ```sh
-gh release download v1.2.3 --repo hossainemruz/devcroft --pattern SHA256SUMS --dir /tmp/devcroft-release
+gh release download v1.2.3 --repo croftkind/devcroft --pattern SHA256SUMS --dir /tmp/devcroft-release
 python3 scripts/release/homebrew.py v1.2.3 /tmp/devcroft-release/SHA256SUMS /path/to/homebrew-tap/Casks/devcroft.rb
 ```
 

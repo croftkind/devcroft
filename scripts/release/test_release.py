@@ -221,7 +221,7 @@ class InstallerTests(unittest.TestCase):
 import os, pathlib, shutil, sys
 args = sys.argv[1:]
 if '--write-out' in args:
-    print('https://github.com/hossainemruz/devcroft/releases/tag/v1.2.3', end='')
+    print('https://github.com/croftkind/devcroft/releases/tag/v1.2.3', end='')
 else:
     shutil.copyfile(pathlib.Path(os.environ['FIXTURE_DIR']) / args[-1].rsplit('/', 1)[-1], args[args.index('--output') + 1])
 ''')

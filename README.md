@@ -9,13 +9,13 @@ Devcroft is a GPUI based desktop app for personal development workflow. It focus
 Install or update the latest release with the same command (available after the first release is published):
 
 ```sh
-curl -fsSL https://github.com/hossainemruz/devcroft/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/croftkind/devcroft/releases/latest/download/install.sh | bash
 ```
 
 macOS users can alternatively install through our Homebrew tap once it is enabled:
 
 ```sh
-brew install --cask hossainemruz/tap/devcroft
+brew install --cask croftkind/tap/devcroft
 brew upgrade --cask devcroft
 ```
 
