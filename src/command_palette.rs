@@ -146,6 +146,44 @@ pub(crate) fn is_save_shortcut(
     key.eq_ignore_ascii_case("s")
 }
 
+/// Match the editor find shortcut from a raw keystroke: `cmd-f` or `ctrl-f`
+/// on every OS. Like [`is_save_shortcut`], the built-in editor never sends
+/// keys to a pty, so accepting both chords costs no terminal behavior and
+/// matches users' habits when switching OS/keyboards. `alt`/`shift`
+/// combinations never match, leaving `cmd-shift-f`/`ctrl-h` and
+/// option-modified typing to their own bindings.
+pub(crate) fn is_find_shortcut(
+    key: &str,
+    platform: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    if alt || shift || !(platform || control) {
+        return false;
+    }
+    key.eq_ignore_ascii_case("f")
+}
+
+/// Match the editor replace shortcut from a raw keystroke: `cmd-shift-f` or
+/// `ctrl-h`, the same chords gpui-kit binds for replace in the built-in
+/// editor. Accepting both on every OS matches [`is_find_shortcut`] and stays
+/// safe because the built-in editor never forwards keys to a pty. `alt` and
+/// plain `shift-f` never match.
+pub(crate) fn is_replace_shortcut(
+    key: &str,
+    platform: bool,
+    control: bool,
+    shift: bool,
+    alt: bool,
+) -> bool {
+    if alt {
+        return false;
+    }
+    (platform && shift && key.eq_ignore_ascii_case("f"))
+        || (control && !shift && key.eq_ignore_ascii_case("h"))
+}
+
 /// Every static command the bar can run, in canonical order. Repository
 /// switching is dynamic (one [`PaletteItem::SwitchRepository`] per recent
 /// repository) and lives outside this enum.
@@ -906,6 +944,43 @@ mod tests {
         assert!(!is_save_shortcut("s", false, true, false, true));
         assert!(!is_save_shortcut("k", true, false, false, false));
         assert!(!is_save_shortcut("k", false, true, false, false));
+    }
+
+    #[test]
+    fn find_shortcut_matches_cmd_or_ctrl_f_on_every_os() {
+        // The built-in editor never sends keys to a pty, so both `Cmd+F`
+        // and `Ctrl+F` find in the open file everywhere: users switching
+        // OS/keyboards expect either chord to work.
+        assert!(is_find_shortcut("f", true, false, false, false));
+        assert!(is_find_shortcut("F", true, false, false, false));
+        assert!(is_find_shortcut("f", false, true, false, false));
+        assert!(is_find_shortcut("F", false, true, false, false));
+        assert!(is_find_shortcut("f", true, true, false, false));
+        assert!(!is_find_shortcut("f", false, false, false, false));
+        assert!(!is_find_shortcut("f", true, false, true, false));
+        assert!(!is_find_shortcut("f", false, true, true, false));
+        assert!(!is_find_shortcut("f", true, false, false, true));
+        assert!(!is_find_shortcut("f", false, true, false, true));
+        assert!(!is_find_shortcut("g", true, false, false, false));
+        assert!(!is_find_shortcut("s", false, true, false, false));
+    }
+
+    #[test]
+    fn replace_shortcut_matches_cmd_shift_f_or_ctrl_h() {
+        assert!(is_replace_shortcut("f", true, false, true, false));
+        assert!(is_replace_shortcut("F", true, false, true, false));
+        assert!(is_replace_shortcut("h", false, true, false, false));
+        assert!(is_replace_shortcut("H", false, true, false, false));
+        assert!(is_replace_shortcut("h", true, true, false, false));
+        // Find and replace must stay distinct: plain `Cmd+F`/`Ctrl+F` is
+        // find, and plain `Cmd+H` is not replace.
+        assert!(!is_replace_shortcut("f", true, false, false, false));
+        assert!(!is_replace_shortcut("f", false, true, false, false));
+        assert!(!is_replace_shortcut("h", true, false, false, false));
+        assert!(!is_replace_shortcut("h", false, true, true, false));
+        assert!(!is_replace_shortcut("f", true, false, true, true));
+        assert!(!is_replace_shortcut("h", false, true, false, true));
+        assert!(!is_replace_shortcut("s", true, false, true, false));
     }
 
     #[test]
