@@ -44,11 +44,18 @@ use gpui_kit::img;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, ScrollHandle,
-    StatefulInteractiveElement, Styled, TestSupportExt as _, Window, div, px, rgb,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, TestSupportExt as _, Window, div, px, rgb,
 };
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Default and limits for the editor's file browser sidebar.
+const SIDEBAR_DEFAULT_WIDTH: f32 = 300.;
+const SIDEBAR_MIN_WIDTH: f32 = 200.;
+const SIDEBAR_MAX_WIDTH: f32 = 520.;
+/// Draggable strip between the sidebar and the code pane.
+const SIDEBAR_RESIZER_WIDTH: f32 = 5.;
 
 /// How often the open file is compared with its on-disk contents. A poll
 /// keeps concurrent agent edits visible without a platform file-watcher
@@ -130,6 +137,10 @@ pub(crate) struct NativeEditor {
     expanded_dirs: HashSet<String>,
     tree_limits: HashMap<String, usize>,
     sidebar_focus: FocusHandle,
+    /// Width of the file browser sidebar in logical pixels.
+    sidebar_width: f32,
+    /// Pointer x and sidebar width when a sidebar resize drag started.
+    sidebar_resize: Option<(f32, f32)>,
     tree_scroll: ScrollHandle,
     navigation_active: bool,
     markdown_preview: Option<Entity<crate::preview::PreviewView>>,
@@ -636,6 +647,8 @@ impl NativeEditor {
             expanded_dirs: HashSet::from([String::new()]),
             tree_limits: HashMap::new(),
             sidebar_focus: cx.focus_handle().tab_stop(true),
+            sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            sidebar_resize: None,
             tree_scroll: ScrollHandle::new(),
             navigation_active: false,
             markdown_preview: None,
@@ -1115,6 +1128,18 @@ impl NativeEditor {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Resize the file browser sidebar from an active edge drag.
+    fn resize_sidebar(&mut self, pointer_x: f32, cx: &mut Context<Self>) {
+        let Some((start_x, start_width)) = self.sidebar_resize else {
+            return;
+        };
+        let width = (start_width + pointer_x - start_x).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        if (width - self.sidebar_width).abs() > 0.1 {
+            self.sidebar_width = width;
+            cx.notify();
+        }
     }
 
     fn active_file_directory(&self) -> String {
@@ -3168,6 +3193,7 @@ impl NativeEditor {
                             } else {
                                 item.label.clone()
                             })
+                            .tooltip(item.key.clone())
                             .when(selected, |row| row.bg(rgb(0x222b36)))
                             .when(cursor == Some(index), |row| {
                                 row.border_1().border_color(rgb(0x61afef))
@@ -3264,7 +3290,7 @@ impl NativeEditor {
                 .id("native-sidebar")
                 .test_support()
                 .track_focus(&self.sidebar_focus)
-                .w(px(260.))
+                .w(px(self.sidebar_width))
                 .h_full()
                 .flex_shrink_0()
                 .min_h_0()
@@ -3286,6 +3312,7 @@ impl NativeEditor {
                                 .flex_1()
                                 .min_w_0()
                                 .overflow_hidden()
+                                .text_ellipsis()
                                 .text_sm()
                                 .text_color(rgb(0xd3d6dc))
                                 .child(project_name),
@@ -3886,7 +3913,53 @@ impl Render for NativeEditor {
                     cx.stop_propagation();
                 }
             }))
-            .when_some(browser, |row, browser| row.child(browser))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.sidebar_resize.is_some() {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        this.resize_sidebar(event.position.x.as_f32(), cx);
+                    } else {
+                        this.sidebar_resize = None;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resize.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.sidebar_resize.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .when_some(browser, |row, browser| {
+                row.child(browser).child(
+                    div()
+                        .id("native-sidebar-resizer")
+                        .debug_selector(|| "native-sidebar-resizer".into())
+                        .w(px(SIDEBAR_RESIZER_WIDTH))
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(rgb(0x0c0e10))
+                        .hover(|style| style.bg(rgb(0x2a2e33)))
+                        .cursor_col_resize()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.sidebar_resize =
+                                    Some((event.position.x.as_f32(), this.sidebar_width));
+                                cx.stop_propagation();
+                            }),
+                        ),
+                )
+            })
             .child(code)
             .when_some(finder, |row, finder| row.child(finder))
     }
@@ -5314,10 +5387,38 @@ mod tests {
         assert_eq!(code.top(), toolbar.bottom());
         assert_eq!(toolbar.top(), sidebar.top());
         assert_eq!(code.bottom() + px(24.), sidebar.bottom());
-        assert_eq!(code.left(), sidebar.right());
+        assert_eq!(sidebar.size.width, px(SIDEBAR_DEFAULT_WIDTH));
+        assert_eq!(
+            code.left(),
+            sidebar.right() + px(SIDEBAR_RESIZER_WIDTH),
+            "the resizer sits between the sidebar and code"
+        );
         assert!(
             code.size.height > px(300.),
             "code pane must fill the window"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn editor_sidebar_can_be_widened_by_dragging_its_edge(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let (_, test_cx) = test_editor(cx, dir.path());
+        test_cx.update(|window, cx| window.render_frame(cx));
+        let before = test_cx.debug_bounds("native-sidebar").unwrap();
+        let handle = test_cx.debug_bounds("native-sidebar-resizer").unwrap();
+        let from = handle.center();
+        let to = gpui_kit::point(from.x + px(80.), from.y);
+        test_cx.update(|window, cx| window.drag(from, to, cx));
+        test_cx.update(|window, cx| window.render_frame(cx));
+        let after = test_cx.debug_bounds("native-sidebar").unwrap();
+        assert!(
+            after.size.width > before.size.width + px(60.),
+            "dragging the edge must widen the sidebar: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.size.width <= px(SIDEBAR_MAX_WIDTH),
+            "the sidebar must respect its maximum width"
         );
     }
 
