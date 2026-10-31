@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::searchable_list::{SearchableListDelegate as _, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{
@@ -31,8 +32,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement, Render, Styled,
-    StyledText, Subscription, TestSupportExt as _, Window, div, list, px, relative, rgb,
+    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement, Pixels, Render,
+    Styled, StyledText, Subscription, TestSupportExt as _, Window, div, list, px, relative, rgb,
 };
 
 use super::diff::{self, DiffResult, LineRef, SplitRow};
@@ -144,6 +145,16 @@ struct DiffPane {
     /// in [`ToolMode::Edit`], so this is never shown as stale: it tells the
     /// toggle to recompute instead of revealing an out-of-date comparison.
     stale: bool,
+}
+
+/// Exact scrollbar content height for a comparison listing.
+///
+/// `ListState` starts with only an estimate and grows it as rows are
+/// measured, which makes its scrollbar thumb shrink during the first scroll.
+/// Every comparison row is one fixed-height line, so the scrollbar can be
+/// given the true total from the first frame.
+fn diff_content_height(row_count: usize) -> Pixels {
+    px(row_count as f32 * stream::ROW_H)
 }
 
 /// One row of the comparison pane.
@@ -836,6 +847,8 @@ impl ToolView {
         let result = pane.result.clone();
         let rows = pane.rows.clone();
         let highlights = pane.highlights.clone();
+        let scrollbar = pane.list.clone();
+        let content_height = diff_content_height(pane.rows.len());
         let dark = cx.theme().is_dark();
         let list = list(pane.list.clone(), move |ix, _window, _cx| match rows[ix] {
             DiffRow::Lines(row) => split_row(row, &result, &highlights, dark),
@@ -856,7 +869,29 @@ impl ToolView {
             .border_color(rgb(PANE_BORDER))
             .bg(rgb(PANE_BG))
             .child(header)
-            .child(div().w_full().flex_1().min_h_0().child(list))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .child(
+                        div()
+                            .id("tool-diff-scrollbar")
+                            .test_support()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(Scrollbar::width())
+                            .child(
+                                Scrollbar::vertical(&scrollbar)
+                                    .scroll_size(gpui_kit::size(px(0.), content_height))
+                                    .viewport_from_layout(),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 

@@ -606,6 +606,51 @@ fn diff_compares_the_two_inputs_into_the_result_pane(cx: &mut gpui_kit::TestAppC
     });
 }
 
+#[test]
+fn diff_scrollbar_uses_the_exact_row_total() {
+    // `ListState` starts with only an estimate and grows it as rows are
+    // measured. The scrollbar is given the exact fixed-height total instead.
+    assert_eq!(
+        diff_content_height(120),
+        px(120_f32 * stream::ROW_H),
+        "the scrollbar must know the full comparison height from the first frame"
+    );
+}
+
+#[gpui_kit::test]
+fn diff_pane_shows_a_scrollbar(cx: &mut gpui_kit::TestAppContext) {
+    let (_dir, root, _store) = fixture();
+    let (view, cx) = open_tool(cx, ToolKind::DiffChecker, root);
+    let old = (1..=100)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let new = old.replace("line 50\n", "line FIFTY\n");
+    cx.update(|window, cx| {
+        set_input(&view, 0, &old, window, cx);
+        set_input(&view, 1, &new, window, cx);
+        window.render_frame(cx);
+        window.click("tool-diff", cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        let pane = window.find("tool-diff-result").bounds();
+        let scrollbar = window.find("tool-diff-scrollbar").bounds();
+        assert!(
+            scrollbar.size.width > px(0.) && scrollbar.size.height > px(0.),
+            "the comparison must expose a scrollbar: {scrollbar:?}"
+        );
+        assert!(
+            scrollbar.top() >= pane.top() + px(RESULT_HEADER_H),
+            "the scrollbar must cover only the rows, not the header: {scrollbar:?} in {pane:?}"
+        );
+        assert!(
+            scrollbar.bottom() <= pane.bottom(),
+            "the scrollbar must stay inside the comparison pane: {scrollbar:?} in {pane:?}"
+        );
+    });
+}
+
 #[gpui_kit::test]
 fn diff_of_identical_texts_says_there_are_no_changes(cx: &mut gpui_kit::TestAppContext) {
     let (_dir, root, _store) = fixture();
