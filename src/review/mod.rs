@@ -123,6 +123,11 @@ pub(crate) struct ReviewView {
     /// every row render. Rasterizing here (not per frame) keeps scrolling
     /// smooth; the `Rc` lets the virtualized row closures share the cache.
     icon_tiles: Rc<IconTiles>,
+    /// Positions of the file headers Kit prepainted this frame. Kit owns the
+    /// diff's scroll state, so Review discovers the top file from these rows.
+    header_spy: Rc<RefCell<stream::HeaderSpy>>,
+    /// Repo-relative path of the file whose header is pinned above the diff.
+    sticky_header: Option<String>,
     last_scrolled: Option<String>,
     /// Monotonic load id; stale background loads never overwrite newer state.
     generation: u64,
@@ -149,6 +154,11 @@ impl ReviewView {
             ReviewState::Loaded(loaded) => Some(loaded.diff.files.len()),
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sticky_header_path(&self) -> Option<&str> {
+        self.sticky_header.as_deref()
     }
     pub(crate) fn open_file(&self, path: &str, line: Option<usize>, cx: &mut Context<Self>) {
         cx.emit(OpenReviewFile {
@@ -191,6 +201,8 @@ impl ReviewView {
             collapsed: Rc::default(),
             review_key: None,
             icon_tiles: Rc::default(),
+            header_spy: Rc::default(),
+            sticky_header: None,
             last_scrolled: None,
             generation: 0,
             load_in_flight: false,
@@ -525,6 +537,8 @@ impl ReviewView {
             self.collapsed.borrow_mut().clear();
             self.viewed.borrow_mut().clear();
             self.viewed_versions.clear();
+            self.header_spy.borrow_mut().clear();
+            self.sticky_header = None;
             self.review_key = Some(key);
         }
         if let Some(previous) = &previous
@@ -918,6 +932,9 @@ impl ReviewView {
             if let Some(path) = &selected {
                 self.diff_state
                     .update(cx, |diff, cx| diff.scroll_to_file(path, cx));
+                // A tree jump can land deep in a file whose header is not
+                // painted, so pin that file until the spy sees the header.
+                self.sticky_header = Some(path.clone());
             }
             self.last_scrolled = selected;
         }

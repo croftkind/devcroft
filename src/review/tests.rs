@@ -545,3 +545,157 @@ fn a_failed_refresh_preserves_progress_until_a_successful_load(cx: &mut gpui_kit
     cx.run_until_parked();
     view.read_with(cx, |view, _| assert_progress(view, "a.txt", false, false));
 }
+
+#[gpui_kit::test]
+fn sticky_file_header_follows_the_top_file_and_toggles_viewed(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    for path in ["a.txt", "b.txt"] {
+        let content = (0..120)
+            .map(|ix| format!("reviewed {ix} {}\n", "x".repeat(80)))
+            .collect::<String>();
+        fs::write(dir.path().join(path), content).unwrap();
+    }
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let render_view = view.clone();
+    let (_, cx) = cx
+        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
+    cx.simulate_resize(gpui_kit::size(px(900.), px(700.)));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.sticky_header_path().map(str::to_owned)),
+        Some("a.txt".to_owned())
+    );
+    let first = cx
+        .debug_bounds("review-sticky-file-header")
+        .expect("the first file's header must be pinned");
+
+    view.update(cx, |view, cx| {
+        view.diff_state
+            .update(cx, |diff, cx| diff.scroll_to_file("b.txt", cx));
+    });
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.sticky_header_path().map(str::to_owned)),
+        Some("b.txt".to_owned())
+    );
+    let second = cx
+        .debug_bounds("review-sticky-file-header")
+        .expect("the second file's header must be pinned");
+    assert_eq!(
+        first.top(),
+        second.top(),
+        "the pinned header must not move with the diff"
+    );
+
+    let viewed = cx
+        .debug_bounds("review-sticky-viewed")
+        .expect("the pinned header's viewed toggle must be reachable");
+    assert!(
+        viewed.left() >= second.left() && viewed.right() <= second.right(),
+        "the viewed toggle must stay inside the pinned header"
+    );
+    let line_before = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window
+            .within(("diff-file", 1usize))
+            .within(("new", 0usize))
+            .find("source")
+            .bounds()
+    });
+    cx.simulate_event(gpui_kit::ScrollEvent {
+        position: gpui_kit::point(px(560.), px(400.)),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(-320.), px(0.))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    let line_after = cx.update(|window, cx| {
+        window.render_frame(cx);
+        window
+            .within(("diff-file", 1usize))
+            .within(("new", 0usize))
+            .find("source")
+            .bounds()
+    });
+    assert!(
+        line_after.left() < line_before.left(),
+        "the diff content must scroll horizontally"
+    );
+    let viewed_after = cx
+        .debug_bounds("review-sticky-viewed")
+        .expect("the pinned header's viewed toggle must stay visible");
+    assert_eq!(
+        viewed.left(),
+        viewed_after.left(),
+        "the pinned header must not scroll horizontally"
+    );
+    cx.simulate_event(gpui_kit::MouseDownEvent {
+        button: gpui_kit::MouseButton::Left,
+        position: viewed.center(),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert!(view.viewed.borrow().contains("b.txt"));
+        assert!(view.collapsed.borrow().contains("b.txt"));
+    });
+}
+
+#[gpui_kit::test]
+fn sticky_file_header_tracks_wheel_scrolling(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::test::TestWindowExt as _;
+    let (dir, view) = setup(cx);
+    for path in ["a.txt", "b.txt"] {
+        let content = (0..120)
+            .map(|ix| format!("reviewed {ix}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join(path), content).unwrap();
+    }
+    view.update(cx, |view, cx| view.reload(cx));
+    cx.run_until_parked();
+    let render_view = view.clone();
+    let (_, cx) = cx
+        .add_window_view(move |window, cx| gpui_kit::component::Root::new(render_view, window, cx));
+    cx.simulate_resize(gpui_kit::size(px(900.), px(700.)));
+    cx.update(|window, cx| window.render_frame(cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| window.render_frame(cx));
+    assert_eq!(
+        view.read_with(cx, |view, _| view.sticky_header_path().map(str::to_owned)),
+        Some("a.txt".to_owned())
+    );
+    let sticky = cx
+        .debug_bounds("review-sticky-file-header")
+        .expect("the first file's header must be pinned");
+    let position = gpui_kit::point(sticky.center().x, px(320.));
+
+    let mut reached_b = false;
+    for _ in 0..40 {
+        cx.simulate_event(gpui_kit::ScrollEvent {
+            position,
+            delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-200.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        if view.read_with(cx, |view, _| view.sticky_header_path() == Some("b.txt")) {
+            reached_b = true;
+            break;
+        }
+    }
+    assert!(reached_b, "the pinned header must follow wheel scrolling");
+
+    let pinned = cx
+        .debug_bounds("review-sticky-file-header")
+        .expect("the second file's header must be pinned");
+    assert_eq!(
+        sticky.top(),
+        pinned.top(),
+        "the pinned header must stay at the top while scrolling"
+    );
+}

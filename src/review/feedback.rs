@@ -1069,6 +1069,7 @@ impl ReviewView {
                     self.feedback.error =
                         Some("Code changed. Refresh the diff before commenting.".into());
                 } else {
+                    self.sticky_header = Some(range.path().to_string());
                     self.diff_state.update(cx, |diff, cx| {
                         diff.set_selected_lines(Some(range.clone()), cx);
                         diff.scroll_to_line(
@@ -1269,6 +1270,7 @@ impl ReviewView {
             if let ReviewState::Loaded(loaded) = &self.state
                 && let Some(annotation) = annotation_for(loaded, &c.anchor, "review-jump".into())
             {
+                self.sticky_header = Some(c.anchor.path.clone());
                 self.diff_state.update(cx, |diff, cx| {
                     diff.set_file_collapsed(&c.anchor.path, false, cx);
                     if let Some(position) = annotation.position() {
