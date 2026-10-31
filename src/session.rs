@@ -16,6 +16,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use gpui_kit::{KeyDownEvent, Modifiers};
 use libghostty_vt::{
+    fmt::Format,
     key::{self, Action, Encoder as KeyEncoder, Event as KeyEvent, Mods},
     mouse::{
         self, Action as MouseAction, Button as MouseButton, Encoder as MouseEncoder,
@@ -23,6 +24,7 @@ use libghostty_vt::{
     },
     render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIteration, RowIterator},
     screen::CellWide,
+    selection::{FormatOptions, Selection},
     style::RgbColor,
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Point,
@@ -440,6 +442,37 @@ impl TerminalSession {
 
     pub(crate) fn scroll_to_bottom(&mut self) {
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
+    }
+
+    /// Offset of the visible viewport into the screen, counting scrollback
+    /// rows from the top. Viewport row `n` is screen row `offset + n`.
+    pub(crate) fn viewport_offset(&self) -> Result<usize> {
+        Ok(self.terminal.scrollbar()?.offset as usize)
+    }
+
+    /// Scroll only the local viewport, bypassing application mouse reporting.
+    ///
+    /// Selection autoscroll uses this so a Shift-drag keeps revealing
+    /// scrollback rows even when the application owns wheel input. Returns
+    /// whether the viewport actually moved.
+    pub(crate) fn scroll_viewport(&mut self, lines: isize) -> Result<bool> {
+        let before = self.terminal.scrollbar()?.offset;
+        self.terminal.scroll_viewport(ScrollViewport::Delta(lines));
+        let after = self.terminal.scrollbar()?.offset;
+        Ok(before != after)
+    }
+
+    /// Plain text for an inclusive selection between screen cells.
+    ///
+    /// Screen rows include scrollback, so the range can span content outside
+    /// the current viewport. Uses Ghostty's selection formatter, then applies
+    /// the same per-line trimming as the visible-row copy path.
+    pub(crate) fn selected_text(
+        &self,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> Result<String> {
+        screen_selection_text(&self.terminal, start, end)
     }
 
     pub(crate) fn viewport_active(&self) -> Result<bool> {
@@ -899,6 +932,63 @@ fn default_shell() -> PathBuf {
 
 fn color_value(color: RgbColor) -> u32 {
     ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32
+}
+
+/// Plain text for an inclusive selection between screen cells.
+///
+/// Screen rows count scrollback from the top, so the range can span content
+/// outside the visible viewport. Ghostty's selection formatter supplies the
+/// text; the same per-line trimming as the visible-row path is applied here.
+fn screen_selection_text(
+    terminal: &Terminal<'_, '_>,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Result<String> {
+    let (start, end) = if (start.1, start.0) <= (end.1, end.0) {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    if start == end {
+        return Ok(String::new());
+    }
+    let cols = terminal.cols()? as usize;
+    let total = terminal.scrollbar()?.total as usize;
+    if cols == 0 || total == 0 || start.1 >= total || end.1 >= total {
+        return Ok(String::new());
+    }
+    let point = |(col, row): (usize, usize)| {
+        Point::Screen(PointCoordinate {
+            x: col.min(cols - 1) as u16,
+            y: row as u32,
+        })
+    };
+    let start = terminal.grid_ref(point(start))?;
+    let end = terminal.grid_ref(point(end))?;
+    let selection = Selection::new(start, end, false);
+    let Some(bytes) = terminal.format_selection_alloc(
+        None,
+        FormatOptions::new()
+            .with_emit_format(Format::Plain)
+            .with_unwrap(false)
+            .with_trim(false)
+            .with_selection(&selection),
+    )?
+    else {
+        return Ok(String::new());
+    };
+    let text = std::str::from_utf8(&bytes).context("terminal selection was not UTF-8")?;
+    Ok(trim_selected_text(text))
+}
+
+/// Match the terminal view's copy rules: trailing whitespace per line and
+/// trailing blank lines are dropped.
+fn trim_selected_text(text: &str) -> String {
+    let mut lines: Vec<&str> = text.split('\n').map(str::trim_end).collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Maps the render state's cursor visual style onto the app's shape enum.
@@ -1411,6 +1501,93 @@ mod tests {
             "a settled grid should present no frame"
         );
         session._child.kill().ok();
+    }
+
+    #[test]
+    fn selection_text_spans_scrollback_and_keeps_column_bounds() {
+        let mut terminal = Terminal::new(10, 2).unwrap();
+        terminal.vt_write(b"zero\r\none\r\ntwo\r\nthree\r\nfour");
+        let bar = terminal.scrollbar().unwrap();
+        assert_eq!((bar.total, bar.offset, bar.len), (5, 3, 2));
+
+        assert_eq!(
+            screen_selection_text(&terminal, (0, 0), (4, 4)).unwrap(),
+            "zero\none\ntwo\nthree\nfour"
+        );
+        assert_eq!(
+            screen_selection_text(&terminal, (1, 1), (1, 2)).unwrap(),
+            "ne\ntw"
+        );
+        // A stale endpoint beyond retained history copies nothing instead of
+        // silently selecting a different row.
+        assert_eq!(
+            screen_selection_text(&terminal, (0, 0), (4, 5)).unwrap(),
+            ""
+        );
+        let mut blank = Terminal::new(5, 4).unwrap();
+        blank.vt_write(b"a  \r\n\r\nb  ");
+        assert_eq!(
+            screen_selection_text(&blank, (0, 0), (2, 2)).unwrap(),
+            "a\n\nb"
+        );
+        let mut indented = Terminal::new(12, 3).unwrap();
+        indented.vt_write(b"  indented\r\nnext");
+        assert_eq!(
+            screen_selection_text(&indented, (0, 0), (9, 0)).unwrap(),
+            "  indented"
+        );
+    }
+
+    #[test]
+    fn local_viewport_scroll_presents_older_rows() {
+        let (mut session, _) = TerminalSession::spawn(
+            WorkspaceTab::Terminal,
+            &std::env::temp_dir(),
+            AgentKind::DEFAULT,
+        )
+        .unwrap();
+        session.feed(b"\x1b[?25l\x1b[2J\x1b[H");
+        for ix in 0..40 {
+            session.feed(format!("line {ix}\r\n").as_bytes());
+        }
+        let row_text = |rows: &[Vec<RenderRun>]| {
+            rows[0]
+                .iter()
+                .map(|run| run.text.as_ref())
+                .collect::<String>()
+        };
+        let before = session.snapshot().unwrap().expect("content should present");
+        let before_offset = session.viewport_offset().unwrap();
+        assert!(before_offset > 0, "the fixture must have scrollback");
+        assert!(session.scroll_viewport(-3).unwrap());
+        assert_eq!(session.viewport_offset().unwrap(), before_offset - 3);
+        let after = session
+            .snapshot()
+            .unwrap()
+            .expect("a viewport scroll must present a frame");
+        assert_ne!(
+            row_text(&before),
+            row_text(&after),
+            "scrolling back must show older rows"
+        );
+        session._child.kill().ok();
+    }
+
+    #[test]
+    fn screen_selection_is_independent_of_viewport_scroll() {
+        let mut terminal = Terminal::new(10, 3).unwrap();
+        terminal.vt_write(b"0\r\n1\r\n2\r\n3\r\n4\r\n5");
+        assert_eq!(terminal.scrollbar().unwrap().offset, 3);
+        assert_eq!(
+            screen_selection_text(&terminal, (0, 1), (0, 3)).unwrap(),
+            "1\n2\n3"
+        );
+        terminal.scroll_viewport(ScrollViewport::Delta(-2));
+        assert_eq!(terminal.scrollbar().unwrap().offset, 1);
+        assert_eq!(
+            screen_selection_text(&terminal, (0, 1), (0, 3)).unwrap(),
+            "1\n2\n3"
+        );
     }
 
     /// A pure cursor move (no cell changes) must still present a frame.

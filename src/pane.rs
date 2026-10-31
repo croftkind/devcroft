@@ -57,14 +57,28 @@ pub(crate) struct TerminalPane {
     last_present: Option<Instant>,
     /// Whether a trailing present flush is already scheduled.
     flush_armed: bool,
-    /// Drag-selection anchor cell `(column, row)` in grid coordinates.
+    /// Drag-selection anchor cell `(column, row)` in screen coordinates.
+    /// Screen rows include scrollback, so the anchor follows content while
+    /// the viewport scrolls.
     selection_anchor: Option<(usize, usize)>,
     app_mouse_button: Option<MouseButton>,
     hovered_link: Option<TerminalLink>,
-    /// Drag-selection focus cell `(column, row)`, updated while dragging.
+    /// Drag-selection focus cell `(column, row)` in screen coordinates.
     selection_focus: Option<(usize, usize)>,
     /// Whether the left button is currently held for a selection drag.
     selecting: bool,
+    /// Last pointer position during a selection drag, used by edge
+    /// autoscroll.
+    selection_pointer: Option<Point<Pixels>>,
+    /// Whether the selection's edge-autoscroll timer is running.
+    selection_autoscroll_armed: bool,
+    /// Incremented when a selection gesture starts or ends so a previous
+    /// autoscroll loop cannot act on a newer selection.
+    selection_autoscroll_seq: u64,
+    /// Screen row of viewport row 0 for [`Self::rows`]. Kept in sync with
+    /// each presented frame so selection highlights and pointer mapping use
+    /// the same scroll position as the painted rows.
+    scroll_offset: usize,
     /// Last painted bounds of the outer pane, for mapping window mouse
     /// positions back to grid cells (see `on_prepaint` in [`Render`]).
     pane_bounds: Option<Bounds<Pixels>>,
@@ -170,6 +184,10 @@ impl TerminalPane {
             hovered_link: None,
             selection_focus: None,
             selecting: false,
+            selection_pointer: None,
+            selection_autoscroll_armed: false,
+            selection_autoscroll_seq: 0,
+            scroll_offset: 0,
             pane_bounds: None,
             copy_feedback_seq: 0,
             agent_activity,
@@ -333,6 +351,12 @@ impl TerminalPane {
                 Ok(None) => self.error = None,
                 Err(error) => self.error = Some(format!("Terminal render error: {error:#}").into()),
             }
+            // Keep pointer mapping and selection highlights on the same
+            // scroll position as the rows above. The viewport can move
+            // without changing any cell, so refresh this outside the match.
+            if let Ok(offset) = session.viewport_offset() {
+                self.scroll_offset = offset;
+            }
         }
         if changed || self.error != error_before {
             self.last_present = Some(Instant::now());
@@ -485,6 +509,10 @@ impl TerminalPane {
         if self.selection_anchor.is_some() || self.selection_focus.is_some() {
             self.selection_anchor = None;
             self.selection_focus = None;
+            self.selecting = false;
+            self.selection_autoscroll_seq = self.selection_autoscroll_seq.wrapping_add(1);
+            self.selection_pointer = None;
+            self.selection_autoscroll_armed = false;
             cx.notify();
         }
         // The command-bar toggles must reach the workspace even while a
@@ -676,52 +704,57 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(cell) = self.cell_at(position) else {
+        let Some((column, viewport_row)) = self.cell_at(position) else {
             return;
         };
+        let row = self.scroll_offset + viewport_row;
         let (anchor, focus) = if click_count >= 3 {
-            let (_, row) = cell;
             let width = self
                 .rows
-                .get(row)
+                .get(viewport_row)
                 .map(|row| row.iter().map(|run| run.columns as usize).sum::<usize>())
                 .unwrap_or(0);
             if width == 0 {
-                (cell, cell)
+                ((column, row), (column, row))
             } else {
                 ((0, row), (width - 1, row))
             }
         } else if click_count == 2 {
             match self
                 .rows
-                .get(cell.1)
-                .and_then(|row| word_bounds_at(row, cell.0))
+                .get(viewport_row)
+                .and_then(|row| word_bounds_at(row, column))
             {
-                Some((start_col, end_col)) => ((start_col, cell.1), (end_col, cell.1)),
+                Some((start_col, end_col)) => ((start_col, row), (end_col, row)),
                 // Past the visible text (padding): fall back to a click.
-                None => (cell, cell),
+                None => ((column, row), (column, row)),
             }
         } else {
-            (cell, cell)
+            ((column, row), (column, row))
         };
         self.selection_anchor = Some(anchor);
         self.selection_focus = Some(focus);
+        self.selection_pointer = Some(position);
         self.selecting = true;
+        self.selection_autoscroll_seq = self.selection_autoscroll_seq.wrapping_add(1);
+        self.selection_autoscroll_armed = false;
         cx.notify();
     }
 
-    /// Extend the in-progress drag selection, clamping to the grid.
+    /// Extend the in-progress drag selection. Coordinates are mapped to
+    /// screen rows so the anchor survives viewport scrolling.
     fn update_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
         }
-        let Some(cell) = self.cell_at(position) else {
-            return;
-        };
-        if self.selection_focus != Some(cell) {
+        self.selection_pointer = Some(position);
+        if let Some(cell) = self.screen_cell_at(position)
+            && self.selection_focus != Some(cell)
+        {
             self.selection_focus = Some(cell);
             cx.notify();
         }
+        self.arm_selection_autoscroll(cx);
     }
 
     /// Finish a drag: copy non-empty selections to the clipboard with a
@@ -738,7 +771,10 @@ impl TerminalPane {
             return;
         }
         self.selecting = false;
-        if let Some(cell) = self.cell_at(position) {
+        self.selection_autoscroll_seq = self.selection_autoscroll_seq.wrapping_add(1);
+        self.selection_pointer = None;
+        self.selection_autoscroll_armed = false;
+        if let Some(cell) = self.screen_cell_at(position) {
             self.selection_focus = Some(cell);
         }
         let (Some(anchor), Some(focus)) = (self.selection_anchor, self.selection_focus) else {
@@ -763,7 +799,33 @@ impl TerminalPane {
             return;
         };
         let (start, end) = normalize_selection(anchor, focus);
-        let text = selected_text(&self.rows, start, end);
+        let text = match self
+            .session
+            .as_ref()
+            .map(|session| session.selected_text(start, end))
+            .transpose()
+        {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                let visible =
+                    |cell: (usize, usize)| (cell.0, cell.1.saturating_sub(self.scroll_offset));
+                if start.1 < self.scroll_offset || end.1 >= self.scroll_offset + self.rows.len() {
+                    String::new()
+                } else {
+                    selected_text(&self.rows, visible(start), visible(end))
+                }
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::new().message(format!("copy failed: {error:#}")),
+                    cx,
+                );
+                self.selection_anchor = None;
+                self.selection_focus = None;
+                cx.notify();
+                return;
+            }
+        };
         if text.is_empty() {
             self.selection_anchor = None;
             self.selection_focus = None;
@@ -813,7 +875,14 @@ impl TerminalPane {
         Some(point_to_cell(position, bounds, rows, cols))
     }
 
-    /// Selected column range `[start, end]` (inclusive) for a grid row, or
+    /// Map a window-coordinate position to a screen cell, including the
+    /// scrollback offset of the rows currently painted.
+    fn screen_cell_at(&self, position: Point<Pixels>) -> Option<(usize, usize)> {
+        let (column, viewport_row) = self.cell_at(position)?;
+        Some((column, self.scroll_offset + viewport_row))
+    }
+
+    /// Selected column range `[start, end]` (inclusive) for a painted row, or
     /// `None` when the row is outside the current selection.
     fn selection_for_row(&self, row: usize) -> Option<(usize, usize)> {
         let (anchor, focus) = match (self.selection_anchor, self.selection_focus) {
@@ -827,7 +896,88 @@ impl TerminalPane {
             .iter()
             .map(|run| run.columns as usize)
             .sum::<usize>();
-        selection_columns_for_row(row, start, end, row_columns)
+        selection_columns_for_row(self.scroll_offset + row, start, end, row_columns)
+    }
+
+    /// Direction to scroll the local viewport while a selection drag rests on
+    /// a vertical edge of the grid.
+    fn selection_autoscroll_direction(&self) -> Option<isize> {
+        if !self.selecting {
+            return None;
+        }
+        let pointer = self.selection_pointer?;
+        let bounds = self.pane_bounds?;
+        let rows = self.rows.len();
+        if rows == 0 {
+            return None;
+        }
+        let grid_top = bounds.origin.y.as_f32() + TERMINAL_PADDING;
+        selection_edge_direction(
+            pointer.y.as_f32(),
+            grid_top,
+            rows as f32 * cell_height(),
+            cell_height(),
+        )
+    }
+
+    /// Start the edge-autoscroll timer if the pointer rests on a grid edge.
+    fn arm_selection_autoscroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_autoscroll_armed || self.selection_autoscroll_direction().is_none() {
+            return;
+        }
+        self.selection_autoscroll_armed = true;
+        let seq = self.selection_autoscroll_seq;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SELECTION_AUTOSCROLL_INTERVAL)
+                    .await;
+                let keep_going = this
+                    .update(cx, |pane, cx| pane.selection_autoscroll_tick(seq, cx))
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// One edge-autoscroll step. Returns whether another step should run.
+    fn selection_autoscroll_tick(&mut self, seq: u64, cx: &mut Context<Self>) -> bool {
+        if seq != self.selection_autoscroll_seq {
+            return false;
+        }
+        let Some(direction) = self.selection_autoscroll_direction() else {
+            self.selection_autoscroll_armed = false;
+            return false;
+        };
+        let moved = match self.session.as_mut() {
+            Some(session) => match session.scroll_viewport(direction) {
+                Ok(moved) => moved,
+                Err(error) => {
+                    self.error = Some(format!("Terminal scroll error: {error:#}").into());
+                    self.selection_autoscroll_armed = false;
+                    cx.notify();
+                    return false;
+                }
+            },
+            None => false,
+        };
+        if !moved {
+            self.selection_autoscroll_armed = false;
+            return false;
+        }
+        self.present_now(cx);
+        let column = self
+            .selection_pointer
+            .and_then(|position| self.cell_at(position).map(|(column, _)| column))
+            .or_else(|| self.selection_focus.map(|(column, _)| column))
+            .unwrap_or(0);
+        let row = selection_focus_row(direction, self.scroll_offset, self.rows.len());
+        self.selection_focus = Some((column, row));
+        cx.notify();
+        true
     }
 
     fn on_scroll(&mut self, event: &ScrollEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -846,7 +996,11 @@ impl TerminalPane {
             // (e.g. nvim `mousescroll`), so undo the platform UI multiplier
             // for the application path (see APP_SCROLL_DIVISOR). The local
             // viewport keeps the multiplied travel to match GUI scroll speed.
-            let app = session.app_handles_scroll().unwrap_or(false);
+            // While a local selection drag is active, wheel input must move
+            // the local scrollback even if the application normally owns the
+            // mouse. Otherwise the selection cannot extend past the viewport.
+            let selecting = self.selecting;
+            let app = !selecting && session.app_handles_scroll().unwrap_or(false);
             let travel_px = match event.delta {
                 ScrollDelta::Pixels(delta) => {
                     let pixels = delta.y.as_f32();
@@ -875,18 +1029,34 @@ impl TerminalPane {
                 // movement or flooding the application with one line per event.
                 return;
             }
-            let scrolled = session.scroll(
-                lines,
-                (event.position.x - bounds.origin.x).as_f32(),
-                (event.position.y - bounds.origin.y).as_f32(),
-                event.modifiers,
-                bounds.size.width.as_f32(),
-                bounds.size.height.as_f32(),
-            );
+            let scrolled = if selecting {
+                session.scroll_viewport(lines)
+            } else {
+                session.scroll(
+                    lines,
+                    (event.position.x - bounds.origin.x).as_f32(),
+                    (event.position.y - bounds.origin.y).as_f32(),
+                    event.modifiers,
+                    bounds.size.width.as_f32(),
+                    bounds.size.height.as_f32(),
+                )
+            };
             match scrolled {
                 // Local viewport scrolls repaint through the paced path like
                 // everything else; the snapshot work is identical.
-                Ok(true) => self.present_paced(cx),
+                Ok(true) => {
+                    if self.selecting {
+                        self.present_now(cx);
+                        if let Some(position) = self.selection_pointer
+                            && let Some(cell) = self.screen_cell_at(position)
+                        {
+                            self.selection_focus = Some(cell);
+                        }
+                        cx.notify();
+                    } else {
+                        self.present_paced(cx);
+                    }
+                }
                 // The application handles the scroll and redraws through the
                 // output task; repainting now would only reshape unchanged
                 // rows while its redraw is still in flight.
@@ -1228,6 +1398,35 @@ fn selection_columns_for_row(
         Some((0, ecol.min(last)))
     } else {
         Some((0, last))
+    }
+}
+
+/// Autoscroll direction for a selection pointer at `pointer_y` in a grid
+/// starting at `grid_top` with `grid_height` and rows of `row_height`.
+/// Returns `-1` near the top edge, `1` near the bottom, and `None` between.
+fn selection_edge_direction(
+    pointer_y: f32,
+    grid_top: f32,
+    grid_height: f32,
+    row_height: f32,
+) -> Option<isize> {
+    let edge = row_height * 0.5;
+    if pointer_y <= grid_top + edge {
+        Some(-1)
+    } else if pointer_y >= grid_top + grid_height - edge {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Screen row under the pointer after an autoscroll step: the new top row
+/// when scrolling up, or the new bottom row when scrolling down.
+fn selection_focus_row(direction: isize, scroll_offset: usize, rows: usize) -> usize {
+    if direction < 0 {
+        scroll_offset
+    } else {
+        scroll_offset + rows.saturating_sub(1)
     }
 }
 
@@ -1658,6 +1857,11 @@ impl Render for TerminalPane {
                                 this.app_mouse_button = Some(button);
                                 this.selection_anchor = None;
                                 this.selection_focus = None;
+                                this.selecting = false;
+                                this.selection_autoscroll_seq =
+                                    this.selection_autoscroll_seq.wrapping_add(1);
+                                this.selection_pointer = None;
+                                this.selection_autoscroll_armed = false;
                                 this.forward_mouse(
                                     libghostty_vt::mouse::Action::Press,
                                     Some(button),
@@ -1844,6 +2048,10 @@ const APP_SCROLL_DIVISOR: f32 = 3.0;
 /// system's own autohide is a fixed 5s (see `dismiss_copy_feedback`), which
 /// is far too long for a single-word acknowledgement.
 const COPY_FEEDBACK_TTL: Duration = Duration::from_millis(1500);
+
+/// Delay between selection autoscroll steps while the pointer rests on a
+/// vertical edge of the terminal grid.
+const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn is_copy_shortcut(key: &str, modifiers: gpui_kit::Modifiers) -> bool {
     key.eq_ignore_ascii_case("c")
@@ -2403,6 +2611,32 @@ mod tests {
             point_to_cell(grid(100_000., 100_000.), bounds, 24, 80),
             (79, 23)
         );
+    }
+
+    #[test]
+    fn selection_autoscroll_starts_only_at_grid_edges() {
+        let grid_top = 100.0;
+        let height = 240.0;
+        let row = 20.0;
+        assert_eq!(
+            selection_edge_direction(90.0, grid_top, height, row),
+            Some(-1)
+        );
+        assert_eq!(
+            selection_edge_direction(105.0, grid_top, height, row),
+            Some(-1)
+        );
+        assert_eq!(selection_edge_direction(200.0, grid_top, height, row), None);
+        assert_eq!(
+            selection_edge_direction(330.0, grid_top, height, row),
+            Some(1)
+        );
+        assert_eq!(
+            selection_edge_direction(400.0, grid_top, height, row),
+            Some(1)
+        );
+        assert_eq!(selection_focus_row(-1, 12, 24), 12);
+        assert_eq!(selection_focus_row(1, 12, 24), 35);
     }
 
     #[test]
