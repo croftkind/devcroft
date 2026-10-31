@@ -13,7 +13,10 @@ an inclusive range, select lines in the gutter and click **+** on one of those
 lines. Ranges stay within one file and one side; Split view makes the old and
 new sides explicit. The editor appears below the range's final line, receives
 keyboard focus, and offers **Save comment**. Use the file header's
-**Open in Editor** action to open its current working-tree file.
+**Open in Editor** action to open its current working-tree file. The header of
+the file at the top of the diff stays pinned there, spans the pane rather than
+the code width, and keeps **Open in Editor** and the viewed toggle reachable
+when Unified lines are wider than the pane.
 
 Saved comments stay visible as threads below their anchored ranges. Each thread
 provides **Edit**, **Resolve / Reopen**, and **Delete**, with editing inside the

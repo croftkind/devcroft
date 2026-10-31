@@ -4,12 +4,20 @@
 //! placement independent of the current unified/split layout. Shared messages
 //! and colors are also used by the text comparison tool.
 
-use std::collections::HashSet;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
-use gpui_kit::component::StyledExt as _;
+use gpui_kit::component::{
+    IconName, Sizable as _, StyledExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, InteractiveElement, IntoElement, MouseButton,
+    AnyElement, App, AppContext as _, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Styled, div, px, rgb,
 };
 
@@ -27,6 +35,87 @@ pub(crate) const ADDITION_BG: u32 = 0x0e2a1a;
 /// Height of file section headers. Taller than [`ROW_H`] so each file
 /// boundary is noticeable while scrolling.
 pub(crate) const FILE_HEADER_H: f32 = 36.0;
+/// The space above a header's content at the top of the diff: the Diff
+/// border, Kit's `py_1` header padding, and the separator Kit adds above
+/// every file after the first. Content tops within this distance of the pane
+/// top belong to a header sitting at the top.
+const FILE_HEADER_TOP_SLACK: f32 = 6.5;
+/// Tolerance for comparing prepainted header and pane positions.
+const STICKY_HEADER_EPSILON: f32 = 0.5;
+
+/// Finds the file whose header should stay pinned above the Review diff.
+///
+/// Kit owns the diff's scroll state and exposes no viewport or scroll getter,
+/// so Review observes the headers it renders instead: each header records its
+/// window position while Kit prepaints it. [`Self::begin_frame`] runs before
+/// Kit lays out the diff, and [`Self::resolve`] runs afterwards from the diff
+/// wrapper, where the pane's own position is known.
+#[derive(Default)]
+pub(crate) struct HeaderSpy {
+    painted: HashSet<String>,
+    tops: HashMap<String, f32>,
+}
+
+impl HeaderSpy {
+    /// Forgets the previous frame's painted headers. Called before Kit
+    /// prepaints the diff so headers scrolled out of the render window are
+    /// not mistaken for their last painted position.
+    pub(crate) fn begin_frame(&mut self) {
+        self.painted.clear();
+    }
+
+    pub(crate) fn record(&mut self, path: &str, content_top: f32) {
+        self.painted.insert(path.to_owned());
+        self.tops.insert(path.to_owned(), content_top);
+    }
+
+    /// Drops positions from a previous review. Paths that survive a branch or
+    /// scope switch would otherwise map to unrelated files.
+    pub(crate) fn clear(&mut self) {
+        self.painted.clear();
+        self.tops.clear();
+    }
+
+    /// Resolves the file at the top of the diff.
+    ///
+    /// Prefers the lowest painted header at or above the pane top. When only
+    /// headers below the top are painted, the previous file still owns the
+    /// viewport. A long file can span several screens without painting any
+    /// header, so `current` is retained in that case.
+    pub(crate) fn resolve(
+        &self,
+        pane_top: f32,
+        files: &[ChangedFile],
+        current: Option<&str>,
+    ) -> Option<String> {
+        let mut above: Option<(f32, &str)> = None;
+        let mut first_below: Option<(f32, &str)> = None;
+        for path in &self.painted {
+            let Some(content_top) = self.tops.get(path).copied() else {
+                continue;
+            };
+            if content_top <= pane_top + FILE_HEADER_TOP_SLACK + STICKY_HEADER_EPSILON {
+                if above.is_none_or(|(top, _)| content_top > top) {
+                    above = Some((content_top, path));
+                }
+            } else if first_below.is_none_or(|(top, _)| content_top < top) {
+                first_below = Some((content_top, path));
+            }
+        }
+        if let Some((_, path)) = above {
+            return Some(path.to_owned());
+        }
+        if let Some((_, path)) = first_below
+            && let Some(ix) = files.iter().position(|file| file.path == path)
+        {
+            return Some(files[ix.saturating_sub(1)].path.clone());
+        }
+        current
+            .filter(|path| files.iter().any(|file| file.path == *path))
+            .map(str::to_owned)
+            .or_else(|| files.first().map(|file| file.path.clone()))
+    }
+}
 
 /// One virtualized row of the diff stream, addressing file/hunk/line by
 /// index into a [`LoadedReview`](super::LoadedReview).
@@ -142,7 +231,107 @@ pub(crate) fn file_header_row(
     is_viewed: bool,
     view: &Entity<ReviewView>,
     editor_open_available: bool,
+    spy: &Rc<RefCell<HeaderSpy>>,
 ) -> AnyElement {
+    let path = file.path.clone();
+    let spy = spy.clone();
+    div()
+        .w_full()
+        // Kit renders headers inside the horizontally scrolled diff content.
+        // Record their vertical window position so Review can pin the header
+        // for the file currently at the top of the pane.
+        .on_children_prepainted(move |children, _, _| {
+            if let Some(bounds) = children.first() {
+                spy.borrow_mut().record(&path, f32::from(bounds.origin.y));
+            }
+        })
+        .child(file_header_content(
+            file,
+            is_viewed,
+            view,
+            editor_open_available,
+            true,
+            None,
+        ))
+        .into_any_element()
+}
+
+/// Theme values and separator state for a header rendered outside Kit's diff.
+#[derive(Clone, Copy)]
+pub(crate) struct HeaderShell {
+    pub background: Hsla,
+    pub border: Hsla,
+    /// Kit adds a separator above every file after the first.
+    pub top_border: bool,
+}
+
+/// The header that stays pinned above the diff while its file is in view.
+///
+/// Unlike [`file_header_row`], it is rendered outside Kit's horizontal
+/// scroll, so its path and viewed toggle remain reachable without scrolling
+/// sideways. The shell copies Kit's header row — same padding, collapse
+/// button, borders, and background — so pinned and in-flow headers read as
+/// one control.
+pub(crate) fn sticky_header_row(
+    file: &ChangedFile,
+    is_viewed: bool,
+    is_collapsed: bool,
+    shell: HeaderShell,
+    view: &Entity<ReviewView>,
+    editor_open_available: bool,
+) -> AnyElement {
+    let path = file.path.clone();
+    let toggle_view = view.clone();
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .pl_1()
+        .pr_3()
+        .py_1()
+        .gap_1()
+        .when(shell.top_border, |this| this.border_t_1())
+        .bg(shell.background)
+        .border_b_1()
+        .border_color(shell.border)
+        .child(
+            Button::new("review-sticky-collapse")
+                .ghost()
+                .xsmall()
+                .icon(if is_collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .accessibility_label(if is_collapsed {
+                    "Expand file"
+                } else {
+                    "Collapse file"
+                })
+                .on_click(move |_, _, cx: &mut App| {
+                    cx.update_entity(&toggle_view, |view, cx| {
+                        view.toggle_collapsed(&path, cx);
+                    });
+                }),
+        )
+        .child(div().flex_1().min_w_0().child(file_header_content(
+            file,
+            is_viewed,
+            view,
+            editor_open_available,
+            true,
+            Some("review-sticky-viewed"),
+        )))
+        .into_any_element()
+}
+
+fn file_header_content(
+    file: &ChangedFile,
+    is_viewed: bool,
+    view: &Entity<ReviewView>,
+    editor_open_available: bool,
+    chrome: bool,
+    viewed_selector: Option<&'static str>,
+) -> impl IntoElement {
     let path = file.path.clone();
     let toggle_view = view.clone();
     let open_view = view.clone();
@@ -164,9 +353,11 @@ pub(crate) fn file_header_row(
         .items_center()
         .px_3()
         .gap_2()
-        .bg(rgb(0x151a1a))
-        .border_b_1()
-        .border_color(rgb(0x2a2e2e))
+        .when(chrome, |this| {
+            this.bg(rgb(0x151a1a))
+                .border_b_1()
+                .border_color(rgb(0x2a2e2e))
+        })
         .child(
             div()
                 .flex_none()
@@ -219,6 +410,9 @@ pub(crate) fn file_header_row(
                 } else {
                     rgb(0x555a5a)
                 })
+                .when_some(viewed_selector, |this, selector| {
+                    this.debug_selector(move || selector.to_string())
+                })
                 .on_mouse_down(MouseButton::Left, move |_, _, cx: &mut App| {
                     cx.update_entity(&toggle_view, |view, cx| {
                         view.toggle_viewed(&path, cx);
@@ -227,7 +421,6 @@ pub(crate) fn file_header_row(
                 })
                 .child(if is_viewed { "✓" } else { "○" }),
         )
-        .into_any_element()
 }
 
 pub(super) fn unavailable_row(reason: UnavailableReason) -> AnyElement {
@@ -421,5 +614,64 @@ mod tests {
             ]
         );
         assert_eq!(starts, vec![0, 1]);
+    }
+
+    fn changed_file(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.to_owned(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 1,
+            content: FileContent::Unavailable(UnavailableReason::Binary),
+        }
+    }
+
+    fn files() -> Vec<ChangedFile> {
+        ["a.rs", "b.rs", "c.rs"].map(changed_file).to_vec()
+    }
+
+    #[test]
+    fn header_spy_prefers_the_lowest_header_at_the_viewport_top() {
+        let files = files();
+        let mut spy = HeaderSpy::default();
+        spy.begin_frame();
+        spy.record("a.rs", 104.);
+        spy.record("b.rs", 604.);
+        assert_eq!(spy.resolve(100., &files, None).as_deref(), Some("a.rs"));
+
+        spy.begin_frame();
+        spy.record("a.rs", -496.);
+        spy.record("b.rs", 104.);
+        assert_eq!(spy.resolve(100., &files, None).as_deref(), Some("b.rs"));
+    }
+
+    #[test]
+    fn header_spy_keeps_the_previous_file_until_the_next_header_arrives() {
+        let files = files();
+        let mut spy = HeaderSpy::default();
+        spy.begin_frame();
+        spy.record("a.rs", -900.);
+        spy.record("b.rs", 108.);
+        assert_eq!(spy.resolve(100., &files, None).as_deref(), Some("a.rs"));
+
+        // A long file can paint no headers at all; the resolved file must not
+        // reset to the first file while scrolling inside it.
+        spy.begin_frame();
+        assert_eq!(
+            spy.resolve(100., &files, Some("b.rs")).as_deref(),
+            Some("b.rs")
+        );
+    }
+
+    #[test]
+    fn header_spy_drops_a_file_that_left_the_review() {
+        let files = vec![changed_file("a.rs"), changed_file("b.rs")];
+        let spy = HeaderSpy::default();
+        assert_eq!(
+            spy.resolve(100., &files, Some("removed.rs")).as_deref(),
+            Some("a.rs")
+        );
+        assert_eq!(spy.resolve(100., &[], Some("a.rs")), None);
     }
 }
