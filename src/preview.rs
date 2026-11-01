@@ -157,10 +157,7 @@ pub(crate) struct TocEntry {
 ///
 /// Returns the entries plus the number of top-level blocks, which is the
 /// virtualized list's item count (`render_root` resets the list to exactly
-/// `blocks.len()`). The count is captured here because reading it back
-/// inside the scroll handler would re-enter the list's borrow while it is
-/// held for scroll processing and panic (`RefCell already mutably
-/// borrowed`).
+/// `blocks.len()`).
 fn extract_toc(source: &str) -> (Vec<TocEntry>, usize) {
     let mut options = markdown::ParseOptions::gfm();
     options.constructs.frontmatter = true;
@@ -219,14 +216,13 @@ fn append_plain_text(node: &markdown::mdast::Node, title: &mut String) {
 
 /// Scrollspy rule (pure, unit-tested): the active entry is the last heading
 /// at or above the first visible item — the section containing the viewport
-/// top. Pinned to the last entry when the viewport reaches the document end
-/// with a nonzero top: the tail belongs to the final section even after its
-/// heading scrolled above the viewport.
-fn active_heading(toc: &[TocEntry], top: usize, bottom: usize, total: usize) -> usize {
+/// top. Pinned to the last entry at the actual scrollable document end,
+/// rather than merely when the final block becomes visible.
+fn active_heading(toc: &[TocEntry], top: usize, at_end: bool) -> usize {
     if toc.is_empty() {
         return 0;
     }
-    if top > 0 && bottom >= total {
+    if at_end {
         return toc.len() - 1;
     }
     let mut active = 0;
@@ -338,9 +334,7 @@ pub(crate) struct PreviewView {
     reference_details: std::sync::Arc<crate::markdown_references::ReferenceDetails>,
     state: Entity<TextViewState>,
     toc: Vec<TocEntry>,
-    /// Top-level block count from our own parse (== the list's item count).
-    /// Stored — never read back from the list inside the scroll handler
-    /// (see `extract_toc`).
+    /// Top-level block count, used to wait for the rendered document to land.
     blocks: usize,
     active: usize,
     focus_handle: FocusHandle,
@@ -412,24 +406,6 @@ impl PreviewView {
         let content = metadata_line_breaks(&content);
         let (toc, blocks) = extract_toc(&content);
         let state = cx.new(|cx| TextViewState::markdown(&content, cx));
-        // Scrollspy: the virtualized list reports its visible item range on
-        // every scroll; mapping the top back onto the TOC keeps the sidebar
-        // highlight in lockstep (nothing inside the renderer uses this
-        // handler, so installing ours is safe). The handler must not touch
-        // the list's own state — it runs while the list holds its borrow —
-        // so the spy works purely from the event range plus data captured
-        // at construction.
-        let spy = cx.entity().downgrade();
-        state.update(cx, |state, _| {
-            state
-                .list_state()
-                .set_scroll_handler(move |event, _window, cx| {
-                    spy.update(cx, |view, cx| {
-                        view.on_scroll(event.visible_range.start, event.visible_range.end, cx);
-                    })
-                    .ok();
-                });
-        });
         // Find results follow the rendered text: a landing parse or a host
         // content swap re-runs the search. Setting highlights notifies this
         // same state, so the observer compares rendered-text revisions to
@@ -527,12 +503,11 @@ impl PreviewView {
         cx.notify();
     }
 
-    fn on_scroll(&mut self, top: usize, bottom: usize, cx: &mut Context<Self>) {
-        let active = active_heading(&self.toc, top, bottom, self.blocks);
+    fn set_active_heading(&mut self, active: usize, cx: &mut Context<Self>) {
         if active != self.active {
             self.active = active;
             // Hosts that render their own outline (Resources) track this to
-            // highlight the visible section. Standalone has no subscribers.
+            // highlight the visible section, including after TOC clicks.
             cx.emit(TocActive(active));
             cx.notify();
         }
@@ -561,7 +536,7 @@ impl PreviewView {
             return;
         };
         let item_ix = entry.item_ix;
-        self.active = index;
+        self.set_active_heading(index, cx);
         self.state.update(cx, |state, _| {
             state.list_state().scroll_to(ListOffset {
                 item_ix,
@@ -866,6 +841,15 @@ impl Render for PreviewView {
         // match the scrollbar insets below.
         let reader_top = px(8.);
         let list_state = self.state.read(cx).list_state().clone();
+        // Read the live offset during render: the wheel callback reports the
+        // previous range and does not run for scrollbar or keyboard movement.
+        // This also registers the offset dependency with GPUI Fast so scrolling
+        // invalidates the outline instead of only translating the cached list.
+        let top = list_state.logical_scroll_top().item_ix;
+        let at_end = list_state.is_scrolled_to_end() == Some(true);
+        if list_state.item_count() == self.blocks {
+            self.set_active_heading(active_heading(&self.toc, top, at_end), cx);
+        }
         let mut table = StyleRefinement::default();
         table.overflow.x = Some(Overflow::Scroll);
         let mut code_block = div()
@@ -1112,6 +1096,186 @@ mod tests {
     }
 
     #[test]
+    fn scrollspy_tracks_wheel_keyboard_scrollbar_and_toc_in_both_readers() {
+        use gpui_kit::component::Root;
+        use gpui_kit::{
+            Bounds, PlatformInput, ScrollDelta, ScrollEvent, TestApp, WindowBounds, WindowOptions,
+            point, size,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        let content = (1..=3)
+            .map(|section| {
+                format!(
+                    "## Section {section}\n\n{}",
+                    "A paragraph of body text.\n\n".repeat(20)
+                )
+            })
+            .collect::<String>();
+        let mut app = TestApp::new();
+        app.update(gpui_kit::init);
+        for embedded in [false, true] {
+            let mut reader = None;
+            let mut window = app.open_window_with_options(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(1000.), px(700.)),
+                    ))),
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let view = cx.new(|cx| {
+                        if embedded {
+                            PreviewView::embedded(content.clone().into(), cx)
+                        } else {
+                            PreviewView::for_editor(content.clone().into(), cx)
+                        }
+                    });
+                    reader = Some(view.clone());
+                    Root::new(view, window, cx)
+                },
+            );
+            window.draw();
+            app.run_until_parked();
+            window.draw();
+            let reader = reader.unwrap();
+            let list = window.read(|_, cx| reader.read(cx).state.read(cx).list_state().clone());
+            let emitted = Rc::new(Cell::new(None));
+            let observed = emitted.clone();
+            let _subscription = window.update(|_, _, cx| {
+                cx.subscribe(&reader, move |_, _, event: &TocActive, _| {
+                    observed.set(Some(event.0));
+                })
+            });
+
+            window.update(|_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::Scroll(ScrollEvent {
+                        position: list.viewport_bounds().center(),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(-1200.))),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            });
+            window.draw();
+            window.read(|_, cx| {
+                let view = reader.read(cx);
+                let top = list.logical_scroll_top().item_ix;
+                assert!(top >= view.toc[1].item_ix && top < view.toc[2].item_ix);
+                assert_eq!(
+                    view.active, 1,
+                    "wheel scrolling selects the current section"
+                );
+            });
+            assert_eq!(emitted.get(), Some(1));
+
+            window.update(|_, _, cx| {
+                reader.update(cx, |view, cx| {
+                    for _ in 0..30 {
+                        view.move_navigation(false, cx);
+                    }
+                });
+            });
+            window.draw();
+            assert_eq!(list.logical_scroll_top().item_ix, 0);
+            assert_eq!(window.read(|_, cx| reader.read(cx).active), 0);
+            assert_eq!(emitted.get(), Some(0));
+
+            for (offset, expected) in [
+                (list.max_offset_for_scrollbar(), 2),
+                (point(px(0.), px(0.)), 0),
+            ] {
+                window.update(|_, _, cx| {
+                    list.set_offset_from_scrollbar(-offset);
+                    reader.update(cx, |_, cx| cx.notify());
+                });
+                window.draw();
+                assert_eq!(window.read(|_, cx| reader.read(cx).active), expected);
+                assert_eq!(emitted.get(), Some(expected));
+            }
+
+            window.update(|_, _, cx| {
+                reader.update(cx, |view, cx| view.on_toc_click(1, cx));
+            });
+            window.draw();
+            assert_eq!(window.read(|_, cx| reader.read(cx).active), 1);
+            assert_eq!(emitted.get(), Some(1), "Resources receives TOC clicks");
+
+            // Preserving a late heading while replacing the document must
+            // settle back to the first entry when the new content all fits.
+            window.update(|_, _, cx| {
+                reader.update(cx, |view, cx| {
+                    view.set_content("## Section 1\n\n## Section 2\n\n## Section 3\n".into(), cx);
+                });
+            });
+            window.draw();
+            app.run_until_parked();
+            window.draw();
+            window.read(|_, cx| {
+                let view = reader.read(cx);
+                assert_eq!(
+                    view.state
+                        .read(cx)
+                        .list_state()
+                        .logical_scroll_top()
+                        .item_ix,
+                    0
+                );
+                assert_eq!(view.active, 0, "selection follows the settled new layout");
+            });
+            assert_eq!(emitted.get(), Some(0));
+        }
+    }
+
+    #[gpui_kit::test]
+    fn scrollspy_follows_scroll_position_clamped_by_resize(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::test::TestWindowExt as _;
+        use gpui_kit::{point, size};
+
+        cx.update(gpui_kit::init);
+        let content = format!(
+            "# First\n\n{}## Last\n\n{}",
+            "Paragraph.\n\n".repeat(10),
+            "Tail.\n\n".repeat(10)
+        );
+        let reader = cx.new(|cx| PreviewView::for_editor(content.into(), cx));
+        let view = reader.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+        let handle = cx.update(|window, _| window.window_handle());
+        cx.simulate_window_resize(handle, size(px(1000.), px(500.)));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+        reader.update(cx, |view, cx| view.on_toc_click(1, cx));
+        cx.update(|window, cx| window.render_frame(cx));
+        reader.read_with(cx, |view, cx| {
+            assert!(
+                view.state
+                    .read(cx)
+                    .list_state()
+                    .logical_scroll_top()
+                    .item_ix
+                    > 0
+            );
+            assert_eq!(view.active, 1);
+        });
+
+        cx.simulate_window_resize(handle, size(px(1000.), px(2000.)));
+        cx.update(|window, cx| window.render_frame(cx));
+        cx.run_until_parked();
+        reader.read_with(cx, |view, cx| {
+            let list = view.state.read(cx).list_state();
+            assert_eq!(list.scroll_px_offset_for_scrollbar(), point(px(0.), px(0.)));
+            assert_eq!(
+                view.active, 0,
+                "all content fits after layout clamps the scroll"
+            );
+        });
+    }
+
+    #[test]
     fn core_and_resources_reserve_space_for_wrapped_headings() {
         use gpui_kit::component::Root;
         use gpui_kit::{Bounds, Pixels, TestApp, WindowBounds, WindowOptions, point, size};
@@ -1322,26 +1486,26 @@ mod tests {
     #[test]
     fn spy_selects_section_containing_viewport_top() {
         let toc = sample_toc();
-        assert_eq!(active_heading(&toc, 0, 15, 30), 0);
-        assert_eq!(active_heading(&toc, 10, 22, 30), 1);
-        assert_eq!(active_heading(&toc, 15, 28, 30), 1);
+        assert_eq!(active_heading(&toc, 0, false), 0);
+        assert_eq!(active_heading(&toc, 10, false), 1);
+        assert_eq!(active_heading(&toc, 15, false), 1);
     }
 
     #[test]
     fn spy_pins_to_last_entry_at_document_end() {
         let toc = sample_toc();
-        assert_eq!(active_heading(&toc, 25, 30, 30), 2);
+        assert_eq!(active_heading(&toc, 15, true), 2);
     }
 
     #[test]
     fn spy_stays_on_first_entry_when_everything_fits() {
         let toc = sample_toc();
-        assert_eq!(active_heading(&toc, 0, 30, 30), 0);
+        assert_eq!(active_heading(&toc, 0, false), 0);
     }
 
     #[test]
     fn spy_is_zero_without_headings() {
-        assert_eq!(active_heading(&[], 5, 10, 20), 0);
+        assert_eq!(active_heading(&[], 5, false), 0);
     }
 
     #[test]
