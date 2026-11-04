@@ -169,6 +169,30 @@ impl TerminalPane {
     ) -> Self {
         let agent_activity = (tab == WorkspaceTab::Agent)
             .then(|| activity_store.start_with_prompt(cwd, agent, target, prompt));
+        Self::with_prepared(tab, cwd, agent, agent_activity, cx)
+    }
+
+    pub(crate) fn with_context(
+        context: &crate::agent_accounts::AgentLaunchContext,
+        store: &AgentActivityStore,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_prepared(
+            WorkspaceTab::Agent,
+            &context.cwd,
+            context.agent,
+            Some(store.start_context(context)),
+            cx,
+        )
+    }
+
+    fn with_prepared(
+        tab: WorkspaceTab,
+        cwd: &Path,
+        agent: AgentKind,
+        agent_activity: Option<PreparedAgentLaunch>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut pane = Self {
             focus_handle: cx.focus_handle(),
             tab,

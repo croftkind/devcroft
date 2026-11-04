@@ -57,13 +57,15 @@ These three also work inside navigation mode: the palettes exit to normal mode a
 
 | Location | Keys |
 | --- | --- |
-| Everywhere in navigation mode | `Tab` Next focusable component, `Shift+Tab` Previous focusable component (mode stays open) |
+| Everywhere in navigation mode | `o` Open Chat, `Tab` Next focusable component, `Shift+Tab` Previous focusable component (mode stays open) |
 | Home dashboard | `a` Add repository, `r` Browse artifacts, `s` Switch space |
 | Space switcher (open) | `↑`/`↓` Highlight a space, `Enter` switch to it, `Escape` close |
 | Repository workspace | `a` Agent, `e` Editor, `t` Terminal, `d` Review, `r` Resources, `g` Git, `Space` Home |
 | Git page | Repository navigation keys, plus `b` Back to the previous view |
 | Editor tab (Built-in selected) | `f` Find project file, `b` Switch open tab, `w` Search project |
 | Agent tab | `n` New agent session |
+| Chat | `n` New chat, `s` Switch space, `f` Search threads, `t` Tag filters, `b` Back, `Space` Home |
+| New chat dialog | `↑`/`↓` Select, `Enter` Confirm space then start harness, `Backspace` Back to space, `Escape` Cancel, `Tab`/`Shift+Tab` Traverse controls |
 | Global Artifacts page | `Space` Home, `b` Back to origin, `s` Switch space, plus artifact actions below when available |
 | Selected resource, no draft or save running | `m` Edit Markdown, `c` Add comment |
 | Resource draft, save not running | `w` Save draft, `q` Cancel draft |

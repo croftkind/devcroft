@@ -189,6 +189,8 @@ pub(crate) fn is_replace_shortcut(
 /// repository) and lives outside this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PaletteCommand {
+    OpenChat,
+    NewChat,
     GoAgent,
     GoEditor,
     GoTerminal,
@@ -215,7 +217,9 @@ impl PaletteCommand {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 13] = [
+    pub(crate) const ALL: [Self; 15] = [
+        Self::OpenChat,
+        Self::NewChat,
         Self::GoAgent,
         Self::GoEditor,
         Self::GoTerminal,
@@ -233,6 +237,8 @@ impl PaletteCommand {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::OpenChat => "Open Chat",
+            Self::NewChat => "New chat",
             Self::GoAgent => "Go to Agent",
             Self::GoEditor => "Go to Editor",
             Self::GoTerminal => "Go to Terminal",
@@ -254,6 +260,7 @@ impl PaletteCommand {
     /// stays the single source of truth for what the widget matches.
     pub(crate) fn keywords(self) -> &'static [&'static str] {
         match self {
+            Self::OpenChat | Self::NewChat => &["chat", "standalone", "conversation", "thread"],
             Self::GoAgent => &["tab", "agent", "opencode"],
             Self::GoEditor => &["tab", "editor", "nvim"],
             Self::GoTerminal => &["tab", "terminal", "shell"],
@@ -496,7 +503,7 @@ pub(crate) fn item_at(
     sections.get(section)?.items.get(row).cloned()
 }
 
-const GO_TO_COMMANDS: [PaletteCommand; 10] = [
+const GO_TO_COMMANDS: [PaletteCommand; 12] = [
     PaletteCommand::GoAgent,
     PaletteCommand::GoEditor,
     PaletteCommand::GoTerminal,
@@ -507,6 +514,8 @@ const GO_TO_COMMANDS: [PaletteCommand; 10] = [
     PaletteCommand::EditorGoBack,
     PaletteCommand::BrowseArtifacts,
     PaletteCommand::RepositoryRelationships,
+    PaletteCommand::OpenChat,
+    PaletteCommand::NewChat,
 ];
 
 const REPOSITORY_COMMANDS: [PaletteCommand; 1] = [PaletteCommand::AddRepository];
@@ -713,7 +722,9 @@ mod tests {
             vec![
                 PaletteCommand::GoHome,
                 PaletteCommand::BrowseArtifacts,
-                PaletteCommand::RepositoryRelationships
+                PaletteCommand::RepositoryRelationships,
+                PaletteCommand::OpenChat,
+                PaletteCommand::NewChat,
             ]
         );
         // Tools belong to no repository, so Home keeps its whole section.
@@ -752,6 +763,8 @@ mod tests {
                 PaletteCommand::EditorGoBack,
                 PaletteCommand::BrowseArtifacts,
                 PaletteCommand::RepositoryRelationships,
+                PaletteCommand::OpenChat,
+                PaletteCommand::NewChat,
             ]
         );
         assert_eq!(
@@ -1045,7 +1058,7 @@ mod tests {
             item_at(&sections, 4, 0),
             Some(PaletteItem::Command(PaletteCommand::SyncPortable))
         );
-        assert_eq!(item_at(&sections, 0, 10), None);
+        assert_eq!(item_at(&sections, 0, GO_TO_COMMANDS.len()), None);
         assert_eq!(item_at(&sections, 1, ToolKind::ALL.len()), None);
         assert_eq!(item_at(&sections, 5, 0), None);
     }
@@ -1055,7 +1068,7 @@ mod tests {
         let sections = palette_sections(&fixture_recents());
         let all = filter_items(&sections, "");
         // 10 go-to + all tools + 2 switch + 1 add + 1 settings + 1 sync.
-        let expected = 15 + ToolKind::ALL.len();
+        let expected = GO_TO_COMMANDS.len() + 5 + ToolKind::ALL.len();
         assert_eq!(all.len(), expected);
         assert_eq!(filter_items(&sections, "   ").len(), expected);
     }

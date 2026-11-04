@@ -51,6 +51,33 @@ impl Catalog {
             cache: root.map(|r| r.root().join("cache/agent-sessions")),
         }
     }
+    pub fn chat_snapshot(&self) -> Snapshot {
+        self.snapshot.lock().clone()
+    }
+    pub fn prepare_chat(
+        &self,
+        thread: &crate::data::chat::Thread,
+    ) -> anyhow::Result<SessionSummary> {
+        let key = thread
+            .native
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Link native history before resuming this chat"))?;
+        let source = providers::Source {
+            provider: thread.agent.id(),
+            root: thread.store.clone(),
+        };
+        let rows = providers::discover(&source, &mut HashMap::new())?;
+        let session = rows
+            .into_iter()
+            .find(|s| &s.key == key)
+            .ok_or_else(|| anyhow::anyhow!("History unavailable"))?;
+        anyhow::ensure!(
+            model::canonical(&session.cwd) == thread.cwd,
+            "Native working folder changed"
+        );
+        session.validate()?;
+        Ok(session)
+    }
     pub fn snapshot(&self) -> Snapshot {
         let mut snapshot = self.snapshot.lock().clone();
         match crate::agent_accounts::Accounts::load(self.root.as_ref()) {
@@ -62,6 +89,22 @@ impl Catalog {
                 snapshot
                     .errors
                     .push(format!("Agent accounts unavailable: {error:#}"));
+            }
+        }
+        if let Some(root) = &self.root {
+            match crate::data::chat::Registry::load(root) {
+                Ok(registry) => snapshot.sessions.retain(|s| {
+                    !registry
+                        .threads
+                        .iter()
+                        .any(|t| t.native.as_ref() == Some(&s.key))
+                }),
+                Err(error) => {
+                    snapshot.sessions.clear();
+                    snapshot
+                        .errors
+                        .push(format!("Chat ownership unavailable: {error}"));
+                }
             }
         }
         snapshot

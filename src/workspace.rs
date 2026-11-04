@@ -143,12 +143,24 @@ impl WorkspaceTab {
 /// instead of always landing on Home.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageOrigin {
+    Chat,
     Home,
     Repository,
 }
 
+/// Chat temporarily replaces the current view and retains its return targets.
+struct ChatOrigin {
+    home_visible: bool,
+    home_page: crate::home::PageState,
+    relationships_visible: bool,
+    git_page_origin: Option<GitPageOrigin>,
+    artifacts_origin: Option<PageOrigin>,
+    relationships_origin: Option<PageOrigin>,
+}
+
 /// The Git page temporarily replaces the current view without selecting a tab.
 struct GitPageOrigin {
+    chat_visible: bool,
     home_visible: bool,
     relationships_visible: bool,
     focus: Option<FocusHandle>,
@@ -208,6 +220,9 @@ fn visible_git_status<'a>(
 pub(crate) struct Workspace {
     resources: Entity<crate::artifacts::ArtifactBrowser>,
     home: Entity<HomeView>,
+    chat: Entity<crate::chat::ChatView>,
+    chat_visible: bool,
+    chat_origin: Option<ChatOrigin>,
     relationships: Entity<crate::repository_graph::GraphPage>,
     relationships_visible: bool,
     relationships_origin: Option<PageOrigin>,
@@ -560,6 +575,14 @@ impl Workspace {
         // `update` fails once the workspace is dropped.
         cx.spawn(async move |this, cx| {
             loop {
+                match this.update(cx, |this, _| this.chat_visible) {
+                    Ok(true) => {
+                        cx.background_executor().timer(GIT_POLL_INTERVAL).await;
+                        continue;
+                    }
+                    Err(_) => break,
+                    _ => {}
+                }
                 let next = this.update(cx, |this, _| {
                     let (generation, path) =
                         this.git_poll.begin_check(this.working_directory.clone());
@@ -595,6 +618,14 @@ impl Workspace {
         .detach();
         cx.spawn(async move |this, cx| {
             loop {
+                match this.update(cx, |this, _| this.chat_visible) {
+                    Ok(true) => {
+                        cx.background_executor().timer(GIT_POLL_INTERVAL).await;
+                        continue;
+                    }
+                    Err(_) => break,
+                    _ => {}
+                }
                 let next = this.update(cx, |this, _| {
                     let root = this.data_root.as_ref()?;
                     Some(this.portable_git_poll.begin_check(root.portable_dir()))
@@ -704,6 +735,7 @@ impl Workspace {
             HomeEvent::RemoveRepository { key } => this.confirm_remove_repository(key, window, cx),
             HomeEvent::OpenAgentSession(key) => this.open_agent_session(key.clone(), window, cx),
             HomeEvent::RefreshSessions => this.refresh_sessions(cx),
+            HomeEvent::OpenChat => this.open_chat(window, cx),
         })
         .detach();
         let settings = cx.new(|cx| {
@@ -724,6 +756,24 @@ impl Workspace {
             .and_then(|root| resolve_current_key(root, working_directory));
 
         let session_catalog = Catalog::new(data_root.as_ref());
+        let chat = cx.new(|cx| {
+            crate::chat::ChatView::new(
+                data_root.clone(),
+                agent_activity.clone(),
+                session_catalog.clone(),
+                window,
+                cx,
+            )
+        });
+        chat.update(cx, |view, cx| {
+            view.set_space(spaces.clone(), active_space.clone(), window, cx)
+        });
+        cx.subscribe_in(&chat, window, |this, _, event, window, cx| match event {
+            crate::chat::ChatEvent::Space(space) => this.switch_space(space.clone(), window, cx),
+            crate::chat::ChatEvent::Refresh => this.refresh_sessions(cx),
+            crate::chat::ChatEvent::New => this.new_chat(window, cx),
+        })
+        .detach();
         let initial_catalog = session_catalog.clone();
         cx.spawn(async move |this, cx| {
             cx.background_spawn(async move {
@@ -850,6 +900,9 @@ impl Workspace {
             .detach();
         }
         Self {
+            chat,
+            chat_visible: false,
+            chat_origin: None,
             relationships,
             relationships_visible: false,
             relationships_origin: None,
@@ -952,6 +1005,81 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_leave_git(window, cx) {
+            return;
+        }
+        if !self.chat_visible {
+            self.chat_origin = Some(ChatOrigin {
+                home_visible: self.home_visible,
+                home_page: self.home.read(cx).page_state(),
+                relationships_visible: self.relationships_visible,
+                git_page_origin: self.git_page_origin.take(),
+                artifacts_origin: self.artifacts_origin,
+                relationships_origin: self.relationships_origin,
+            });
+        }
+        self.close_navigation(cx);
+        self.chat_visible = true;
+        self.chat.update(cx, |v, _| v.active = true);
+        self.home_visible = true;
+        self.relationships_visible = false;
+        self.command_open = false;
+        self.session_navigation = self.session_navigation.wrapping_add(1);
+        self.resources.update(cx, |v, cx| v.set_active(false, cx));
+        self.home.update(cx, |v, cx| v.deactivate(cx));
+        self.relationships
+            .update(cx, |v, cx| v.set_active(false, cx));
+        self.sync_git_view(cx);
+        self.refresh_spaces();
+        self.chat.update(cx, |v, cx| {
+            v.set_space(self.spaces.clone(), self.active_space.clone(), window, cx);
+            v.refresh(self.session_catalog.chat_snapshot(), cx);
+        });
+        self.refresh_sessions(cx);
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+    fn resume_chat_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let origin = self.chat_origin.take();
+        self.open_chat(window, cx);
+        self.chat_origin = origin;
+    }
+    fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_chat(window, cx);
+        if self.chat_visible {
+            self.chat.update(cx, |v, cx| {
+                v.new_chat(self.enabled_agents.clone(), self.default_agent, window, cx)
+            });
+        }
+    }
+    fn back_from_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_navigation(cx);
+        self.chat_visible = false;
+        self.chat.update(cx, |v, _| v.active = false);
+        if let Some(origin) = self.chat_origin.take() {
+            self.home_visible = origin.home_visible;
+            self.home
+                .update(cx, |v, cx| v.restore_page(origin.home_page, cx));
+            self.relationships_visible = origin.relationships_visible;
+            self.git_page_origin = origin.git_page_origin;
+            self.artifacts_origin = origin.artifacts_origin;
+            self.relationships_origin = origin.relationships_origin;
+        } else {
+            self.home_visible = true;
+        }
+        if !self.home_visible && self.git_page_origin.is_none() {
+            self.enter_repository(window, cx);
+        }
+        if self.relationships_visible {
+            self.relationships
+                .update(cx, |v, cx| v.set_active(true, cx));
+        }
+        self.sync_git_view(cx);
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
     fn focus_active_pane(&mut self, window: &mut Window, cx: &mut App) {
         self.remember_agent_pane(cx);
         self.sync_activity_visibility(window, cx);
@@ -971,6 +1099,15 @@ impl Workspace {
                 .focus_handle
                 .clone()
                 .focus(window, cx);
+            return;
+        }
+        if self.chat_visible {
+            let chat = self.chat.read(cx);
+            let focus = chat
+                .pane()
+                .map(|p| p.read(cx).focus_handle.clone())
+                .unwrap_or_else(|| chat.focus.clone());
+            focus.focus(window, cx);
             return;
         }
         if self.home_visible {
@@ -1006,7 +1143,9 @@ impl Workspace {
     fn sync_activity_visibility(&self, window: &Window, cx: &App) {
         self.agent_activity
             .set_foreground_checkout(self.foreground_checkout());
-        let visible = if self.git_page_origin.is_none()
+        let visible = if self.chat_visible && window.is_window_active() {
+            self.chat.read(cx).launch_id(cx)
+        } else if self.git_page_origin.is_none()
             && !self.git_header_busy
             && !self.home_visible
             && window.is_window_active()
@@ -1235,6 +1374,30 @@ impl Workspace {
     ) {
         if self.command_open {
             return;
+        }
+        if attention_only {
+            let activity = self.agent_activity.snapshot();
+            let chat = self.chat.read(cx);
+            let target = chat
+                .registry
+                .threads
+                .iter()
+                .find(|t| {
+                    t.available_space(&self.spaces)
+                        .is_some_and(|s| self.active_space.matches(&s.name))
+                        && chat
+                            .live
+                            .get(&t.id)
+                            .and_then(|p| p.read(cx).launch_id())
+                            .and_then(|id| activity.for_launch(id))
+                            .is_some_and(|a| a.state == ActivityState::NeedsAttention)
+                })
+                .map(|t| t.id.clone());
+            if let Some(id) = target {
+                self.open_chat(window, cx);
+                self.chat.update(cx, |v, cx| v.open(&id, window, cx));
+                return;
+            }
         }
         self.command_origin_focus = self.focused_content_handle(window, cx);
         // Opening another overlay clears stale navigation state: the palette
@@ -1537,6 +1700,7 @@ impl Workspace {
                 .take()
                 .or_else(|| self.focused_content_handle(window, cx));
             self.git_page_origin = Some(GitPageOrigin {
+                chat_visible: self.chat_visible,
                 home_visible: self.home_visible,
                 relationships_visible: self.relationships_visible,
                 focus,
@@ -1544,6 +1708,8 @@ impl Workspace {
         }
         self.close_navigation(cx);
         self.command_open = false;
+        self.chat_visible = false;
+        self.chat.update(cx, |v, _| v.active = false);
         self.home_visible = false;
         self.relationships_visible = false;
         self.home.update(cx, |view, cx| view.deactivate(cx));
@@ -1579,6 +1745,8 @@ impl Workspace {
             return;
         };
         self.close_navigation(cx);
+        self.chat_visible = origin.chat_visible;
+        self.chat.update(cx, |v, _| v.active = self.chat_visible);
         self.home_visible = origin.home_visible;
         self.relationships_visible = origin.relationships_visible;
         self.sync_git_view(cx);
@@ -1706,6 +1874,8 @@ impl Workspace {
                 PaletteCommand::OpenSettings => self.open_settings(window, cx),
                 PaletteCommand::EditorGoBack => self.editor_go_back(window, cx),
                 PaletteCommand::AddRepository => self.open_add_repository(window, cx),
+                PaletteCommand::OpenChat => self.open_chat(window, cx),
+                PaletteCommand::NewChat => self.new_chat(window, cx),
                 PaletteCommand::GoHome => self.go_home(window, cx),
                 PaletteCommand::RepositoryRelationships => self.open_relationships(window, cx),
                 PaletteCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
@@ -2115,6 +2285,8 @@ impl Workspace {
     }
 
     fn enter_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_visible = false;
+        self.chat.update(cx, |v, _| v.active = false);
         self.git_page_origin = None;
         self.sync_tutorial_palette(cx);
         self.sync_tutorial_navigation(cx);
@@ -2212,7 +2384,9 @@ impl Workspace {
         }
         self.git_page_origin = None;
         if !self.relationships_visible {
-            self.relationships_origin = Some(if self.home_visible {
+            self.relationships_origin = Some(if self.chat_visible {
+                PageOrigin::Chat
+            } else if self.home_visible {
                 PageOrigin::Home
             } else {
                 PageOrigin::Repository
@@ -2222,6 +2396,8 @@ impl Workspace {
         self.home.update(cx, |view, cx| view.deactivate(cx));
         self.resources
             .update(cx, |view, cx| view.set_active(false, cx));
+        self.chat_visible = false;
+        self.chat.update(cx, |v, _| v.active = false);
         self.relationships_visible = true;
         self.home_visible = true;
         self.sync_git_view(cx);
@@ -2238,6 +2414,7 @@ impl Workspace {
         self.relationships
             .update(cx, |view, cx| view.set_active(false, cx));
         match self.relationships_origin.take() {
+            Some(PageOrigin::Chat) => self.resume_chat_page(window, cx),
             Some(PageOrigin::Repository) => self.enter_repository(window, cx),
             _ => {
                 self.home.update(cx, |view, cx| view.resume_page(cx));
@@ -2270,6 +2447,9 @@ impl Workspace {
             return;
         }
         self.active_space = selection.clone();
+        self.chat.update(cx, |v, cx| {
+            v.set_space(self.spaces.clone(), selection.clone(), window, cx)
+        });
         self.close_space_menu(window, cx);
         self.close_navigation(cx);
         if let Some(root) = &self.data_root {
@@ -2319,8 +2499,9 @@ impl Workspace {
     /// repositories count under their repository's space; unregistered
     /// checkouts (explicitly opened ad-hoc) always count, matching the Home
     /// session cards' rule.
-    fn attention_count(&self) -> usize {
-        self.agent_activity
+    fn attention_count(&self, cx: &App) -> usize {
+        let repository_count = self
+            .agent_activity
             .snapshot()
             .launches_by_checkout()
             .filter(|(checkout, agent)| {
@@ -2329,7 +2510,25 @@ impl Workspace {
                         .session_space(checkout)
                         .is_none_or(|space| self.active_space.matches(&space))
             })
-            .count()
+            .count();
+        let snapshot = self.agent_activity.snapshot();
+        let chat = self.chat.read(cx);
+        repository_count
+            + chat
+                .registry
+                .threads
+                .iter()
+                .filter(|t| {
+                    t.available_space(&self.spaces)
+                        .is_some_and(|s| self.active_space.matches(&s.name))
+                        && chat
+                            .live
+                            .get(&t.id)
+                            .and_then(|p| p.read(cx).launch_id())
+                            .and_then(|id| snapshot.for_launch(id))
+                            .is_some_and(|a| a.state == ActivityState::NeedsAttention)
+                })
+                .count()
     }
 
     fn completion_count(&self) -> usize {
@@ -2397,6 +2596,9 @@ impl Workspace {
                 });
             }
         }
+        self.chat.update(cx, |v, cx| {
+            v.sync_space(self.spaces.clone(), self.active_space.clone(), cx)
+        });
         let names = self.spaces.names();
         self.home.update(cx, |view, cx| {
             view.set_space(names.clone(), self.active_space.clone(), cx);
@@ -2517,6 +2719,8 @@ impl Workspace {
         if !self.can_leave_git(window, cx) {
             return;
         }
+        self.chat_visible = false;
+        self.chat.update(cx, |v, _| v.active = false);
         self.git_page_origin = None;
         self.relationships_visible = false;
         self.relationships
@@ -2549,15 +2753,20 @@ impl Workspace {
         self.relationships
             .update(cx, |view, cx| view.set_active(false, cx));
         self.close_navigation(cx);
-        let already_there = self.home_visible && self.home.read(cx).is_artifacts_page();
+        let already_there =
+            !self.chat_visible && self.home_visible && self.home.read(cx).is_artifacts_page();
         if !already_there {
-            let origin = if !self.home_visible {
+            let origin = if self.chat_visible {
+                PageOrigin::Chat
+            } else if !self.home_visible {
                 PageOrigin::Repository
             } else {
                 PageOrigin::Home
             };
             self.artifacts_origin = Some(origin);
         }
+        self.chat_visible = false;
+        self.chat.update(cx, |v, _| v.active = false);
         self.resources
             .update(cx, |view, cx| view.set_active(false, cx));
         self.home_visible = true;
@@ -2629,6 +2838,7 @@ impl Workspace {
     fn go_back_from_artifacts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_navigation(cx);
         match self.artifacts_origin.take() {
+            Some(PageOrigin::Chat) => self.resume_chat_page(window, cx),
             Some(PageOrigin::Repository) => {
                 self.enter_repository(window, cx);
                 self.focus_active_pane(window, cx);
@@ -2642,6 +2852,7 @@ impl Workspace {
 
     fn artifacts_back_label(&self) -> SharedString {
         match self.artifacts_origin {
+            Some(PageOrigin::Chat) => "‹ Chat".into(),
             Some(PageOrigin::Repository) => format!("‹ {}", self.project_name).into(),
             Some(PageOrigin::Home) | None => "‹ Home".into(),
         }
@@ -2898,7 +3109,10 @@ impl Workspace {
         let mut open_checkouts = activity
             .iter()
             .filter(|(checkout, agent)| {
-                agent.state != ActivityState::NoAgent
+                self.open_sessions
+                    .values()
+                    .any(|s| s.checkout.as_path() == *checkout)
+                    && agent.state != ActivityState::NoAgent
                     && (!attention_only || agent.state == ActivityState::NeedsAttention)
                     && !self
                         .recent_repositories
@@ -3137,6 +3351,9 @@ impl Workspace {
     }
 
     fn render_active_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.chat_visible {
+            return self.chat.clone().into_any_element();
+        }
         if self.git_page_origin.is_none()
             && self
                 .git_view
@@ -3200,6 +3417,9 @@ impl Workspace {
     }
 
     fn navigation_context(&self, cx: &App) -> NavigationContext {
+        if self.chat_visible {
+            return NavigationContext::Chat;
+        }
         if self.git_page_origin.is_some() || self.git_header_busy {
             return NavigationContext::Git;
         }
@@ -3251,6 +3471,9 @@ impl Workspace {
     }
 
     fn navigation_panes(&self, cx: &App) -> Vec<(&'static str, FocusHandle)> {
+        if self.chat_visible {
+            return self.chat.read(cx).panes(cx);
+        }
         if self.git_header_busy && self.git_page_origin.is_none() {
             return vec![("Git operation", self.git_header_busy_focus.clone())];
         }
@@ -3315,6 +3538,11 @@ impl Workspace {
             .rposition(|(_, focus)| focus.contains_focused(window, cx))
             .unwrap_or(0);
         self.navigation_open = true;
+        if self.chat_visible {
+            self.chat.update(cx, |v, cx| v.set_navigation(true, cx));
+            cx.notify();
+            return;
+        }
         if self.git_page_origin.is_none()
             && !self.git_header_busy
             && !self.home_visible
@@ -3359,6 +3587,7 @@ impl Workspace {
     }
 
     fn close_navigation(&mut self, cx: &mut Context<Self>) {
+        self.chat.update(cx, |v, cx| v.set_navigation(false, cx));
         let was_open = self.navigation_open;
         if was_open {
             self.navigation_open = false;
@@ -3437,6 +3666,12 @@ impl Workspace {
     /// `j`/`k`. Keeps the mode open for repeats; locations without a list
     /// consume the key and stay open. Clamps at the ends like pane movement.
     fn move_navigation_item(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_visible {
+            if self.navigation_pane == 0 {
+                self.chat.update(cx, |v, cx| v.move_cursor(down, cx));
+            }
+            return;
+        }
         if self.git_page_origin.is_some() || self.git_header_busy || self.relationships_visible {
             return;
         }
@@ -3488,6 +3723,15 @@ impl Workspace {
     /// like before. Folder toggles keep navigation open; other activations
     /// return to normal mode.
     fn accept_navigation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_visible {
+            if self.navigation_pane == 0
+                && self.chat.update(cx, |v, cx| v.accept_cursor(window, cx))
+            {
+                return;
+            }
+            self.close_navigation(cx);
+            return;
+        }
         if self.git_page_origin.is_some() {
             self.close_navigation(cx);
             return;
@@ -3542,6 +3786,12 @@ impl Workspace {
         // Close through the shared path so item cursors clear with the mode.
         self.close_navigation(cx);
         match command {
+            NavigationCommand::OpenChat => self.open_chat(window, cx),
+            NavigationCommand::NewChat => self.new_chat(window, cx),
+            NavigationCommand::ChatSearch => {
+                self.chat.update(cx, |v, cx| v.focus_search(window, cx))
+            }
+            NavigationCommand::ChatTags => self.chat.update(cx, |v, cx| v.filters(window, cx)),
             NavigationCommand::AddRepository => self.open_add_repository(window, cx),
             NavigationCommand::BrowseArtifacts => self.browse_artifacts(window, cx),
             NavigationCommand::SwitchSpace => self.toggle_space_menu(window, cx),
@@ -3557,6 +3807,10 @@ impl Workspace {
             NavigationCommand::GitChanges => self.open_git_page(window, cx),
             NavigationCommand::Home => self.go_home(window, cx),
             NavigationCommand::Back => {
+                if self.chat_visible {
+                    self.back_from_chat(window, cx);
+                    return;
+                }
                 if self.git_page_origin.is_some() {
                     self.back_from_git(window, cx);
                     return;
@@ -4052,6 +4306,7 @@ impl Workspace {
 /// `CommandItem::action`, which renders the binding hint for free; `on_confirm` still resolves it afterwards, idempotently.
 fn palette_icon(command: PaletteCommand) -> IconName {
     match command {
+        PaletteCommand::OpenChat | PaletteCommand::NewChat => IconName::Bot,
         PaletteCommand::GoAgent => IconName::Bot,
         PaletteCommand::GoEditor => IconName::FileText,
         PaletteCommand::GoTerminal => IconName::SquareTerminal,
@@ -4110,10 +4365,12 @@ impl Render for Workspace {
         // chrome: title and back navigation live here, not in a second row.
         // The portable git status is hidden on these pages and the lists
         // stay live through their active polls.
-        let is_artifacts = self.home_visible
+        let is_artifacts = !self.chat_visible
+            && self.home_visible
             && !self.relationships_visible
             && self.home.read(cx).is_artifacts_page();
-        let is_projects = self.home_visible
+        let is_projects = !self.chat_visible
+            && self.home_visible
             && !self.relationships_visible
             && self.home.read(cx).is_projects_page();
         let artifacts_back = if is_artifacts {
@@ -4121,21 +4378,26 @@ impl Render for Workspace {
         } else {
             SharedString::from("")
         };
-        let is_pull_requests = self.home_visible
+        let is_pull_requests = !self.chat_visible
+            && self.home_visible
             && !self.relationships_visible
             && self.home.read(cx).is_pull_requests_page();
-        let is_todos =
-            self.home_visible && !self.relationships_visible && self.home.read(cx).is_todos_page();
-        let is_reading = self.home_visible
+        let is_todos = !self.chat_visible
+            && self.home_visible
+            && !self.relationships_visible
+            && self.home.read(cx).is_todos_page();
+        let is_reading = !self.chat_visible
+            && self.home_visible
             && !self.relationships_visible
             && self.home.read(cx).is_reading_page();
-        let is_home_page = self.relationships_visible
+        let is_home_page = self.chat_visible
+            || self.relationships_visible
             || is_artifacts
             || is_projects
             || is_pull_requests
             || is_todos
             || is_reading;
-        let attention_count = self.attention_count();
+        let attention_count = self.attention_count(cx);
         let completion_count = self.completion_count();
         let completion_label = if completion_count == 1 {
             "1 agent finished · Open projects".to_owned()
@@ -4256,6 +4518,19 @@ impl Render for Workspace {
                     })
                     .when(self.home_visible && !self.relationships_visible, |header| {
                         header.child(self.space_switcher(cx))
+                    })
+                    .when(self.chat_visible, |header| {
+                        header
+                            .child(
+                                Button::new("chat-back")
+                                    .ghost()
+                                    .small()
+                                    .label("‹ Back")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.back_from_chat(window, cx)
+                                    })),
+                            )
+                            .child(div().text_sm().font_semibold().child("Chat"))
                     })
                     .when(self.relationships_visible, |header| {
                         header.child(
@@ -5173,6 +5448,71 @@ mod tests {
                 assert!(workspace.home_visible);
                 assert!(workspace.home.read(cx).is_artifacts_page());
                 assert_eq!(workspace.artifacts_origin, origin);
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn chat_roundtrips_restore_artifact_and_relationship_return_targets(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::{cell::RefCell, rc::Rc};
+        cx.update(gpui_kit::init);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let holder = Rc::new(RefCell::new(None));
+        let slot = holder.clone();
+        let (_, test_cx) = cx.add_window_view(move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new_for_test(window, cx, &root));
+            *slot.borrow_mut() = Some(workspace.clone());
+            Root::new(workspace, window, cx)
+        });
+        let workspace = holder.borrow().clone().unwrap();
+        test_cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                // A retained Artifacts page behind Chat is not the visible
+                // destination. Reopening it must capture Chat as the origin.
+                workspace.home_visible = false;
+                workspace.active_tab = WorkspaceTab::Resources;
+                workspace.browse_artifacts(window, cx);
+                assert_eq!(workspace.artifacts_origin, Some(PageOrigin::Repository));
+                workspace.open_chat(window, cx);
+                workspace.browse_artifacts(window, cx);
+                assert_eq!(workspace.artifacts_origin, Some(PageOrigin::Chat));
+                workspace.go_back_from_artifacts(window, cx);
+                assert!(workspace.chat_visible);
+                workspace.back_from_chat(window, cx);
+                assert!(!workspace.chat_visible);
+                assert!(workspace.home.read(cx).is_artifacts_page());
+                assert_eq!(workspace.artifacts_origin, Some(PageOrigin::Repository));
+
+                // The equivalent nested Relationships visit must also keep
+                // the return target captured before Chat was opened.
+                workspace.home_visible = false;
+                workspace.open_relationships(window, cx);
+                assert_eq!(workspace.relationships_origin, Some(PageOrigin::Repository));
+                workspace.open_chat(window, cx);
+                workspace.open_relationships(window, cx);
+                assert_eq!(workspace.relationships_origin, Some(PageOrigin::Chat));
+                workspace.back_from_relationships(window, cx);
+                assert!(workspace.chat_visible);
+                workspace.back_from_chat(window, cx);
+                assert!(!workspace.chat_visible);
+                assert!(workspace.relationships_visible);
+                assert_eq!(workspace.relationships_origin, Some(PageOrigin::Repository));
+
+                // Browsing Artifacts during a Chat detour must not replace
+                // the dashboard that Chat originally covered.
+                workspace.go_home(window, cx);
+                let home_page = workspace.home.read(cx).page_state();
+                workspace.open_chat(window, cx);
+                workspace.browse_artifacts(window, cx);
+                workspace.go_back_from_artifacts(window, cx);
+                assert!(workspace.chat_visible);
+                workspace.back_from_chat(window, cx);
+                assert!(workspace.home_visible);
+                assert!(!workspace.chat_visible);
+                assert_eq!(workspace.home.read(cx).page_state(), home_page);
             });
         });
     }

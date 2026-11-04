@@ -9,6 +9,7 @@ mod app_assets;
 mod artifacts;
 #[cfg(test)]
 mod backend_benchmarks;
+mod chat;
 mod cli;
 mod command_palette;
 mod commands;

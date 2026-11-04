@@ -204,6 +204,7 @@ pub(crate) enum HomeEvent {
     RemoveRepository { key: String },
     OpenAgentSession(crate::agent_sessions::SessionKey),
     RefreshSessions,
+    OpenChat,
 }
 
 /// Session-local project filter for Todos. `All` shows everything, `Unscoped`
@@ -267,6 +268,14 @@ fn todo_board_columns(projects: &[RepositoryEntry], todos: &[Item]) -> Vec<TodoC
         });
     }
     columns
+}
+
+/// The retained Home destination while another full-page view is visible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageState {
+    page: Option<&'static str>,
+    scroll_offset: gpui_kit::Point<gpui_kit::Pixels>,
+    active: bool,
 }
 
 pub(crate) struct HomeView {
@@ -501,6 +510,25 @@ impl HomeView {
             view.set_active(self.page == Some("Artifacts"), cx)
         });
         self.reload(cx);
+    }
+
+    pub(crate) fn page_state(&self) -> PageState {
+        PageState {
+            page: self.page,
+            scroll_offset: self.scroll.offset(),
+            active: self.active,
+        }
+    }
+
+    pub(crate) fn restore_page(&mut self, state: PageState, cx: &mut Context<Self>) {
+        self.page = state.page;
+        self.scroll.set_offset(state.scroll_offset);
+        if state.active {
+            self.resume_page(cx);
+        } else {
+            self.deactivate(cx);
+            cx.notify();
+        }
     }
 
     pub(crate) fn deactivate(&mut self, cx: &mut Context<Self>) {

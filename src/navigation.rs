@@ -7,6 +7,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Context {
     Home,
+    Chat,
     Workspace,
     Git,
     Artifacts,
@@ -38,6 +39,10 @@ pub(crate) enum Tab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Command {
+    OpenChat,
+    NewChat,
+    ChatSearch,
+    ChatTags,
     AddRepository,
     BrowseArtifacts,
     SwitchSpace,
@@ -231,11 +236,55 @@ const RESOURCE_DRAFT: [Row; 2] = [
 pub(crate) fn rows(context: Context, resource: ResourceState) -> Vec<Row> {
     let mut result = match context {
         Context::Home => HOME.to_vec(),
+        Context::Chat => vec![
+            Row {
+                key: 'n',
+                label: "New chat",
+                group: "Chat",
+                command: Command::NewChat,
+            },
+            Row {
+                key: 's',
+                label: "Switch space",
+                group: "Chat",
+                command: Command::SwitchSpace,
+            },
+            Row {
+                key: 'f',
+                label: "Search threads",
+                group: "Chat",
+                command: Command::ChatSearch,
+            },
+            Row {
+                key: 't',
+                label: "Tag filters",
+                group: "Chat",
+                command: Command::ChatTags,
+            },
+            Row {
+                key: 'b',
+                label: "Back",
+                group: "Navigate",
+                command: Command::Back,
+            },
+            Row {
+                key: ' ',
+                label: "Home",
+                group: "Navigate",
+                command: Command::Home,
+            },
+        ],
         Context::Workspace => WORKSPACE.to_vec(),
         Context::Git => WORKSPACE.into_iter().chain([ARTIFACTS[1]]).collect(),
         Context::Artifacts => ARTIFACTS.to_vec(),
         Context::Relationships => RELATIONSHIPS.to_vec(),
     };
+    result.push(Row {
+        key: 'o',
+        label: "Open Chat",
+        group: "Navigate",
+        command: Command::OpenChat,
+    });
     if context == Context::Workspace && resource.active_tab == Some(Tab::Agent) {
         result.push(NEW_SESSION);
     }
@@ -596,9 +645,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_palette_keys_are_gone_everywhere() {
+    fn palette_keys_are_gone_and_chat_is_global() {
         // The Common section was removed: palettes stay reachable through
-        // their direct shortcuts, so p/o must offer nothing in any context.
+        // their direct shortcuts. Open Chat owns o in every page context.
         // `s` is Home's Switch space action and stays free elsewhere.
         for context in [
             Context::Home,
@@ -607,9 +656,11 @@ mod tests {
             Context::Artifacts,
             Context::Relationships,
         ] {
-            for key in ['p', 'o'] {
-                assert_eq!(resolve(context, ResourceState::default(), key), None);
-            }
+            assert_eq!(
+                resolve(context, ResourceState::default(), 'o'),
+                Some(Command::OpenChat)
+            );
+            assert_eq!(resolve(context, ResourceState::default(), 'p'), None);
             assert!(
                 rows(context, ResourceState::default())
                     .iter()
@@ -691,10 +742,13 @@ mod tests {
             None
         );
         assert_eq!(resolve(Context::Home, built_in, 'f'), None);
-        assert_eq!(resolve(Context::Workspace, built_in, 'o'), None);
+        assert_eq!(
+            resolve(Context::Workspace, built_in, 'o'),
+            Some(Command::OpenChat)
+        );
         assert_eq!(
             resolve(Context::Workspace, ResourceState::default(), 'o'),
-            None
+            Some(Command::OpenChat)
         );
     }
 
@@ -1015,5 +1069,44 @@ mod tests {
         cx.update(|_, app| app.bind_keys([KeyBinding::new("a", LeakingAction, None)]));
         cx.simulate_keystrokes("a");
         view.update(cx, |harness, _| assert_eq!(harness.action_count, 0));
+    }
+    #[test]
+    fn chat_keys_are_unique_across_pages_and_resource_states() {
+        for context in [
+            Context::Home,
+            Context::Chat,
+            Context::Workspace,
+            Context::Git,
+            Context::Artifacts,
+            Context::Relationships,
+        ] {
+            for active_tab in [
+                None,
+                Some(Tab::Agent),
+                Some(Tab::Editor),
+                Some(Tab::Terminal),
+                Some(Tab::Review),
+                Some(Tab::Resources),
+            ] {
+                for flags in 0..128 {
+                    let state = ResourceState {
+                        active_tab,
+                        built_in_editor: flags & 1 != 0,
+                        markdown_file: flags & 2 != 0,
+                        selected: flags & 4 != 0,
+                        drafting: flags & 8 != 0,
+                        saving: flags & 16 != 0,
+                        editable: flags & 32 != 0,
+                    };
+                    assert!(unique_keys(&rows(context, state)));
+                    assert_eq!(resolve(context, state, 'o'), Some(Command::OpenChat));
+                    if context == Context::Chat {
+                        assert_eq!(resolve(context, state, 'n'), Some(Command::NewChat));
+                        assert_eq!(resolve(context, state, 'f'), Some(Command::ChatSearch));
+                        assert_eq!(resolve(context, state, 't'), Some(Command::ChatTags));
+                    }
+                }
+            }
+        }
     }
 }

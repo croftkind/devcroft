@@ -159,6 +159,18 @@ impl Workspace {
         cx: &App,
     ) -> anyhow::Result<()> {
         self.remember_agent_pane(cx);
+        if let Some(id) = self
+            .spaces
+            .spaces
+            .iter()
+            .find(|s| crate::data::space_eq(&s.name, space))
+            .map(|s| s.id.clone())
+        {
+            anyhow::ensure!(
+                !self.chat.read(cx).busy_space(&id),
+                "Close the open chats in {space} before changing its accounts or removing the space."
+            );
+        }
         if let Some(root) = &self.data_root {
             let (repositories, errors) = crate::data::all_repositories(root)?;
             anyhow::ensure!(errors.is_empty(), "Could not check open agent accounts");
@@ -287,6 +299,9 @@ impl Workspace {
 
     pub(super) fn publish_sessions(&mut self, cx: &mut Context<Self>) {
         self.acknowledge_project_completions();
+        self.chat.update(cx, |v, cx| {
+            v.refresh(self.session_catalog.chat_snapshot(), cx)
+        });
         self.session_snapshot = self.session_catalog.snapshot();
         self.remember_agent_pane(cx);
         let accounts = crate::agent_accounts::Accounts::load(self.data_root.as_ref());
@@ -403,6 +418,41 @@ impl Workspace {
                 break;
             }
         }
+        for thread in &self.chat.read(cx).registry.threads {
+            if thread.archived {
+                continue;
+            }
+            let space = thread.available_space(&self.spaces);
+            if space.is_none() && self.active_space != SpaceSelection::All {
+                continue;
+            }
+            if space.is_some_and(|s| !self.active_space.matches(&s.name)) {
+                continue;
+            }
+            let session = SessionSummary {
+                key: thread.native.clone().unwrap_or_else(|| SessionKey {
+                    provider: "devcroft-chat".into(),
+                    store: thread.store.clone(),
+                    id: thread.id.clone(),
+                }),
+                cwd: thread.cwd.clone(),
+                checkout: thread.cwd.clone(),
+                title: thread.label().into(),
+                updated: thread.updated,
+                timestamp_source: "chat".into(),
+            };
+            cards.push((
+                session,
+                format!(
+                    "Chat · {}",
+                    space
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("Unavailable space")
+                ),
+            ));
+        }
+        cards.sort_by_key(|a| std::cmp::Reverse(a.0.updated));
+        cards.truncate(HOME_LIMIT);
         self.home.update(cx, |view, cx| {
             view.set_sessions(
                 cards,
@@ -464,6 +514,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(id) = self
+            .chat
+            .read(cx)
+            .registry
+            .threads
+            .iter()
+            .find(|t| {
+                t.native.as_ref() == Some(&key)
+                    || (key.provider == "devcroft-chat" && t.id == key.id)
+            })
+            .map(|t| t.id.clone())
+        {
+            self.open_chat(window, cx);
+            if self.chat_visible {
+                self.chat.update(cx, |v, cx| v.open(&id, window, cx));
+            }
+            return;
+        }
         if !self.can_leave_git(window, cx) {
             return;
         }

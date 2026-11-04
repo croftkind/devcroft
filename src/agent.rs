@@ -11,7 +11,7 @@
 //! tables below.
 
 /// Agent harness launched in the Agent tab.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum AgentKind {
     Opencode,
     Claude,

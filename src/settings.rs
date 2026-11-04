@@ -2645,8 +2645,8 @@ fn load_space_names(root: Option<&DataRoot>) -> Vec<String> {
 /// still holds the old name.
 fn space_rewrite_notice(prefix: &str, touched: &SpaceRewrite) -> String {
     let mut notice = format!(
-        "{prefix} · {} repositories and {} Home items updated",
-        touched.repositories, touched.items
+        "{prefix} · {} repositories, {} Home items and {} chats updated",
+        touched.repositories, touched.items, touched.chats
     );
     if touched.skipped > 0 {
         notice.push_str(&format!(

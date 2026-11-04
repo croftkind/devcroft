@@ -11,6 +11,7 @@
 //! inspection, and [`sync`] owns the portable-only Git pipeline over the git CLI.
 
 pub(crate) mod artifacts;
+pub(crate) mod chat;
 pub(crate) mod dashboard;
 mod device;
 mod portable;

@@ -276,6 +276,13 @@ impl HomeView {
                     .gap_2()
                     .child(section_title("Recent Sessions", self.sessions.len(), cx))
                     .child(
+                        Button::new("home-chat")
+                            .ghost()
+                            .small()
+                            .label("Chat →")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(HomeEvent::OpenChat))),
+                    )
+                    .child(
                         Button::new("refresh-home-sessions")
                             .ghost()
                             .small()

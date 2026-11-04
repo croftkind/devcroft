@@ -61,6 +61,7 @@ pub(crate) struct ActivitySnapshot {
     activities: HashMap<PathBuf, AgentActivity>,
     launches: HashMap<u64, (PathBuf, AgentActivity)>,
     unread_completions: Vec<PathBuf>,
+    standalone: HashSet<u64>,
 }
 
 impl ActivitySnapshot {
@@ -75,8 +76,9 @@ impl ActivitySnapshot {
     /// space-filtered attention counts: several panes can share a checkout.
     pub(crate) fn launches_by_checkout(&self) -> impl Iterator<Item = (&Path, &AgentActivity)> {
         self.launches
-            .values()
-            .map(|(checkout, activity)| (checkout.as_path(), activity))
+            .iter()
+            .filter(|(id, _)| !self.standalone.contains(id))
+            .map(|(_, (checkout, activity))| (checkout.as_path(), activity))
     }
 
     /// One entry per agent with a background completion not yet acknowledged.
@@ -123,6 +125,7 @@ enum BaseState {
 }
 
 struct ActivityRecord {
+    standalone: bool,
     generation: u64,
     native_session: Option<String>,
     agent: AgentKind,
@@ -253,7 +256,53 @@ impl AgentActivityStore {
             Ok(account)
         })();
         let launch_error = account.as_ref().err().map(|error| format!("{error:#}"));
-        let account = account.unwrap_or_default();
+        let context = crate::agent_accounts::AgentLaunchContext {
+            cwd: checkout.to_owned(),
+            agent,
+            account: account.unwrap_or_default(),
+            store: None,
+            session: session.cloned(),
+        };
+        self.prepare_launch(&context, prompt, launch_error)
+    }
+
+    pub(crate) fn start_context(
+        &self,
+        context: &crate::agent_accounts::AgentLaunchContext,
+    ) -> PreparedAgentLaunch {
+        let error = (|| -> anyhow::Result<()> {
+            anyhow::ensure!(context.cwd.is_dir(), "Working folder is unavailable");
+            context.account.prepare(context.agent)?;
+            if let Some(session) = &context.session {
+                session.validate()?;
+            }
+            if let Some(expected) = context.account.store(context.agent) {
+                anyhow::ensure!(
+                    context
+                        .store
+                        .as_ref()
+                        .is_some_and(|s| s.canonicalize().unwrap_or_else(|_| s.clone())
+                            == expected.canonicalize().unwrap_or(expected)),
+                    "Chat account store changed"
+                );
+            }
+            Ok(())
+        })()
+        .err()
+        .map(|e| format!("{e:#}"));
+        self.prepare_launch(context, None, error)
+    }
+
+    fn prepare_launch(
+        &self,
+        context: &crate::agent_accounts::AgentLaunchContext,
+        prompt: Option<&str>,
+        launch_error: Option<String>,
+    ) -> PreparedAgentLaunch {
+        let checkout = &context.cwd;
+        let agent = context.agent;
+        let account = context.account.clone();
+        let session = context.session.as_ref();
         let checkout = checkout
             .canonicalize()
             .unwrap_or_else(|_| checkout.to_owned());
@@ -265,6 +314,7 @@ impl AgentActivityStore {
             inner.records.insert(
                 (checkout.clone(), generation),
                 ActivityRecord {
+                    standalone: context.store.is_some(),
                     generation,
                     native_session: session.map(|s| s.key.id.clone()),
                     agent,
@@ -305,12 +355,35 @@ impl AgentActivityStore {
             provider.arguments.splice(0..0, session.arguments());
             provider.environment.extend(session.environment());
         }
+        if let Some(store) = &context.store {
+            let variable = match agent {
+                AgentKind::Codex => "CODEX_HOME",
+                AgentKind::Claude => "CLAUDE_CONFIG_DIR",
+                AgentKind::Opencode => "XDG_DATA_HOME",
+                AgentKind::Omp => "PI_CODING_AGENT_DIR",
+            };
+            provider
+                .environment
+                .push((variable.into(), store.to_string_lossy().into_owned()));
+        }
         if let Some(prompt) = prompt {
             provider.arguments.extend(agent.prompt_arguments(prompt));
         }
         let exit_marker = format!("devcroft-agent-exit-{generation}-");
-        let mut command_line =
-            account.wrap_command(agent, &shell_command(agent, generation, &provider));
+        let mut invocation = shell_command(agent, generation, &provider);
+        if let Some(store) = &context.store {
+            let variable = match agent {
+                AgentKind::Codex => "CODEX_HOME",
+                AgentKind::Claude => "CLAUDE_CONFIG_DIR",
+                AgentKind::Opencode => "XDG_DATA_HOME",
+                AgentKind::Omp => "PI_CODING_AGENT_DIR",
+            };
+            invocation = format!(
+                "export {variable}={} && {invocation}",
+                shell_quote(&store.to_string_lossy())
+            );
+        }
+        let mut command_line = account.wrap_command(agent, &invocation);
         // Isolated launches run in a subshell. Also clear observer secrets in
         // the parent login shell after it returns.
         if !provider.environment.is_empty() {
@@ -346,12 +419,17 @@ impl AgentActivityStore {
         let mut activities: HashMap<PathBuf, AgentActivity> = HashMap::new();
         let mut launches = HashMap::new();
         let mut unread_completions = Vec::new();
+        let mut standalone = HashSet::new();
         for ((checkout, generation), record) in &inner.records {
-            if record.unread_completion {
+            if record.unread_completion && !record.standalone {
                 unread_completions.push(checkout.clone());
             }
             let activity = record.projected();
             launches.insert(*generation, (checkout.clone(), activity.clone()));
+            if record.standalone {
+                standalone.insert(*generation);
+                continue;
+            }
             let priority = |state| match state {
                 ActivityState::NeedsAttention => 6,
                 ActivityState::Working => 5,
@@ -371,6 +449,7 @@ impl AgentActivityStore {
             activities,
             launches,
             unread_completions,
+            standalone,
         }
     }
 
@@ -1574,5 +1653,29 @@ mod tests {
             store.snapshot().for_checkout(&checkout).unwrap().state,
             ActivityState::Idle
         );
+    }
+    #[test]
+    fn standalone_activity_keeps_launch_identity_without_affecting_repository_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_owned();
+        let store_path = cwd.join("native store's home");
+        let store = AgentActivityStore::new().0;
+        let context = crate::agent_accounts::AgentLaunchContext {
+            cwd: cwd.clone(),
+            agent: AgentKind::Codex,
+            account: Default::default(),
+            store: Some(store_path.clone()),
+            session: None,
+        };
+        let launch = store.start_context(&context);
+        assert!(launch.launch_error.is_none());
+        let snapshot = store.snapshot();
+        assert!(snapshot.for_launch(launch.id()).is_some());
+        assert!(snapshot.for_checkout(&cwd).is_none());
+        assert_eq!(snapshot.launches_by_checkout().count(), 0);
+        assert!(launch.command_line().contains(&format!(
+            "export CODEX_HOME={}",
+            shell_quote(&store_path.to_string_lossy())
+        )));
     }
 }

@@ -14,12 +14,45 @@ use crate::{
     data::{DataRoot, DeviceStore, Spaces, all_repositories, space_eq},
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Account {
     directory: Option<PathBuf>,
 }
 
 impl Account {
+    pub(crate) fn for_space(root: &DataRoot, space: &crate::data::spaces::Space) -> Result<Self> {
+        if space.isolate_agents {
+            Self::isolated(
+                root,
+                space
+                    .agent_account_id
+                    .as_deref()
+                    .context("Space account identity is missing")?,
+            )
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub(crate) fn session_store(&self, agent: AgentKind) -> Result<PathBuf> {
+        if let Some(path) = self.store(agent) {
+            return Ok(canonical(&path));
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .context("Home directory is unavailable")?;
+        let (variable, fallback) = match agent {
+            AgentKind::Codex => ("CODEX_HOME", home.join(".codex")),
+            AgentKind::Claude => ("CLAUDE_CONFIG_DIR", home.join(".claude")),
+            AgentKind::Opencode => ("XDG_DATA_HOME", home.join(".local/share")),
+            AgentKind::Omp => ("PI_CODING_AGENT_DIR", home.join(".omp")),
+        };
+        Ok(canonical(
+            &std::env::var_os(variable)
+                .map(PathBuf::from)
+                .unwrap_or(fallback),
+        ))
+    }
     pub(crate) fn isolated(root: &DataRoot, id: &str) -> Result<Self> {
         ensure!(
             id.starts_with("account-")
@@ -190,12 +223,22 @@ impl Account {
     }
 }
 
+/// Resolved once from durable ownership, never from the browsing selection.
+pub(crate) struct AgentLaunchContext {
+    pub cwd: PathBuf,
+    pub agent: AgentKind,
+    pub account: Account,
+    pub store: Option<PathBuf>,
+    pub session: Option<SessionSummary>,
+}
+
 /// One consistent account map per scan, avoiding filesystem work for every row.
 #[derive(Default)]
 pub(crate) struct Accounts {
     checkouts: HashMap<PathBuf, Account>,
     managed_directory: Option<PathBuf>,
     pub(crate) isolated: Vec<Account>,
+    pub(crate) chat_sources: Vec<(AgentKind, PathBuf)>,
 }
 
 impl Accounts {
@@ -227,10 +270,18 @@ impl Accounts {
             by_space.push((&space.name, account));
         }
         let managed_directory = Some(canonical(&root.root().join("agent-accounts")));
+        let mut chat_sources = Vec::new();
+        for thread in crate::data::chat::Registry::load(root)?.threads {
+            chat_sources.push((thread.agent, thread.store));
+            if thread.account.directory.is_some() && !isolated.contains(&thread.account) {
+                isolated.push(thread.account);
+            }
+        }
         if isolated.is_empty() {
             // Existing shared-only installations keep tolerant repository
             // discovery. Old managed histories are still excluded below.
             return Ok(Self {
+                chat_sources,
                 managed_directory,
                 ..Self::default()
             });
@@ -261,6 +312,7 @@ impl Accounts {
             );
         }
         Ok(Self {
+            chat_sources,
             checkouts,
             managed_directory,
             isolated,

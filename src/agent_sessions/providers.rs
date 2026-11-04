@@ -55,6 +55,18 @@ pub(super) fn sources(accounts: &crate::agent_accounts::Accounts) -> Vec<Source>
             }
         }
     }
+    for (agent, root) in &accounts.chat_sources {
+        if *agent != crate::agent::AgentKind::Omp
+            && !sources
+                .iter()
+                .any(|s| s.provider == agent.id() && canonical(&s.root) == canonical(root))
+        {
+            sources.push(Source {
+                provider: agent.id(),
+                root: root.clone(),
+            });
+        }
+    }
     sources
         .into_iter()
         .map(|mut s| {

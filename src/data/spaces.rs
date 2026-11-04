@@ -109,6 +109,8 @@ pub(crate) const DEFAULT_SEED: [&str; 2] = ["Personal", "Work"];
 /// survives older builds.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Space {
+    #[serde(default)]
+    pub(crate) id: String,
     pub(crate) name: String,
     /// Portable identity only. Credentials live in the machine-local data root.
     /// Keep the identity when disabled or renamed so re-enabling restores login.
@@ -131,6 +133,7 @@ pub(crate) struct Space {
 impl Space {
     fn new(name: impl Into<String>) -> Self {
         Self {
+            id: super::record::random_id().replacen("art-", "space-", 1),
             name: name.into(),
             agent_account_id: None,
             isolate_agents: false,
@@ -250,6 +253,34 @@ impl Spaces {
         };
         let mut catalog: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
+        let mut ids = std::collections::HashSet::new();
+        for space in &catalog.spaces {
+            ensure!(
+                space.id.is_empty()
+                    || (space.id.starts_with("space-")
+                        && space
+                            .id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+                "Invalid space identity"
+            );
+            ensure!(
+                space.id.is_empty() || ids.insert(space.id.clone()),
+                "Duplicate space identity; reconcile the spaces catalog before continuing"
+            );
+        }
+        for (i, space) in catalog.spaces.iter().enumerate() {
+            ensure!(
+                !catalog
+                    .spaces
+                    .iter()
+                    .skip(i + 1)
+                    .any(|other| !space.id.is_empty()
+                        && !other.id.is_empty()
+                        && space_eq(&space.name, &other.name)),
+                "Conflicting space identities share a name; reconcile the catalog before continuing"
+            );
+        }
         catalog.spaces.truncate(MAX_SPACES);
         // Drop blank and equivalent duplicates (a hand-edited catalog can
         // hold "Client A" and "Client  A"): canonicalization treats them as
@@ -404,6 +435,7 @@ impl Spaces {
 pub(crate) struct SpaceRewrite {
     pub(crate) repositories: usize,
     pub(crate) items: usize,
+    pub(crate) chats: usize,
     /// Records that reference the catalog but could not be parsed: reported
     /// so a rename never looks complete while some record still holds the
     /// old name.
@@ -427,6 +459,12 @@ pub(super) fn ensure_spaces_unlocked(root: &DataRoot) -> Result<Spaces> {
     let existed = Spaces::path(root).try_exists()?;
     let mut catalog = Spaces::load(root)?;
     let mut changed = false;
+    for space in &mut catalog.spaces {
+        if space.id.is_empty() {
+            space.id = super::record::random_id().replacen("art-", "space-", 1);
+            changed = true;
+        }
+    }
     if catalog.is_empty() {
         for name in DEFAULT_SEED {
             changed |= catalog.ensure_name(name);
@@ -855,13 +893,37 @@ pub(crate) fn delete_space(root: &DataRoot, name: &str, destination: &str) -> Re
         !space_eq(&canonical, &destination),
         "Choose a different destination space"
     );
+    // Local conversations retain their original credentials. Never migrate a
+    // provider transcript into another account as a side effect of deletion.
+    let source = catalog.spaces.iter().find(|s| s.name == canonical).unwrap();
+    let target = catalog
+        .spaces
+        .iter()
+        .find(|s| s.name == destination)
+        .unwrap();
+    let _chat_lock = super::chat::Registry::lock(root)?;
+    let mut registry = super::chat::Registry::load(root)?;
+    let chats = registry
+        .threads
+        .iter()
+        .filter(|t| t.space == source.id)
+        .count();
+    registry.move_space(root, source, target)?;
+    registry.validate()?;
     let removing_default = catalog
         .first()
         .is_some_and(|first| space_eq(first, &canonical));
-    let (touched, mut pending) =
+    let (mut touched, mut pending) =
         stage_reference_rewrites(root, &canonical, &destination, removing_default);
     catalog.remove(&canonical)?;
     pending.push(stage_catalog_rewrite(root, &catalog)?);
+    touched.chats = chats;
+    let chat_path = super::chat::Registry::path(root);
+    pending.push(PendingRewrite {
+        path: chat_path.clone(),
+        original: std::fs::read(&chat_path).ok(),
+        replacement: serde_json::to_vec_pretty(&registry)?,
+    });
     commit_rewrites(&pending)?;
     retarget_active_space(root, &canonical, &destination);
     Ok(touched)
@@ -1471,5 +1533,29 @@ mod tests {
             Spaces::load(&root).unwrap().names(),
             vec!["Personal", "Work"]
         );
+    }
+    #[test]
+    fn failed_space_transaction_rolls_back_chat_metadata() {
+        let (_dir, root) = root();
+        ensure_spaces(&root).unwrap();
+        let chat = crate::data::chat::Registry::path(&root);
+        std::fs::create_dir_all(chat.parent().unwrap()).unwrap();
+        std::fs::write(&chat, b"original chat").unwrap();
+        let blocked = root.root().join("blocked");
+        std::fs::write(&blocked, b"file").unwrap();
+        let result = commit_rewrites(&[
+            PendingRewrite {
+                path: chat.clone(),
+                original: Some(b"original chat".to_vec()),
+                replacement: b"moved chat".to_vec(),
+            },
+            PendingRewrite {
+                path: blocked.join("spaces.json"),
+                original: None,
+                replacement: b"deleted space".to_vec(),
+            },
+        ]);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&chat).unwrap(), b"original chat");
     }
 }
