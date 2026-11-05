@@ -2,6 +2,7 @@
 //! protection against overwriting a file changed by an agent on disk.
 
 mod file_finder;
+mod git_markers;
 
 use std::{
     borrow::Cow,
@@ -33,8 +34,8 @@ use gpui_kit::component::{
     dialog::{Confirm, DialogFooter},
     h_flex,
     input::{
-        Editor, EditorState, Input, InputEvent, InputState, MoveDown, MoveUp, Position,
-        ShowCompletions, highlight_characters,
+        Editor, EditorState, Input, InputEditsEvent, InputEvent, InputState, MoveDown, MoveUp,
+        Position, ShowCompletions, highlight_characters,
     },
     menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
@@ -154,6 +155,7 @@ pub(crate) struct NativeEditor {
     journal_lock: Arc<Mutex<()>>,
     journal_generation: Arc<AtomicU64>,
     journal_digest: Option<u64>,
+    git_markers: git_markers::Markers,
 }
 
 struct JournalWrite {
@@ -436,14 +438,8 @@ impl NativeEditor {
         }
         tabs.sort();
         let editor = cx.new(|cx| EditorState::new(window, cx).searchable(false));
-        cx.subscribe(&editor, |this, editor, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.dirty = this.saved.as_ref().is_some_and(|saved| {
-                    file_bytes_for_buffer(saved, editor.read(cx).value().as_ref()) != saved.as_str()
-                });
-                this.push_text_to_server(cx);
-                cx.notify();
-            }
+        cx.subscribe(&editor, |this, editor, event: &InputEditsEvent, cx| {
+            this.handle_input_edits(&editor, event, cx);
         })
         .detach();
         let file_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find a file…"));
@@ -547,6 +543,7 @@ impl NativeEditor {
                     }
                 }
                 let write = view.update(cx, |this, cx| this.journal_if_changed(cx));
+                let _ = view.update(cx, |this, cx| this.poll_git_markers(cx));
                 if let Ok(Some(write)) = write {
                     let result = cx.background_spawn(async move { write.write() }).await;
                     if let Err(error) = result {
@@ -662,6 +659,7 @@ impl NativeEditor {
             journal_lock: Arc::new(Mutex::new(())),
             journal_generation: Arc::new(AtomicU64::new(0)),
             journal_digest: None,
+            git_markers: git_markers::Markers::default(),
         }
     }
 
@@ -1651,17 +1649,40 @@ impl NativeEditor {
     }
 
     fn subscribe_changes(&self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
-        cx.subscribe(editor, |this, editor, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) && this.editor.entity_id() == editor.entity_id()
-            {
-                this.dirty = this.saved.as_ref().is_some_and(|saved| {
-                    file_bytes_for_buffer(saved, editor.read(cx).value().as_ref()) != saved.as_str()
-                });
-                this.push_text_to_server(cx);
-                cx.notify();
-            }
+        cx.subscribe(editor, |this, editor, event: &InputEditsEvent, cx| {
+            this.handle_input_edits(&editor, event, cx);
         })
         .detach();
+    }
+
+    fn handle_input_edits(
+        &mut self,
+        editor: &Entity<EditorState>,
+        event: &InputEditsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor.entity_id() == editor.entity_id() {
+            self.dirty = self.saved.as_ref().is_some_and(|saved| {
+                file_bytes_for_buffer(saved, editor.read(cx).value().as_ref()) != saved.as_str()
+            });
+            if let Some(session) = &self.lsp {
+                let _ = session.client.did_edit(&session.uri, event.edits());
+            }
+            self.refresh_git_markers(true, cx);
+        } else if let Some((path, doc)) = self
+            .inactive_documents
+            .iter_mut()
+            .find(|(_, doc)| doc.editor.entity_id() == editor.entity_id())
+        {
+            doc.dirty = file_bytes_for_buffer(&doc.saved, editor.read(cx).value().as_ref())
+                != doc.saved.as_str();
+            if let Some(client) = self.language_servers.client(path)
+                && let Ok(uri) = file_uri(path)
+            {
+                let _ = client.did_edit(uri.as_str(), event.edits());
+            }
+        }
+        cx.notify();
     }
 
     /// A Review event has no Window handle. Apply it on the next render, when
@@ -1782,6 +1803,7 @@ impl NativeEditor {
         }
         self.markdown_preview = None;
         self.path = Some(canonical.clone());
+        self.refresh_git_markers(false, cx);
         self.place_cursor(line, window, cx);
         self.check_disk(window, cx);
         self.restart_lsp(&canonical, language_for(&canonical), window, cx);
@@ -1908,6 +1930,7 @@ impl NativeEditor {
                 let editor = cx.new(|cx| EditorState::new(window, cx).searchable(false));
                 self.editor = editor;
                 self.subscribe_changes(&self.editor, cx);
+                self.refresh_git_markers(false, cx);
             }
         } else {
             self.inactive_documents.remove(path);
@@ -2246,7 +2269,8 @@ impl NativeEditor {
     /// Push the current buffer to the server after an edit. Silent on
     /// failure: the client records the failure and the next edit retries,
     /// so a struggling server never interrupts typing.
-    fn push_text_to_server(&self, cx: &mut Context<Self>) {
+    fn push_text_to_server(&mut self, cx: &mut Context<Self>) {
+        self.refresh_git_markers(false, cx);
         let Some(session) = self.lsp.as_ref() else {
             return;
         };
@@ -3803,6 +3827,9 @@ impl Render for NativeEditor {
                     .border_color(rgb(0x202328))
                     .child(div().flex_1().min_w_0().overflow_hidden().child(label))
                     .when(self.dirty, |row| row.child("Modified"))
+                    .when(self.git_markers.unavailable, |row| {
+                        row.child("Git indicators unavailable")
+                    })
                     .child(
                         div()
                             .max_w(px(420.))
@@ -4117,7 +4144,7 @@ mod tests {
 
     /// Test host: a real window plus a bare `NativeEditor`, without entering
     /// any repository workspace.
-    fn test_editor<'a>(
+    pub(super) fn test_editor<'a>(
         cx: &'a mut gpui_kit::TestAppContext,
         dir: &std::path::Path,
     ) -> (Entity<NativeEditor>, &'a mut gpui_kit::VisualTestContext) {
@@ -5871,6 +5898,94 @@ mod tests {
                 assert!(client.doc_version(first_uri.as_str()) > 0);
             })
             .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn queued_edits_sync_their_own_inactive_document_and_undo_redo_stay_in_sync(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::editor::lsp::transport::{Transport, test_util::stub_server_with_sync};
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.rs");
+        let second = dir.path().join("second.rs");
+        fs::write(&first, "fn first() {}\n").unwrap();
+        fs::write(&second, "fn second() {}\n").unwrap();
+        let (reader, writer) = stub_server_with_sync(2);
+        let (transport, messages) = Transport::new(reader, writer);
+        let (tx, _) = async_channel::unbounded();
+        let client = Client::handshake(transport, dir.path(), messages, tx).unwrap();
+        let uri = file_uri(&first.canonicalize().unwrap()).unwrap();
+        let (view, test_cx) = test_editor(cx, dir.path());
+        view.update_in(test_cx, |view, window, cx| {
+            view.open(&first, None, window, cx).unwrap();
+            view.lsp_trusted = true;
+            let key = Manager::key(
+                ServerId::Rust,
+                &first,
+                &view.canonical_root,
+                &Default::default(),
+            );
+            view.language_servers.start(key.clone(), Default::default());
+            let slot = view.language_servers.slots.get_mut(&key).unwrap();
+            slot.client = Some(client.clone());
+            slot.starting = false;
+            view.open(&first, None, window, cx).unwrap();
+            view.editor
+                .update(cx, |editor, cx| editor.insert("🎉\n", window, cx));
+            // The event is delivered after this update, when its editor is inactive.
+            view.open(&second, None, window, cx).unwrap();
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            let doc = &view.inactive_documents[&first.canonicalize().unwrap()];
+            assert!(doc.dirty);
+            assert_eq!(
+                client.synchronized_text(uri.as_str()),
+                doc.editor.read(cx).value().to_string()
+            );
+        });
+        view.update_in(test_cx, |view, window, cx| {
+            use gpui_kit::EntityInputHandler as _;
+            view.open(&first, None, window, cx).unwrap();
+            view.editor.update(cx, |editor, cx| {
+                editor.replace_and_mark_text_in_range(None, "n", None, window, cx);
+                editor.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                editor.replace_and_mark_text_in_range(None, "你", None, window, cx);
+                // macOS confirms a candidate with insertText:, rather than
+                // unmarkText; marked preedit intentionally emits no change.
+                editor.replace_text_in_range(None, "你", window, cx);
+            });
+        });
+        test_cx.run_until_parked();
+        view.read_with(test_cx, |view, cx| {
+            assert!(view.editor.read(cx).value().contains('你'));
+            assert_eq!(
+                client.synchronized_text(uri.as_str()),
+                view.editor.read(cx).value().to_string()
+            );
+        });
+        let committed =
+            view.read_with(test_cx, |view, cx| view.editor.read(cx).value().to_string());
+        for action in ["undo", "redo"] {
+            test_cx.update(|window, cx| {
+                if action == "undo" {
+                    window.dispatch_action(Box::new(gpui_kit::component::input::Undo), cx);
+                } else {
+                    window.dispatch_action(Box::new(gpui_kit::component::input::Redo), cx);
+                }
+            });
+            test_cx.run_until_parked();
+            view.read_with(test_cx, |view, cx| {
+                let text = view.editor.read(cx).value().to_string();
+                if action == "undo" {
+                    assert_ne!(text, committed);
+                } else {
+                    assert_eq!(text, committed);
+                }
+                assert_eq!(client.synchronized_text(uri.as_str()), text)
+            });
+        }
     }
 
     #[gpui_kit::test]

@@ -571,6 +571,10 @@ pub(crate) mod test_util {
     /// UTF-16 capabilities, answers any other request with null, and ignores
     /// notifications. Anything fancier belongs in the client tests' fake.
     pub(crate) fn stub_server() -> (ChannelReader, ChannelWriter) {
+        stub_server_with_sync(1)
+    }
+
+    pub(crate) fn stub_server_with_sync(sync: i32) -> (ChannelReader, ChannelWriter) {
         let (client_to_server_tx, client_to_server_rx) = mpsc::channel();
         let (server_to_client_tx, server_to_client_rx) = mpsc::channel();
         thread::spawn(move || {
@@ -588,7 +592,7 @@ pub(crate) mod test_util {
                     let result = if frame.get("method").and_then(|m| m.as_str())
                         == Some("initialize")
                     {
-                        serde_json::json!({"capabilities": {"positionEncoding": "utf-16", "textDocumentSync": {"openClose": true, "change": 1}, "hoverProvider": true, "definitionProvider": true, "completionProvider": {}}})
+                        serde_json::json!({"capabilities": {"positionEncoding": "utf-16", "textDocumentSync": {"openClose": true, "change": sync}, "hoverProvider": true, "definitionProvider": true, "completionProvider": {}}})
                     } else {
                         Value::Null
                     };

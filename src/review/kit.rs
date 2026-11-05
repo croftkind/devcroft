@@ -206,11 +206,38 @@ impl ReviewView {
             }
         }
         let notice_files = loaded.diff.clone();
+        let markers = self.comment_markers(loaded, self.diff_state.read(cx).mode());
+        let marker_list = markers
+            .iter()
+            .map(|(marker, _)| marker.clone())
+            .collect::<Vec<_>>();
+        let marker_view = cx.entity();
         let diff = Diff::new(&self.diff_state)
             .soft_wrap(self.diff_state.read(cx).mode() == DiffMode::Split)
             .font_family(TERMINAL_FONT_FAMILY)
             .text_size(px(review_font_size()))
             .annotations(annotations)
+            .decorations(self.active_comment_decoration(loaded))
+            .gutter_markers(marker_list)
+            .render_gutter_marker(move |marker, _, _| {
+                let comments = markers
+                    .iter()
+                    .find(|(item, _)| item.id() == marker.id())
+                    .map(|(_, comments)| comments.clone())
+                    .unwrap_or_default();
+                let view = marker_view.clone();
+                Button::new(marker.id().clone())
+                    .xsmall()
+                    .ghost()
+                    .icon(gpui_kit::assets::IconName::MessageSquare)
+                    .tooltip(marker.label().clone())
+                    .accessibility_label(marker.label().clone())
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.reveal_comment_marker(&comments, window, cx)
+                        });
+                    })
+            })
             .render_header(move |file, _, _| {
                 let file = headers
                     .diff

@@ -9,6 +9,7 @@ mod remote;
 mod repository;
 mod view;
 mod watch;
+pub(crate) use repository::editor_index_baseline;
 
 pub(crate) use view::{
     BranchPickerAction, BranchPickerRequested, CommitDraftChanged, GitMode, GitView, OpenGitFile,
