@@ -67,6 +67,9 @@ pub(crate) struct DeviceState {
     /// out-of-range values are clamped on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) app_font_size: Option<f32>,
+    /// Kit text caret policy; missing or unknown preserves the blinking default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) caret: Option<String>,
     /// Copy terminal selections on release; absent preserves the historical default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) terminal_copy_on_select: Option<bool>,
@@ -473,6 +476,7 @@ mod tests {
             theme: Some("dark".to_owned()),
             sync_interval_minutes: Some(15),
             app_font_size: Some(17.0),
+            caret: Some("steady".into()),
             recent_sessions_limit: Some(40),
             default_agent: Some("claude".to_owned()),
             ..DeviceState::default()
@@ -486,6 +490,7 @@ mod tests {
         assert_eq!(loaded.theme.as_deref(), Some("dark"));
         assert_eq!(loaded.sync_interval_minutes, Some(15));
         assert_eq!(loaded.app_font_size, Some(17.0));
+        assert_eq!(loaded.caret.as_deref(), Some("steady"));
         assert_eq!(loaded.app_font_size_or_default(), 17.0);
         assert_eq!(loaded.recent_sessions_limit, Some(40));
         assert_eq!(loaded.recent_sessions_limit_or_default(), 40);

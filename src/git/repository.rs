@@ -30,6 +30,63 @@ pub(super) struct CommandOutput {
     pub(super) stdout_truncated: bool,
 }
 
+/// Read the stage-zero index blob in working-tree form, including attributes,
+/// CRLF conversion and smudge filters. Unsupported/failed filters produce no
+/// indicators rather than a misleading whole-file diff. Reads are bounded.
+pub(crate) fn editor_index_baseline(root: &Path, path: &Path) -> Result<Option<String>, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "File is outside the checkout")?;
+    let run = |args| {
+        run_git_noninteractive(root, args, Duration::from_secs(2), 2 * 1024 * 1024 + 1)
+            .map_err(|error| format!("{error:?}"))
+    };
+    let index = run(vec![
+        "--literal-pathspecs".into(),
+        "ls-files".into(),
+        "--full-name".into(),
+        "--stage".into(),
+        "-z".into(),
+        "--".into(),
+        relative.as_os_str().to_owned(),
+    ])?;
+    if !index.status.success() || index.stdout_truncated {
+        return Err("Index is unavailable".into());
+    }
+    if index.stdout.is_empty() {
+        return Ok(None);
+    }
+    let record = index.stdout.split(|b| *b == 0).next().unwrap_or_default();
+    let separator = record
+        .iter()
+        .position(|b| *b == b'\t')
+        .ok_or("Invalid index entry")?;
+    let (header, name) = (&record[..separator], &record[separator + 1..]);
+    if !header.ends_with(b" 0") || !header.starts_with(b"100") {
+        return Err("Index entry is unmerged or is not a regular file".into());
+    }
+    let name = std::str::from_utf8(name).map_err(|_| "Index path is not UTF-8")?;
+    let blob = run(vec![
+        "cat-file".into(),
+        "--filters".into(),
+        format!("--path={name}").into(),
+        format!(":{name}").into(),
+    ])?;
+    // Optional smudge failures can succeed with the raw blob plus stderr.
+    if !blob.status.success()
+        || !blob.stderr.is_empty()
+        || blob.stdout_truncated
+        || blob.stdout.len() > 2 * 1024 * 1024
+    {
+        return Err("Index contents or filters are unavailable".into());
+    }
+    let text = String::from_utf8(blob.stdout).map_err(|_| "Index contents are not UTF-8")?;
+    if text.contains('\0') {
+        return Err("Index contents are binary".into());
+    }
+    Ok(Some(text))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LoadError {
     GitUnavailable,
@@ -528,6 +585,95 @@ fn raw_path(bytes: &[u8]) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn editor_baseline_tracks_index_and_applies_attributes_and_filters() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run(root, &["init", "-b", "main"]);
+        let file = root.join("special [name].txt");
+        fs::write(&file, "index\n").unwrap();
+        run(root, &["add", "--", "special [name].txt"]);
+        fs::write(&file, "unsaved on disk\n").unwrap();
+        assert_eq!(
+            editor_index_baseline(root, &file).unwrap().as_deref(),
+            Some("index\n")
+        );
+        run(root, &["add", "--", "special [name].txt"]);
+        assert_eq!(
+            editor_index_baseline(root, &file).unwrap().as_deref(),
+            Some("unsaved on disk\n")
+        );
+        assert_eq!(
+            editor_index_baseline(root, &root.join("new.txt")).unwrap(),
+            None
+        );
+        fs::write(root.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        assert_eq!(
+            editor_index_baseline(root, &file).unwrap().as_deref(),
+            Some("unsaved on disk\r\n")
+        );
+        fs::write(root.join(".gitattributes"), "*.txt filter=editor-test\n").unwrap();
+        run(
+            root,
+            &[
+                "config",
+                "filter.editor-test.smudge",
+                "sed s/unsaved/filtered/",
+            ],
+        );
+        assert_eq!(
+            editor_index_baseline(root, &file).unwrap().as_deref(),
+            Some("filtered on disk\n")
+        );
+        run(root, &["config", "filter.editor-test.smudge", "false"]);
+        assert!(
+            editor_index_baseline(root, &file).is_err(),
+            "optional filter failure must not use the raw blob"
+        );
+        run(root, &["config", "filter.editor-test.required", "true"]);
+        assert!(editor_index_baseline(root, &file).is_err());
+    }
+
+    #[test]
+    fn editor_baseline_handles_subdirectories_and_linked_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        run(root, &["init", "-b", "main"]);
+        run(root, &["config", "user.name", "Test"]);
+        run(root, &["config", "user.email", "test@example.com"]);
+        run(root, &["config", "commit.gpgsign", "false"]);
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.txt"), "baseline\n").unwrap();
+        run(root, &["add", "."]);
+        run(root, &["commit", "-m", "fixture"]);
+        assert_eq!(
+            editor_index_baseline(&root.join("sub"), &root.join("sub/a.txt"))
+                .unwrap()
+                .as_deref(),
+            Some("baseline\n")
+        );
+        let worktree = root.join("linked");
+        run(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            editor_index_baseline(&worktree, &worktree.join("sub/a.txt"))
+                .unwrap()
+                .as_deref(),
+            Some("baseline\n")
+        );
+        fs::write(worktree.join("sub/a.txt"), [0, 1]).unwrap();
+        run(&worktree, &["add", "sub/a.txt"]);
+        assert!(editor_index_baseline(&worktree, &worktree.join("sub/a.txt")).is_err());
+    }
 
     fn run(root: &Path, args: &[&str]) {
         let output = Command::new("git")

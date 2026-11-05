@@ -7,7 +7,10 @@ use super::{
 };
 use gpui_kit::{
     component::{
-        diff::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide},
+        diff::{
+            DiffAnnotation, DiffDecoration, DiffGutterMarker, DiffLinePosition, DiffLineRange,
+            DiffSide,
+        },
         h_flex,
         input::{Textarea, TextareaState},
         v_flex,
@@ -107,6 +110,131 @@ mod tests {
         stream::flatten,
     };
     use ::core::prelude::v1::test;
+
+    #[gpui_kit::test]
+    fn unified_context_markers_include_threads_from_both_sides(cx: &mut TestAppContext) {
+        use gpui_kit::component::diff::DiffMode;
+        let (dir, view) = crate::review::tests::setup(cx);
+        std::fs::write(dir.path().join("a.txt"), "original\nadded\n").unwrap();
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            for side in [Side::Old, Side::New] {
+                view.feedback.comments.push(Rc::new(Comment {
+                    id: format!("{side:?}"),
+                    pair: String::new(),
+                    scope: String::new(),
+                    anchor: Anchor {
+                        path: "a.txt".into(),
+                        side,
+                        start: 1,
+                        end: 1,
+                        outdated: false,
+                        source: "original\n".into(),
+                    },
+                    body: "Context thread".into(),
+                    resolved: false,
+                    revision: 1,
+                }));
+            }
+            let ReviewState::Loaded(loaded) = &view.state else {
+                unreachable!()
+            };
+            let unified = view.comment_markers(loaded, DiffMode::Unified);
+            assert_eq!(unified.len(), 1);
+            assert_eq!(unified[0].1.len(), 2);
+            assert_eq!(view.comment_markers(loaded, DiffMode::Split).len(), 2);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn gutter_markers_group_threads_preserve_selection_and_focus_the_revealed_thread(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt as _;
+        let (_dir, view) = crate::review::tests::setup(cx);
+        view.update(cx, |view, _| {
+            let anchor = Anchor {
+                path: "a.txt".into(),
+                side: Side::New,
+                start: 1,
+                end: 1,
+                outdated: false,
+                source: "reviewed\n".into(),
+            };
+            for (id, side, outdated) in [
+                ("first", Side::New, false),
+                ("second", Side::New, false),
+                ("old", Side::Old, false),
+                ("missing", Side::New, true),
+            ] {
+                view.feedback.comments.push(Rc::new(Comment {
+                    id: id.into(),
+                    pair: String::new(),
+                    scope: String::new(),
+                    anchor: Anchor {
+                        side,
+                        outdated,
+                        ..anchor.clone()
+                    },
+                    body: id.into(),
+                    resolved: false,
+                    revision: 1,
+                }));
+            }
+        });
+        let render_view = view.clone();
+        let (_, cx) =
+            cx.add_window_view(move |window, cx| component::Root::new(render_view, window, cx));
+        cx.update(|window, cx| {
+            let selected = DiffLineRange::new("b.txt", DiffSide::Original, 1, 1);
+            view.update(cx, |view, cx| {
+                view.diff_state.update(cx, |diff, cx| {
+                    diff.set_selected_lines(Some(selected.clone()), cx)
+                })
+            });
+            window.render_frame(cx);
+            view.read_with(cx, |view, cx| {
+                let ReviewState::Loaded(loaded) = &view.state else {
+                    unreachable!()
+                };
+                let markers = view.comment_markers(loaded, view.diff_state.read(cx).mode());
+                assert_eq!(
+                    markers.len(),
+                    2,
+                    "old/new sides stay separate; outdated anchors have no marker"
+                );
+                assert_eq!(markers[0].1.len(), 2);
+                assert!(markers[0].0.label().contains("2 comment threads"));
+            });
+            window.click("review-marker-first", cx);
+            window.render_frame(cx);
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.feedback.active.as_deref(), Some("first"));
+                assert_eq!(
+                    view.diff_state.read(cx).selected_lines(),
+                    Some(selected.clone())
+                );
+                assert!(
+                    view.feedback
+                        .thread_focus
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .is_focused(window)
+                );
+                let ReviewState::Loaded(loaded) = &view.state else {
+                    unreachable!()
+                };
+                assert!(view.active_comment_decoration(loaded).is_some());
+            });
+            window.click("review-marker-first", cx);
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.feedback.active.as_deref(), Some("second"));
+                assert_eq!(view.diff_state.read(cx).selected_lines(), Some(selected));
+            });
+        });
+    }
 
     #[gpui_kit::test]
     fn kit_add_comment_preserves_old_side_and_selected_new_range(cx: &mut TestAppContext) {
@@ -705,6 +833,7 @@ pub(super) struct Feedback {
     input: Option<Entity<TextareaState>>,
     editing: Option<Rc<Comment>>,
     active: Option<String>,
+    thread_focus: Option<(String, FocusHandle)>,
     error: Option<String>,
     filter: usize,
     busy: bool,
@@ -713,6 +842,91 @@ pub(super) struct Feedback {
 }
 
 impl ReviewView {
+    pub(super) fn comment_markers(
+        &self,
+        loaded: &super::LoadedReview,
+        mode: gpui_kit::component::diff::DiffMode,
+    ) -> Vec<(DiffGutterMarker, Vec<Rc<Comment>>)> {
+        let mut groups: Vec<(DiffGutterMarker, Vec<Rc<Comment>>)> = Vec::new();
+        let mut rows = std::collections::HashMap::new();
+        for comment in &self.feedback.comments {
+            let Some(row) = anchor_end_row(loaded, &comment.anchor) else {
+                continue;
+            };
+            let position = DiffLinePosition::new(
+                comment.anchor.path.clone(),
+                kit_side(comment.anchor.side),
+                comment.anchor.end as usize,
+            );
+            // Unified context rows have both old/new positions but only one
+            // marker slot. Keep both sides reachable through that one button.
+            let key = (
+                row,
+                (mode == gpui_kit::component::diff::DiffMode::Split).then_some(comment.anchor.side),
+            );
+            if let Some(&index) = rows.get(&key) {
+                let (_, comments): &mut (DiffGutterMarker, Vec<Rc<Comment>>) = &mut groups[index];
+                comments.push(comment.clone());
+            } else {
+                rows.insert(key, groups.len());
+                groups.push((
+                    DiffGutterMarker::new(
+                        SharedString::from(format!("review-marker-{}", comment.id)),
+                        position,
+                    ),
+                    vec![comment.clone()],
+                ));
+            }
+        }
+        for (marker, comments) in &mut groups {
+            *marker = marker.clone().with_label(if comments.len() == 1 {
+                "Show comment thread".to_owned()
+            } else {
+                format!(
+                    "Show {} comment threads; activate again for the next thread",
+                    comments.len()
+                )
+            });
+        }
+        groups
+    }
+
+    pub(super) fn active_comment_decoration(
+        &self,
+        loaded: &super::LoadedReview,
+    ) -> Option<DiffDecoration> {
+        let comment = self
+            .feedback
+            .comments
+            .iter()
+            .find(|c| self.feedback.active.as_ref() == Some(&c.id))?;
+        anchor_end_row(loaded, &comment.anchor)?;
+        Some(DiffDecoration::new(DiffLineRange::new(
+            comment.anchor.path.clone(),
+            kit_side(comment.anchor.side),
+            comment.anchor.start as usize,
+            comment.anchor.end as usize,
+        )))
+    }
+
+    pub(super) fn reveal_comment_marker(
+        &mut self,
+        comments: &[Rc<Comment>],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = comments
+            .iter()
+            .position(|c| self.feedback.active.as_ref() == Some(&c.id))
+            .map_or(0, |ix| (ix + 1) % comments.len().max(1));
+        if let Some(comment) = comments.get(next) {
+            self.reveal_comment(comment, false, window, cx);
+            let focus = cx.focus_handle().tab_stop(true);
+            self.feedback.thread_focus = Some((comment.id.clone(), focus.clone()));
+            focus.focus(window, cx);
+        }
+    }
+
     pub(super) fn diff_annotations(&self, loaded: &super::LoadedReview) -> Vec<DiffAnnotation> {
         let mut annotations = self
             .feedback
@@ -1236,6 +1450,16 @@ impl ReviewView {
     }
 
     fn jump_comment(&mut self, c: &Comment, _window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_comment(c, true, _window, cx);
+    }
+
+    fn reveal_comment(
+        &mut self,
+        c: &Comment,
+        select: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.collapsed.borrow_mut().remove(&c.anchor.path);
         self.sync_collapsed(cx);
         self.rebuild_rows(cx);
@@ -1274,15 +1498,17 @@ impl ReviewView {
                 self.diff_state.update(cx, |diff, cx| {
                     diff.set_file_collapsed(&c.anchor.path, false, cx);
                     if let Some(position) = annotation.position() {
-                        diff.set_selected_lines(
-                            Some(DiffLineRange::new(
-                                c.anchor.path.clone(),
-                                kit_side(c.anchor.side),
-                                c.anchor.start as usize,
-                                c.anchor.end as usize,
-                            )),
-                            cx,
-                        );
+                        if select {
+                            diff.set_selected_lines(
+                                Some(DiffLineRange::new(
+                                    c.anchor.path.clone(),
+                                    kit_side(c.anchor.side),
+                                    c.anchor.start as usize,
+                                    c.anchor.end as usize,
+                                )),
+                                cx,
+                            );
+                        }
                         diff.scroll_to_line(position.clone(), cx);
                     } else {
                         diff.scroll_to_file(&c.anchor.path, cx);
@@ -1307,6 +1533,14 @@ impl ReviewView {
             .collect::<Vec<_>>()
             .join("\n");
         v_flex()
+            .id(SharedString::from(format!("review-thread-{}", c.id)))
+            .when_some(
+                self.feedback
+                    .thread_focus
+                    .as_ref()
+                    .filter(|(id, _)| id == &c.id),
+                |view, (_, focus)| view.track_focus(focus),
+            )
             .flex_none()
             .cursor_pointer()
             .on_mouse_down(

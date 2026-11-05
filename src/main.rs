@@ -9,6 +9,7 @@ mod app_assets;
 mod artifacts;
 #[cfg(test)]
 mod backend_benchmarks;
+mod caret_preferences;
 mod cli;
 mod command_palette;
 mod commands;
@@ -150,7 +151,7 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
     // Resolve `--checkout` before touching the GUI so a bad path fails fast
     // with a runtime error instead of opening a window rooted elsewhere.
     let working_directory = crate::cli::resolve_working_directory(args.checkout)?;
-    let (theme_mode, app_font_size) = resolve_appearance();
+    let (theme_mode, app_font_size, caret) = resolve_appearance();
     // Live pane geometry reads this global at render time; Settings edits it
     // later through the same path.
     crate::metrics::set_app_font_size(app_font_size);
@@ -163,6 +164,7 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
         load_bundled_fonts(cx).expect("failed to load bundled application fonts");
         Theme::change(theme_mode, None, cx);
         apply_focus_theme(cx);
+        caret.apply(cx);
 
         let options = WindowOptions {
             titlebar: Some(gpui_kit::TitlebarOptions {
@@ -220,14 +222,18 @@ fn install_panic_log() {
 
 /// Persisted workspace appearance (theme mode plus app font size).
 /// Failures stay non-fatal with dark/default fallbacks.
-fn resolve_appearance() -> (ThemeMode, f32) {
+fn resolve_appearance() -> (ThemeMode, f32, caret_preferences::CaretPreference) {
     // App-owned data root: resolve, `mkdir -p`, and first-run init of
     // `portable/`.
     let root = match data::ensure_ready(None) {
         Ok(root) => root,
         Err(error) => {
             eprintln!("devcroft: data directory unavailable: {error:#}");
-            return (ThemeMode::Dark, crate::metrics::DEFAULT_APP_FONT_SIZE);
+            return (
+                ThemeMode::Dark,
+                crate::metrics::DEFAULT_APP_FONT_SIZE,
+                Default::default(),
+            );
         }
     };
     match data::DeviceStore::new(&root).load() {
@@ -241,11 +247,16 @@ fn resolve_appearance() -> (ThemeMode, f32) {
                     .as_deref()
                     .map_or(ThemeMode::Dark, theme_mode_from_name),
                 state.app_font_size_or_default(),
+                caret_preferences::CaretPreference::from_name(state.caret.as_deref()),
             )
         }
         Err(error) => {
             eprintln!("devcroft: device state unavailable: {error:#}");
-            (ThemeMode::Dark, crate::metrics::DEFAULT_APP_FONT_SIZE)
+            (
+                ThemeMode::Dark,
+                crate::metrics::DEFAULT_APP_FONT_SIZE,
+                Default::default(),
+            )
         }
     }
 }

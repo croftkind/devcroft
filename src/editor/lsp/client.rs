@@ -1,5 +1,5 @@
 //! One bounded workspace client with capability-gated requests, per-document
-//! versions, negotiated UTF-16 positions, full or whole-range incremental
+//! versions, negotiated UTF-16 positions, full or incremental
 //! synchronization, and diagnostic forwarding. Providers run requests off
 //! the UI thread; notification writes are queued by the transport.
 
@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use gpui_kit::component::input::{InputEdit, Rope};
 use serde_json::Value;
 
 use super::transport::{ServerMessage, Transport};
@@ -314,6 +315,11 @@ impl Client {
             .map_or(0, |doc| doc.version)
     }
 
+    #[cfg(test)]
+    pub(crate) fn synchronized_text(&self, uri: &str) -> String {
+        self.docs.lock().unwrap()[uri].text.clone()
+    }
+
     pub fn supports(&self, method: &str) -> bool {
         let name = match method {
             "textDocument/hover" => "hoverProvider",
@@ -368,26 +374,61 @@ impl Client {
         if doc.text == text {
             return Ok(doc.version);
         }
-        self.transport.cancel_document(uri);
-        doc.version = self.next_version.fetch_add(1, Ordering::SeqCst);
         // Incremental-only servers receive a valid range replacing the old text.
         let end = end_position(&doc.text);
-        doc.text = text.to_owned();
         let change = match self.sync_kind() {
             1 => serde_json::json!({"text":text}),
             2 => {
                 serde_json::json!({"range":{"start":{"line":0,"character":0},"end":end},"text":text})
             }
-            _ => return Ok(doc.version),
+            _ => Value::Null,
         };
-        self.transport
-            .notify(
-                "textDocument/didChange",
-                serde_json::json!({
-                    "textDocument":{"uri":uri,"version":doc.version}, "contentChanges":[change]
-                }),
-            )
-            .inspect_err(|e| self.record_error(e))?;
+        self.send_changes(uri, doc, text.to_owned(), vec![change])
+    }
+
+    /// Replay the immutable batch, including queued edits and undo/redo, against
+    /// the server's last accepted document. Silent replacements or a previous
+    /// failed notification fall back to one full-range replacement.
+    pub fn did_edit(&self, uri: &str, edits: &[(InputEdit, Rope)]) -> Result<i32> {
+        let Some((_, last)) = edits.last() else {
+            let version = self.doc_version(uri);
+            anyhow::ensure!(version != 0, "Document is not open");
+            return Ok(version);
+        };
+        if self.sync_kind() != 2 {
+            return self.did_change(uri, &last.to_string());
+        }
+        anyhow::ensure!(self.is_alive(), "Language server exited; restart it");
+        let mut docs = self.docs.lock().expect("LSP state poisoned");
+        let doc = docs.get_mut(uri).context("Document is not open")?;
+        let (text, changes) = incremental_changes(&doc.text, edits);
+        self.send_changes(uri, doc, text, changes)
+    }
+
+    fn send_changes(
+        &self,
+        uri: &str,
+        doc: &mut DocState,
+        text: String,
+        changes: Vec<Value>,
+    ) -> Result<i32> {
+        if doc.text == text {
+            return Ok(doc.version);
+        }
+        self.transport.cancel_document(uri);
+        let version = self.next_version.fetch_add(1, Ordering::SeqCst);
+        if self.sync_kind() != 0 {
+            self.transport
+                .notify(
+                    "textDocument/didChange",
+                    serde_json::json!({
+                        "textDocument":{"uri":uri,"version":version}, "contentChanges":changes
+                    }),
+                )
+                .inspect_err(|e| self.record_error(e))?;
+        }
+        doc.text = text;
+        doc.version = version;
         Ok(doc.version)
     }
 
@@ -640,6 +681,41 @@ fn watched_changes(root: &Path, event: &notify::Event) -> Vec<Value> {
             Some(serde_json::json!({"uri":url_of(path).ok()?,"type":kind}))
         })
         .collect()
+}
+
+fn incremental_changes(before: &str, edits: &[(InputEdit, Rope)]) -> (String, Vec<Value>) {
+    let mut text = before.to_owned();
+    let mut changes = Vec::with_capacity(edits.len());
+    for (edit, after) in edits {
+        if edit.start_byte > edit.old_end_byte
+            || edit.start_byte > edit.new_end_byte
+            || !text.is_char_boundary(edit.start_byte)
+            || !text.is_char_boundary(edit.old_end_byte)
+            || edit.new_end_byte > after.len()
+        {
+            return full_replacement(before, edits);
+        }
+        let start = end_position(&text[..edit.start_byte]);
+        let end = end_position(&text[..edit.old_end_byte]);
+        let inserted = after.slice(edit.start_byte..edit.new_end_byte).to_string();
+        text.replace_range(edit.start_byte..edit.old_end_byte, &inserted);
+        // A silent set_value can leave an otherwise valid byte range pointing
+        // into a different document. Compare without materializing another String.
+        if !text.chars().eq(after.chars()) {
+            return full_replacement(before, edits);
+        }
+        changes.push(serde_json::json!({"range":{"start":start,"end":end},"text":inserted}));
+    }
+    (text, changes)
+}
+
+fn full_replacement(before: &str, edits: &[(InputEdit, Rope)]) -> (String, Vec<Value>) {
+    let text = edits
+        .last()
+        .map(|(_, text)| text.to_string())
+        .unwrap_or_else(|| before.to_owned());
+    let change = serde_json::json!({"range":{"start":{"line":0,"character":0},"end":end_position(before)},"text":text});
+    (text, vec![change])
 }
 
 fn end_position(text: &str) -> lsp_types::Position {
@@ -920,6 +996,92 @@ mod tests {
             Client::handshake(transport, &std::env::temp_dir(), messages, tx).unwrap(),
             seen_rx,
         )
+    }
+
+    fn edit_snapshot(
+        text: &mut String,
+        range: std::ops::Range<usize>,
+        inserted: &str,
+    ) -> (InputEdit, Rope) {
+        let edit = InputEdit {
+            start_byte: range.start,
+            old_end_byte: range.end,
+            new_end_byte: range.start + inserted.len(),
+            start_position: gpui_kit::component::input::Point::new(0, 0),
+            old_end_position: gpui_kit::component::input::Point::new(0, 0),
+            new_end_position: gpui_kit::component::input::Point::new(0, 0),
+        };
+        text.replace_range(range, inserted);
+        (edit, Rope::from(text.as_str()))
+    }
+
+    #[test]
+    fn exact_batches_send_utf16_ranges_in_order_and_recover_after_silent_replacements() {
+        let (client, seen) = configured_client(serde_json::json!({"textDocumentSync":2}));
+        let uri: lsp_types::Uri = "file:///tmp/exact.rs".parse().unwrap();
+        let original = "a🎉\r\n終\n";
+        client.did_open(&uri, "rust", original).unwrap();
+        let mut text = original.to_owned();
+        let first = edit_snapshot(&mut text, 5..5, "é");
+        let second = edit_snapshot(&mut text, 9..12, "世界\nIME");
+        let third = edit_snapshot(&mut text, 1..5, "");
+        let version = client
+            .did_edit(uri.as_str(), &[first, second, third])
+            .unwrap();
+        assert_eq!(client.docs.lock().unwrap()[uri.as_str()].text, text);
+        let mut reloaded = "silent\n".to_owned();
+        let commit = edit_snapshot(&mut reloaded, 0..0, "IME 🎉 ");
+        assert!(client.did_edit(uri.as_str(), &[commit]).unwrap() > version);
+        client.shutdown();
+        let frames: Vec<_> = seen
+            .try_iter()
+            .filter(|f| f["method"] == "textDocument/didChange")
+            .collect();
+        let changes = frames[0]["params"]["contentChanges"].as_array().unwrap();
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            changes[0]["range"]["start"],
+            serde_json::json!({"line":0,"character":3})
+        );
+        assert_eq!(
+            changes[1]["range"],
+            serde_json::json!({"start":{"line":1,"character":0},"end":{"line":1,"character":1}})
+        );
+        assert_eq!(
+            changes[2]["range"],
+            serde_json::json!({"start":{"line":0,"character":1},"end":{"line":0,"character":3}})
+        );
+        assert_eq!(changes[1]["text"], "世界\nIME");
+        assert_eq!(frames[1]["params"]["contentChanges"][0]["text"], reloaded);
+        assert_eq!(
+            frames[1]["params"]["contentChanges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn full_sync_batches_send_final_text_and_small_edits_reduce_wire_payload() {
+        let (client, seen) = configured_client(serde_json::json!({"textDocumentSync":1}));
+        let uri: lsp_types::Uri = "file:///tmp/full.rs".parse().unwrap();
+        let original = "a".repeat(100_000);
+        client.did_open(&uri, "rust", &original).unwrap();
+        let mut text = original.clone();
+        let edit = edit_snapshot(&mut text, 50_000..50_001, "🎉");
+        let (_, precise) = incremental_changes(&original, std::slice::from_ref(&edit));
+        assert!(serde_json::to_vec(&precise).unwrap().len() < 200);
+        client.did_edit(uri.as_str(), &[edit]).unwrap();
+        client.shutdown();
+        let frame = seen
+            .try_iter()
+            .find(|f| f["method"] == "textDocument/didChange")
+            .unwrap();
+        assert_eq!(
+            frame["params"]["contentChanges"],
+            serde_json::json!([{"text":text}])
+        );
     }
 
     #[test]

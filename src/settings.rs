@@ -16,6 +16,7 @@
 //! open/close while the view keeps the selected section and edits across
 //! reopenings.
 
+use crate::caret_preferences::CaretPreference;
 use gpui_kit::base::TestSupportExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -115,6 +116,8 @@ pub(crate) struct SettingsView {
     pub(crate) focus_handle: FocusHandle,
     active_section: SettingsSection,
     font_size: f32,
+    caret: CaretPreference,
+    caret_error: Option<String>,
     terminal_preferences_error: Option<String>,
     navigation_shortcut: NavigationShortcut,
     navigation_recording: bool,
@@ -306,6 +309,10 @@ impl SettingsView {
             focus_handle: cx.focus_handle(),
             active_section: SettingsSection::General,
             font_size: clamp_app_font_size(initial_font_size),
+            caret: CaretPreference::from_name(
+                stored.as_ref().and_then(|state| state.caret.as_deref()),
+            ),
+            caret_error: None,
             terminal_preferences_error: None,
             navigation_shortcut,
             navigation_recording: false,
@@ -456,6 +463,10 @@ impl SettingsView {
         self.check_external_editors(cx);
         if let Some(root) = self.data_root.clone() {
             let stored = DeviceStore::new(&root).load().ok();
+            self.caret = CaretPreference::from_name(
+                stored.as_ref().and_then(|state| state.caret.as_deref()),
+            );
+            self.caret.apply(cx);
             self.navigation_shortcut = stored
                 .as_ref()
                 .map(|state| state.navigation_shortcut_or_default())
@@ -811,6 +822,18 @@ impl SettingsView {
                 state.app_font_size = Some(size);
             });
         }
+        cx.notify();
+    }
+
+    fn set_caret(&mut self, choice: CaretPreference, cx: &mut Context<Self>) {
+        self.caret = choice;
+        choice.apply(cx);
+        self.caret_error = self.data_root.as_ref().and_then(|root| {
+            DeviceStore::new(root)
+                .update(|state| state.caret = Some(choice.name().into()))
+                .err()
+                .map(|error| format!("Could not save text cursor preference: {error}"))
+        });
         cx.notify();
     }
 
@@ -1702,6 +1725,18 @@ impl SettingsView {
         let is_default = (size - DEFAULT_APP_FONT_SIZE).abs() < f32::EPSILON;
         v_flex()
             .gap_4()
+            .child(group(cx, "Text cursor", None).child(live_row(cx,
+                "Cursor animation",
+                "Applies to text fields and the built-in editor. Stop after idle keeps the cursor visible after five seconds.",
+                h_flex().gap_2().children(CaretPreference::ALL.into_iter().map(|choice| {
+                    Button::new(format!("caret-{}", choice.name())).small().label(choice.label())
+                        .when(self.caret == choice, |button| button.primary())
+                        .on_click(cx.listener(move |this, _, _, cx| this.set_caret(choice, cx)))
+                })),
+            )))
+            .when_some(self.caret_error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(cx.theme().danger).child(error))
+            })
             .child(group(cx, "Terminal", None).child(live_row(cx,
                 "Copy on select",
                 "Automatically copy selected terminal text. Hold Shift to select inside mouse-aware applications. Explicit copy: Ctrl+Shift+C (Cmd+C on macOS).",
