@@ -66,7 +66,7 @@ On Linux this installs `~/.local/bin/devcroft` plus a `devcroft.desktop` launche
 
 ## Features
 
-- **Agent** runs your default harness (`opencode` unless changed in Settings → Agent) in your default login shell, resuming the checkout's most recent session when history exists. Use **New session** to pick a harness explicitly.
+- **Agent** runs your default harness (`opencode` unless changed in Settings → Agent) in your default login shell, resuming the checkout's most recent session when history exists. The sidebar shows open sessions across repositories, persistent pinned conversations, and the current repository's recent history. Open and pinned sessions follow the selected space; clicking a card restores its session and repository workspace. Use **New session** to pick a harness explicitly.
 - **Git** opens as a full workspace page from **Open Git** in the header's branch menu, `Cmd/Ctrl+J`, then `g`, or **Open Git** in the actions palette. Back returns to the previous view. Changes, History, branch management, remote operations, and conflict editing share this page; dialogs open above it. See [Git workflow](docs/git.md).
 - **Editor** offers Neovim or the built-in editor (Settings → Editor; the default for new installations). The built-in editor covers file tabs, fuzzy finding, project search, syntax highlighting, and find/replace for small edits. See [editor setup and everyday use](docs/editor.md) and [language support](docs/language-support.md).
 - **Terminal** tabs own independent PTY sessions backed by your login shell, with bundled Nerd Font symbols and mouse/link support. See [Terminal](docs/terminal.md).

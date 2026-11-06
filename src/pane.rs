@@ -109,6 +109,49 @@ pub(crate) struct TerminalPane {
 struct TerminalCopyFeedback;
 
 impl TerminalPane {
+    fn unstarted(
+        tab: WorkspaceTab,
+        agent_activity: Option<PreparedAgentLaunch>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            focus_handle: cx.focus_handle(),
+            tab,
+            session: None,
+            rows: Vec::new(),
+            error: None,
+            grid_size: (INITIAL_COLS, INITIAL_ROWS),
+            scroll_remainder: 0.0,
+            last_present: None,
+            flush_armed: false,
+            selection_anchor: None,
+            app_mouse_button: None,
+            hovered_link: None,
+            selection_focus: None,
+            selecting: false,
+            selection_pointer: None,
+            selection_autoscroll_armed: false,
+            selection_autoscroll_seq: 0,
+            scroll_offset: 0,
+            pane_bounds: None,
+            copy_feedback_seq: 0,
+            agent_activity,
+            last_activity_observation: None,
+            activity_observation_armed: false,
+            activity_output_tail: Vec::new(),
+            cursor: CursorPresentation::HIDDEN,
+            cursor_blink_on: true,
+            cursor_blink_armed: false,
+        }
+    }
+
+    /// Managed pane identity for workspace tests, without spawning a shell
+    /// or a real harness against the developer's accounts.
+    #[cfg(test)]
+    pub(crate) fn test_agent(launch: PreparedAgentLaunch, cx: &mut Context<Self>) -> Self {
+        Self::unstarted(WorkspaceTab::Agent, Some(launch), cx)
+    }
+
     /// One pane for `tab`. The Agent tab launches `agent`; every other
     /// tab uses its fixed command (see [`TerminalSession::spawn`]).
     pub(crate) fn new(
@@ -169,35 +212,7 @@ impl TerminalPane {
     ) -> Self {
         let agent_activity = (tab == WorkspaceTab::Agent)
             .then(|| activity_store.start_with_prompt(cwd, agent, target, prompt));
-        let mut pane = Self {
-            focus_handle: cx.focus_handle(),
-            tab,
-            session: None,
-            rows: Vec::new(),
-            error: None,
-            grid_size: (INITIAL_COLS, INITIAL_ROWS),
-            scroll_remainder: 0.0,
-            last_present: None,
-            flush_armed: false,
-            selection_anchor: None,
-            app_mouse_button: None,
-            hovered_link: None,
-            selection_focus: None,
-            selecting: false,
-            selection_pointer: None,
-            selection_autoscroll_armed: false,
-            selection_autoscroll_seq: 0,
-            scroll_offset: 0,
-            pane_bounds: None,
-            copy_feedback_seq: 0,
-            agent_activity,
-            last_activity_observation: None,
-            activity_observation_armed: false,
-            activity_output_tail: Vec::new(),
-            cursor: CursorPresentation::HIDDEN,
-            cursor_blink_on: true,
-            cursor_blink_armed: false,
-        };
+        let mut pane = Self::unstarted(tab, agent_activity, cx);
 
         let (startup, startup_environment) = pane
             .agent_activity

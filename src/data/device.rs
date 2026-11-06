@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use super::{DataRoot, write_json_atomic};
 use crate::agent::AgentKind;
-use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, snap_sidebar_limit};
+use crate::agent_sessions::{DEFAULT_SIDEBAR_LIMIT, SessionKey, snap_sidebar_limit};
 use crate::editor::EditorChoice;
 use crate::metrics::{DEFAULT_APP_FONT_SIZE, clamp_app_font_size};
 
@@ -81,6 +81,10 @@ pub(crate) struct DeviceState {
     /// on read, never rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recent_sessions_limit: Option<u32>,
+    /// Saved conversations, newest pin first. Provider stores and session
+    /// identities are device-local, so pins never enter portable sync.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pinned_sessions: Vec<SessionKey>,
     /// Default agent harness id (Settings > Agent). Absent or unknown means
     /// [`AgentKind::DEFAULT`]; stored as a plain string so a harness added
     /// later can never break older builds' startup.
@@ -222,6 +226,22 @@ pub(crate) struct DeviceStore {
 }
 
 impl DeviceStore {
+    /// Change one pin against the latest state so other windows' pins and
+    /// unrelated settings survive. Publish the resulting list only on success.
+    pub(crate) fn set_session_pinned(
+        &self,
+        key: &SessionKey,
+        pinned: bool,
+    ) -> Result<Vec<SessionKey>> {
+        self.update(|state| {
+            state.pinned_sessions.retain(|saved| saved != key);
+            if pinned {
+                state.pinned_sessions.insert(0, key.clone());
+            }
+            state.pinned_sessions.clone()
+        })
+    }
+
     /// Seed only an empty installation, before portable initialization writes
     /// its first files. Existing data (even without device.json) retains the
     /// legacy Neovim fallback. Publish without replacing a concurrent writer.
@@ -326,6 +346,66 @@ fn save_to(path: &Path, state: &DeviceState) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_pins_survive_reopen_and_preserve_other_windows_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let key = SessionKey {
+            provider: "codex".into(),
+            store: "/account-one".into(),
+            id: "same-id".into(),
+        };
+        let other_account = SessionKey {
+            store: "/account-two".into(),
+            ..key.clone()
+        };
+        let other_provider = SessionKey {
+            provider: "claude".into(),
+            ..key.clone()
+        };
+        store
+            .update(|state| {
+                state.extra.insert("future-setting".into(), json!(42));
+                state.recent_sessions_limit = Some(35);
+            })
+            .unwrap();
+        store.set_session_pinned(&key, true).unwrap();
+        let reopened = store_in(dir.path());
+        assert_eq!(reopened.load().unwrap().pinned_sessions, vec![key.clone()]);
+        reopened.set_session_pinned(&other_account, true).unwrap();
+        store.set_session_pinned(&other_provider, true).unwrap();
+        store.set_session_pinned(&key, true).unwrap();
+        assert_eq!(
+            reopened.load().unwrap().pinned_sessions,
+            vec![key.clone(), other_provider.clone(), other_account.clone()]
+        );
+        reopened.set_session_pinned(&key, false).unwrap();
+        let state = store.load().unwrap();
+        assert_eq!(state.pinned_sessions, vec![other_provider, other_account]);
+        assert_eq!(state.recent_sessions_limit, Some(35));
+        assert_eq!(state.extra["future-setting"], json!(42));
+        assert!(DeviceState::default().pinned_sessions.is_empty());
+    }
+
+    #[test]
+    fn failed_session_pin_write_preserves_persisted_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(dir.path());
+        let key = SessionKey {
+            provider: "codex".into(),
+            store: "/store".into(),
+            id: "session".into(),
+        };
+        store.set_session_pinned(&key, true).unwrap();
+        // A malformed file must never be overwritten with partial defaults.
+        std::fs::write(&store.path, "invalid json").unwrap();
+        assert!(store.set_session_pinned(&key, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&store.path).unwrap(),
+            "invalid json"
+        );
+    }
 
     fn store_in(dir: &Path) -> DeviceStore {
         DeviceStore::new(&DataRoot::new(dir.to_owned()))

@@ -298,6 +298,8 @@ pub(crate) struct Workspace {
     /// `device.json` at startup and pushed live by Settings > Agent; the
     /// sidebar re-projects the in-memory snapshot on change, no rescan.
     session_limit: usize,
+    /// Full catalog identities, in pin order, persisted in device.json.
+    pinned_sessions: Vec<SessionKey>,
     open_sessions: HashMap<u64, OpenAgentSession>,
     /// Checkouts where the Agent pane has been started (fresh or resumed).
     /// Entering a checkout auto-resumes its most recent catalog session
@@ -337,6 +339,9 @@ pub(crate) struct Workspace {
     /// sidebar or outside navigation mode; `Enter` opens the cursor session
     /// once and exits the mode, `Escape` exits without opening.
     session_cursor: Option<usize>,
+    /// Independently expanded sidebar sections, retained for this window.
+    session_sections_expanded: [bool; 3],
+    session_section_focus: [FocusHandle; 3],
     /// Keys consumed by the navigation interceptor and held until release so
     /// physical repeats cannot toggle twice or leak into a newly focused
     /// terminal. The flag per key records whether any modifier moved since
@@ -902,6 +907,10 @@ impl Workspace {
             session_refreshing: false,
             session_navigation: 0,
             session_limit,
+            pinned_sessions: stored
+                .as_ref()
+                .map(|state| state.pinned_sessions.clone())
+                .unwrap_or_default(),
             open_sessions: HashMap::new(),
             agent_autostart: HashSet::new(),
             data_root,
@@ -915,6 +924,8 @@ impl Workspace {
             navigation_open: false,
             navigation_pane: 0,
             session_cursor: None,
+            session_sections_expanded: [true; 3],
+            session_section_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             navigation_claimed_keys: HashMap::new(),
             agent_sidebar_focus: cx.focus_handle().tab_stop(true),
             agent_icon_tiles: Rc::new(agent_icon_tiles),
@@ -2249,7 +2260,8 @@ impl Workspace {
 
     /// Switch isolation profiles: persist the choice machine-locally and
     /// re-project every space-filtered surface. The open repository workspace
-    /// stays open (an explicit context); its sidebar keeps its own sessions.
+    /// stays open (an explicit context); its recent history stays local while
+    /// the sidebar's Open and Pinned sections follow the selected space.
     pub(crate) fn switch_space(
         &mut self,
         selection: SpaceSelection,
@@ -3136,7 +3148,7 @@ impl Workspace {
         command
     }
 
-    fn render_active_content(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_active_content(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.git_page_origin.is_none()
             && self
                 .git_view
@@ -3178,7 +3190,7 @@ impl Workspace {
             return self.review.clone().into_any_element();
         }
         if self.active_tab == WorkspaceTab::Agent {
-            return self.render_agent_sessions(cx);
+            return self.render_agent_sessions(window, cx);
         }
         if self.active_tab == WorkspaceTab::Editor
             && self.editor_instance == Some(EditorChoice::BuiltIn)
@@ -3453,6 +3465,9 @@ impl Workspace {
                 WorkspaceTab::Agent => {
                     if self.navigation_pane == 0 {
                         self.move_session_cursor(down);
+                        if self.session_cursor.is_some() {
+                            self.agent_sidebar_focus.focus(window, cx);
+                        }
                     }
                 }
                 WorkspaceTab::Resources => {
@@ -3490,6 +3505,17 @@ impl Workspace {
     fn accept_navigation_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.git_page_origin.is_some() {
             self.close_navigation(cx);
+            return;
+        }
+        if !self.git_header_busy
+            && !self.home_visible
+            && self.active_tab == WorkspaceTab::Agent
+            && let Some(index) = self
+                .session_section_focus
+                .iter()
+                .position(|focus| focus.is_focused(window))
+        {
+            self.set_session_section_expanded(index, !self.session_sections_expanded[index], cx);
             return;
         }
         if self.git_page_origin.is_none()
@@ -4105,7 +4131,7 @@ impl Render for Workspace {
                 .map(WorkspaceTab::label)
                 .collect()
         };
-        let active_content = self.render_active_content(cx);
+        let active_content = self.render_active_content(window, cx);
         // Resources and Artifacts full-pages share the repository workspace
         // chrome: title and back navigation live here, not in a second row.
         // The portable git status is hidden on these pages and the lists
