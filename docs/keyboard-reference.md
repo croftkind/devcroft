@@ -103,6 +103,30 @@ The built-in editor’s Markdown preview and the Resources reader share one docu
 
 ## Panes
 
+The Agent sidebar lists **Open sessions** across repositories in this window,
+then **Pinned sessions** across repositories, followed by **Recent sessions**
+for the current checkout. Open and pinned sections respect the selected space;
+explicitly opened checkouts without a registered space remain available.
+Selecting a session restores that conversation and its repository workspace.
+Navigation-mode `j`/`k` follows the same section order, and `Enter` opens once.
+Hover a section header to see its repository scope. Recent cards use two compact rows;
+Open and Pinned cards also show their repository above the session title.
+Click a header to collapse or expand that section independently. All sections
+start expanded and remember their state within the current window. Counts stay
+visible while collapsed, and `j`/`k` skips hidden sessions. In navigation mode,
+use `Tab`/`Shift+Tab` to focus a header and `Enter` to toggle it. A focused header
+also accepts `Enter` or `Space` in normal mode.
+
+Use a session card's **Pin session** button to keep a conversation accessible
+across days and app restarts. Hover or keyboard-focus a card, or highlight it in
+navigation mode, to reveal its pin and close controls in the top-right corner.
+The controls replace the timestamp while the card or its buttons are hovered.
+**Unpin session** removes the pin without closing
+or deleting the conversation. Pins are saved on this device and do not count
+toward the recent-session limit. An open pinned session appears once in Open;
+closing it returns it to Pinned. A pin whose provider session is unavailable
+reappears when that session is discovered again.
+
 Pane movement follows the rendered left-to-right layout and only includes regions on screen. Agent covers the sessions sidebar and the terminal; Review covers files, diff, and comments when shown; Resources and Artifacts cover the list, the document or draft, and the comments and outline rails when shown. The built-in Editor covers its visible sidebar and code area; Neovim and Terminal each have one pane. Home has one pane: `j`/`k` there walk every dashboard card (recent sessions, recent projects, then pull requests, todos, and reading items) instead of switching panes. On the Pull Requests board, `j`/`k` walk cards column by column within the active space and `Enter` edits the selected PR. On the Todos board, `j`/`k` walk cards column by column (Unscoped first, then projects) within the active space and `Enter` toggles the selected todo. On the To Read page, `j`/`k` walk the list in order and `Enter` toggles the selected item read. Card menus also support moving PRs without dragging. The focused pane is named in the list and native panes show a focus ring; the `j`/`k` cursor shows as a ring around the highlighted sidebar row or card.
 
 ## Repository Relationships
