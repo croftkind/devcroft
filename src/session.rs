@@ -255,7 +255,7 @@ impl TerminalSession {
             .context("spawning PTY reader")?;
 
         let grid_size = Arc::new(Mutex::new((INITIAL_COLS, INITIAL_ROWS)));
-        let mut terminal = Terminal::new(INITIAL_COLS, INITIAL_ROWS)?;
+        let mut terminal = crate::terminal_graphics::new_terminal(INITIAL_COLS, INITIAL_ROWS)?;
         // Match the renderer's defaults and answer OSC 10/11 color queries.
         // Leaving these unset paints the same colors but sends no report,
         // so applications cannot derive their input/background colors.
@@ -265,7 +265,6 @@ impl TerminalSession {
             b: 255,
         }))?;
         terminal.set_default_bg_color(Some(RgbColor { r: 0, g: 0, b: 0 }))?;
-        crate::terminal_graphics::configure(&mut terminal)?;
         terminal.set_scrollback_max_lines(Some(10_000))?;
         // Ghostty's default cursor blinks (ghostty(5), `cursor-style-blink`:
         // "If this is not set, the cursor blinks by default"), so a fresh
@@ -357,7 +356,7 @@ impl TerminalSession {
     }
 
     pub(crate) fn title(&self) -> Result<String> {
-        Ok(self.terminal.title()?.to_owned())
+        Ok(String::from_utf8_lossy(self.terminal.title()?).into_owned())
     }
 
     /// Read the terminal's live active area independently of the user's
@@ -1010,6 +1009,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn title_decodes_utf8_and_replaces_invalid_bytes() {
+        let (mut session, _) = TerminalSession::spawn(
+            WorkspaceTab::Terminal,
+            &std::env::temp_dir(),
+            AgentKind::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(session.title().unwrap(), "");
+        session.feed("\x1b]2;editor – café\x07".as_bytes());
+        assert_eq!(session.title().unwrap(), "editor – café");
+        session.terminal.set_title(b"editor \xff").unwrap();
+        assert_eq!(session.title().unwrap(), "editor \u{fffd}");
+    }
+
+    #[test]
     fn snapshot_preserves_faint_colors_and_intensity_resets() {
         let (mut session, _) = TerminalSession::spawn(
             WorkspaceTab::Terminal,
@@ -1218,7 +1232,7 @@ mod tests {
     /// while sync is active for exactly this reason.
     #[test]
     fn synchronized_output_buffers_a_frame_until_sync_end() {
-        let mut terminal = Terminal::new(20, 5).unwrap();
+        let mut terminal = crate::terminal_graphics::new_terminal(20, 5).unwrap();
         let mut render_state = RenderState::new().unwrap();
 
         terminal.vt_write(b"\x1b[?2026h");
@@ -1505,7 +1519,7 @@ mod tests {
 
     #[test]
     fn selection_text_spans_scrollback_and_keeps_column_bounds() {
-        let mut terminal = Terminal::new(10, 2).unwrap();
+        let mut terminal = crate::terminal_graphics::new_terminal(10, 2).unwrap();
         terminal.vt_write(b"zero\r\none\r\ntwo\r\nthree\r\nfour");
         let bar = terminal.scrollbar().unwrap();
         assert_eq!((bar.total, bar.offset, bar.len), (5, 3, 2));
@@ -1524,13 +1538,13 @@ mod tests {
             screen_selection_text(&terminal, (0, 0), (4, 5)).unwrap(),
             ""
         );
-        let mut blank = Terminal::new(5, 4).unwrap();
+        let mut blank = crate::terminal_graphics::new_terminal(5, 4).unwrap();
         blank.vt_write(b"a  \r\n\r\nb  ");
         assert_eq!(
             screen_selection_text(&blank, (0, 0), (2, 2)).unwrap(),
             "a\n\nb"
         );
-        let mut indented = Terminal::new(12, 3).unwrap();
+        let mut indented = crate::terminal_graphics::new_terminal(12, 3).unwrap();
         indented.vt_write(b"  indented\r\nnext");
         assert_eq!(
             screen_selection_text(&indented, (0, 0), (9, 0)).unwrap(),
@@ -1575,7 +1589,7 @@ mod tests {
 
     #[test]
     fn screen_selection_is_independent_of_viewport_scroll() {
-        let mut terminal = Terminal::new(10, 3).unwrap();
+        let mut terminal = crate::terminal_graphics::new_terminal(10, 3).unwrap();
         terminal.vt_write(b"0\r\n1\r\n2\r\n3\r\n4\r\n5");
         assert_eq!(terminal.scrollbar().unwrap().offset, 3);
         assert_eq!(

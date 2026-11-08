@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Result, anyhow};
@@ -49,15 +49,23 @@ impl DecodePng for PngDecoder {
     }
 }
 
-pub(crate) fn configure(terminal: &mut Terminal<'_, '_>) -> Result<()> {
-    // Decoder callbacks are thread-local; terminal mutation is on the UI thread.
-    graphics::set_png_decoder(Some(Box::new(PngDecoder)))?;
+/// Create every terminal through this factory so the process-global decoder
+/// is installed before any thread can enter other libghostty calls.
+pub(crate) fn new_terminal(cols: u16, rows: u16) -> Result<Terminal<'static, 'static>> {
+    static PNG_DECODER: OnceLock<libghostty_vt::error::Result<()>> = OnceLock::new();
+    (*PNG_DECODER.get_or_init(|| {
+        // SAFETY: All terminals are constructed below, after this one-time
+        // initialization completes. Concurrent creators wait here, including
+        // parallel tests, and the hook is never replaced after initialization.
+        unsafe { graphics::set_png_decoder(Some(Box::new(PngDecoder))) }
+    }))?;
+    let mut terminal = Terminal::new(cols, rows)?;
     terminal.set_kitty_image_storage_limit(IMAGE_BUDGET)?;
     // Inline transfers work for local and remote applications. Never let terminal
     // output read arbitrary host files or shared memory.
     terminal.set_kitty_image_from_file_allowed(false)?;
     terminal.set_kitty_image_from_shared_mem_allowed(false)?;
-    Ok(())
+    Ok(terminal)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -136,13 +144,15 @@ impl Graphics {
     /// Recompute geometry on every presented frame (scroll/resize can move
     /// images without changing their generation). Upload pixels only once.
     pub(crate) fn update(&mut self, terminal: &Terminal<'_, '_>) -> Result<bool> {
-        let storage = terminal.kitty_graphics()?;
-        if storage.generation()? == 0 {
-            let changed = !self.placements.is_empty();
-            self.placements.clear();
-            self.images.clear();
-            return Ok(changed);
-        }
+        let storage = match terminal.kitty_graphics()? {
+            Some(storage) if storage.generation()? != 0 => storage,
+            _ => {
+                let changed = !self.placements.is_empty();
+                self.placements.clear();
+                self.images.clear();
+                return Ok(changed);
+            }
+        };
         let mut iter = PlacementIterator::new()?;
         let mut iter = iter.update(&storage)?;
         let mut placements = Vec::new();
@@ -400,7 +410,7 @@ mod tests {
     use super::*;
 
     fn terminal() -> Terminal<'static, 'static> {
-        let mut terminal = Terminal::new(20, 10).unwrap();
+        let mut terminal = new_terminal(20, 10).unwrap();
         terminal
             .resize(
                 20,
@@ -409,7 +419,6 @@ mod tests {
                 cell_height().round() as u32,
             )
             .unwrap();
-        configure(&mut terminal).unwrap();
         terminal
     }
 
