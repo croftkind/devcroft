@@ -327,7 +327,9 @@ struct FindState {
 
 /// Shared document content, find state, and outline navigation.
 pub(crate) struct PreviewView {
+    source: SharedString,
     content: SharedString,
+    source_map: std::sync::Arc<resource_blocks::SelectionMap>,
     resources: Option<resource_blocks::ResourceBlocks>,
     reference_root: Option<crate::data::DataRoot>,
     reference_generation: u64,
@@ -336,6 +338,7 @@ pub(crate) struct PreviewView {
     toc: Vec<TocEntry>,
     /// Top-level block count, used to wait for the rendered document to land.
     blocks: usize,
+    pending_scroll: Option<ListOffset>,
     active: usize,
     focus_handle: FocusHandle,
     toc_focus: FocusHandle,
@@ -355,6 +358,107 @@ impl EventEmitter<OpenReference> for PreviewView {}
 
 pub(crate) struct OpenRelativeFile(pub std::path::PathBuf);
 impl EventEmitter<OpenRelativeFile> for PreviewView {}
+
+/// A checkbox edit belongs to the exact document that produced the click.
+/// Hosts reject stale events before applying the byte range to their source.
+#[derive(Clone, Debug)]
+pub(crate) struct TaskToggle {
+    source: SharedString,
+    pub(crate) marker_range: std::ops::Range<usize>,
+    checked: bool,
+}
+
+impl EventEmitter<TaskToggle> for PreviewView {}
+
+impl TaskToggle {
+    pub(crate) fn new(
+        source: SharedString,
+        marker_range: std::ops::Range<usize>,
+        checked: bool,
+    ) -> Option<Self> {
+        let marker = source.get(marker_range.clone())?;
+        if !matches!(marker, "[ ]" | "[x]" | "[X]") || (marker != "[ ]") == checked {
+            return None;
+        }
+        Some(Self {
+            source,
+            marker_range,
+            checked,
+        })
+    }
+
+    pub(crate) fn replacement(&self, source: &str) -> Option<&'static str> {
+        (source == self.source.as_ref()).then_some(if self.checked { "[x]" } else { "[ ]" })
+    }
+
+    pub(crate) fn apply(&self, source: &str) -> Option<String> {
+        let replacement = self.replacement(source)?;
+        let mut content = source.to_owned();
+        content.replace_range(self.marker_range.clone(), replacement);
+        Some(content)
+    }
+}
+
+/// A one-byte checkbox change leaves all block indices and line heights intact.
+fn task_marker_changed(before: &str, after: &str) -> bool {
+    if before.len() != after.len() {
+        return false;
+    }
+    let mut changes = before
+        .bytes()
+        .zip(after.bytes())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b);
+    let Some((index, (a, b))) = changes.next() else {
+        return false;
+    };
+    changes.next().is_none()
+        && ((a == b' ' && matches!(b, b'x' | b'X')) || (b == b' ' && matches!(a, b'x' | b'X')))
+        && index > 0
+        && before.as_bytes().get(index - 1) == Some(&b'[')
+        && before.as_bytes().get(index + 1) == Some(&b']')
+}
+
+const CALLOUTS: [(&str, &str); 5] = [
+    ("note", "Note"),
+    ("tip", "Tip"),
+    ("important", "Important"),
+    ("warning", "Warning"),
+    ("caution", "Caution"),
+];
+
+fn markdown_extensions() -> MarkdownExtensions {
+    // Keep the registry revision stable across frames. The callbacks read the
+    // current theme at render time, so switching themes needs no new parse.
+    static EXTENSIONS: std::sync::LazyLock<MarkdownExtensions> = std::sync::LazyLock::new(|| {
+        let mut extensions = MarkdownExtensions::default().frontmatter();
+        for (name, title) in CALLOUTS {
+            extensions = extensions.block_surface(name, move |_, cx| {
+                let color = match name {
+                    "tip" => cx.theme().success,
+                    "important" => cx.theme().primary,
+                    "warning" => cx.theme().warning,
+                    "caution" => cx.theme().danger,
+                    _ => cx.theme().info,
+                };
+                v_flex()
+                    .p_3()
+                    .rounded_md()
+                    .border_l_2()
+                    .border_color(color)
+                    .bg(color.opacity(0.08))
+                    .child(
+                        div()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(title),
+                    )
+            });
+        }
+        extensions
+    });
+    EXTENSIONS.clone()
+}
 
 /// URL paths are relative to the source document, with query/fragment suffixes
 /// excluded from the filename. Leave absolute URLs and in-document anchors to
@@ -403,7 +507,13 @@ impl PreviewView {
     }
 
     fn new(content: SharedString, cx: &mut Context<Self>) -> Self {
-        let content = metadata_line_breaks(&content);
+        let source = content;
+        let (content, insertions) = metadata_display(&source);
+        let source_map = std::sync::Arc::new(resource_blocks::SelectionMap::new(
+            0..source.len(),
+            content.len(),
+            insertions,
+        ));
         let (toc, blocks) = extract_toc(&content);
         let state = cx.new(|cx| TextViewState::markdown(&content, cx));
         // Find results follow the rendered text: a landing parse or a host
@@ -415,7 +525,9 @@ impl PreviewView {
         })
         .detach();
         Self {
+            source,
             content: content.into(),
+            source_map,
             resources: None,
             reference_root: None,
             reference_generation: 0,
@@ -423,6 +535,7 @@ impl PreviewView {
             state,
             toc,
             blocks,
+            pending_scroll: None,
             active: 0,
             focus_handle: cx.focus_handle(),
             toc_focus: cx.focus_handle().tab_stop(true),
@@ -476,6 +589,8 @@ impl PreviewView {
     /// Unchanged Markdown never calls this, so ordinary polling preserves exact scroll.
     pub(crate) fn set_content(&mut self, content: SharedString, cx: &mut Context<Self>) {
         let heading = self.toc.get(self.active).map(|entry| entry.title.clone());
+        let task_scroll = task_marker_changed(&self.source, &content)
+            .then(|| self.state.read(cx).list_state().logical_scroll_top());
         let mut next = if self.editor_preview {
             Self::for_editor(content, cx)
         } else if self.resources.is_some() {
@@ -490,7 +605,10 @@ impl PreviewView {
         // An open find session survives the swap; its matches are recomputed
         // against the new text below (and again when its parse lands).
         next.find = self.find.take();
-        if let Some(index) =
+        if let Some(scroll) = task_scroll {
+            next.pending_scroll = Some(scroll);
+            next.active = self.active;
+        } else if let Some(index) =
             heading.and_then(|title| next.toc.iter().position(|entry| entry.title == title))
         {
             next.on_toc_click(index, cx);
@@ -841,6 +959,11 @@ impl Render for PreviewView {
         // match the scrollbar insets below.
         let reader_top = px(8.);
         let list_state = self.state.read(cx).list_state().clone();
+        if list_state.item_count() == self.blocks
+            && let Some(scroll) = self.pending_scroll.take()
+        {
+            list_state.scroll_to(scroll);
+        }
         // Read the live offset during render: the wheel callback reports the
         // previous range and does not run for scrollbar or keyboard movement.
         // This also registers the offset dependency with GPUI Fast so scrolling
@@ -976,23 +1099,28 @@ impl Render for PreviewView {
                         // Keeping the virtualized list preserves TOC offsets,
                         // selection, and keyboard scrolling.
                         div().relative().size_full().overflow_hidden().child(
-                            self.text_view(&self.state, style.clone(), cx)
-                                .when(self.resources.is_some(), |view| {
-                                    view.plugin(self.resource_plugin(style, cx))
-                                })
-                                .scrollable(true)
-                                // Both hosts stretch 16px past the clip box to
-                                // hide the built-in scrollbar. w_auto is
-                                // required: the scrollable TextView defaults to
-                                // width 100%, which would otherwise win over
-                                // the inset and leave its scrollbar visible.
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .right(px(-16.))
-                                .w_auto()
-                                .pr(px(16.)),
+                            self.text_view(
+                                &self.state,
+                                style.clone(),
+                                self.editor_preview.then(|| self.source_map.clone()),
+                                cx,
+                            )
+                            .when(self.resources.is_some(), |view| {
+                                view.plugin(self.resource_plugin(style, cx))
+                            })
+                            .scrollable(true)
+                            // Both hosts stretch 16px past the clip box to
+                            // hide the built-in scrollbar. w_auto is
+                            // required: the scrollable TextView defaults to
+                            // width 100%, which would otherwise win over
+                            // the inset and leave its scrollbar visible.
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .right(px(-16.))
+                            .w_auto()
+                            .pr(px(16.)),
                         ),
                     )
                     .when_some(find_bar, |this, find_bar| this.child(find_bar)),
@@ -1030,6 +1158,78 @@ impl Render for PreviewView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::test::TestWindowExt as _;
+
+    #[test]
+    fn task_toggle_rejects_stale_source_invalid_ranges_and_unchanged_state() {
+        let source: SharedString = "λ\n- [ ] Parent\n  - [X] Child\n".into();
+        let start = source.find("[X]").unwrap();
+        let event = TaskToggle::new(source.clone(), start..start + 3, false).unwrap();
+        assert_eq!(
+            event.apply(&source).unwrap(),
+            "λ\n- [ ] Parent\n  - [ ] Child\n"
+        );
+        assert!(event.apply(&format!("{source}\nNewer edit")).is_none());
+        assert!(TaskToggle::new(source.clone(), 1..4, true).is_none());
+        assert!(TaskToggle::new(source.clone(), 0..usize::MAX, true).is_none());
+        assert!(TaskToggle::new(source, start..start + 3, true).is_none());
+    }
+
+    #[gpui_kit::test]
+    fn task_toggle_preserves_scroll_within_a_long_section(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let source = format!(
+            "# Tasks\n\n{}",
+            (0..80)
+                .map(|i| { format!("Paragraph {i}.\n\n- [ ] Task {i}\n\n") })
+                .collect::<String>()
+        );
+        for embedded in [false, true] {
+            let reader = cx.new(|cx| {
+                if embedded {
+                    PreviewView::embedded(source.clone().into(), cx)
+                } else {
+                    PreviewView::for_editor(source.clone().into(), cx)
+                }
+            });
+            let view = reader.clone();
+            let (_, test_cx) = cx.add_window_view(move |window, cx| {
+                gpui_kit::component::Root::new(view, window, cx)
+            });
+            for _ in 0..3 {
+                test_cx.run_until_parked();
+                test_cx.update(|window, cx| window.render_frame(cx));
+            }
+            reader.update(test_cx, |reader, cx| {
+                reader.state.read(cx).list_state().scroll_to(ListOffset {
+                    item_ix: 61,
+                    offset_in_item: px(6.),
+                });
+            });
+            test_cx.update(|window, cx| window.render_frame(cx));
+            let before = reader.read_with(test_cx, |reader, cx| {
+                reader.state.read(cx).list_state().logical_scroll_top()
+            });
+            let marker = source.find("[ ] Task 30").unwrap();
+            let next = TaskToggle::new(source.clone().into(), marker..marker + 3, true)
+                .unwrap()
+                .apply(&source)
+                .unwrap();
+            reader.update(test_cx, |reader, cx| reader.set_content(next.into(), cx));
+            for _ in 0..3 {
+                test_cx.run_until_parked();
+                test_cx.update(|window, cx| window.render_frame(cx));
+            }
+            reader.read_with(test_cx, |reader, cx| {
+                let after = reader.state.read(cx).list_state().logical_scroll_top();
+                assert_eq!(after.item_ix, before.item_ix, "embedded: {embedded}");
+                assert_eq!(
+                    after.offset_in_item, before.offset_in_item,
+                    "embedded: {embedded}"
+                );
+            });
+        }
+    }
 
     #[test]
     fn relative_file_links_decode_paths_and_exclude_url_suffixes() {

@@ -87,7 +87,10 @@ impl MarkdownPlugin for BlockPlugin {
         let index = self.ranges.iter().position(|r| *r == range)?;
         Some(
             MarkdownNode::new(self.name(), index)
-                .text(heading_plain_text(node))
+                .text(resource_plain_text(
+                    node,
+                    context.node_source(node).unwrap_or_default(),
+                ))
                 .markdown(context.node_source(node).unwrap_or_default().to_owned()),
         )
     }
@@ -98,6 +101,60 @@ impl MarkdownPlugin for BlockPlugin {
                 view.render_resource_block(index, self.style.clone(), window, cx)
             })
             .unwrap_or_else(|_| div().into_any_element())
+    }
+}
+
+/// The outer custom block supplies Resources' find index. Omit a registered
+/// callout marker only when the inner reader will hide it as markup too.
+fn resource_plain_text(node: &markdown_ast::Node, source: &str) -> String {
+    let plain = heading_plain_text(node);
+    let markdown_ast::Node::Blockquote(quote) = node else {
+        return plain;
+    };
+    let Some(markdown_ast::Node::Paragraph(paragraph)) = quote.children.first() else {
+        return plain;
+    };
+    let Some(markdown_ast::Node::Text(text)) = paragraph.children.first() else {
+        return plain;
+    };
+    let (line, rest) = match text.value.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), Some(rest)),
+        None => (text.value.as_str(), None),
+    };
+    let Some(name) = line.strip_prefix("[!").and_then(|s| s.strip_suffix(']')) else {
+        return plain;
+    };
+    let start = text.position.as_ref().and_then(|position| {
+        position
+            .start
+            .offset
+            .checked_sub(node.position()?.start.offset)
+    });
+    let literal_marker = start.is_some_and(|start| {
+        source
+            .get(..start)
+            .is_some_and(|prefix| !prefix.ends_with('\\'))
+            && source.get(start..).is_some_and(|raw| raw.starts_with(line))
+    });
+    let valid_end = rest.is_some()
+        || paragraph.children.len() == 1
+        || matches!(
+            paragraph.children.get(1),
+            Some(markdown_ast::Node::Break(_))
+        );
+    if valid_end
+        && literal_marker
+        && CALLOUTS
+            .iter()
+            .any(|(registered, _)| name.eq_ignore_ascii_case(registered))
+    {
+        plain
+            .strip_prefix(line)
+            .unwrap_or(&plain)
+            .trim_start()
+            .to_owned()
+    } else {
+        plain
     }
 }
 
@@ -166,10 +223,19 @@ impl PreviewView {
         &self,
         state: &Entity<TextViewState>,
         style: TextViewStyle,
+        task_map: Option<Arc<SelectionMap>>,
         cx: &Context<Self>,
     ) -> TextView {
+        // Kit recognizes top-level surfaces before block plugins. Let the
+        // resource wrapper claim the whole block first, then render its callout
+        // inside the inner TextView so comment controls and anchors survive.
+        let extensions = if self.resources.is_some() && state == &self.state {
+            MarkdownExtensions::default().frontmatter()
+        } else {
+            markdown_extensions()
+        };
         TextView::new(state)
-            .markdown_extensions(MarkdownExtensions::default().frontmatter())
+            .markdown_extensions(extensions)
             .plugin(FrontmatterPlugin)
             .plugin(crate::markdown_references::ReferencePlugin {
                 details: self.reference_details.clone(),
@@ -195,6 +261,22 @@ impl PreviewView {
                     }
                     crate::markdown_references::open_link(url, event, window, cx, &open)
                 }
+            })
+            .when_some(task_map, |view, map| {
+                let source = self.source.clone();
+                let reader = cx.entity().downgrade();
+                view.on_task_toggle(move |event, _, cx| {
+                    // Appended reference definitions are outside this map.
+                    let range = event.marker_range();
+                    if range.end > map.display_len {
+                        return;
+                    }
+                    if let Some(range) = map.original_range(range)
+                        && let Some(event) = TaskToggle::new(source.clone(), range, event.checked())
+                    {
+                        let _ = reader.update(cx, |_, cx| cx.emit(event));
+                    }
+                })
             })
             .style(style)
             .code_block_actions(|block, _, _| {
@@ -242,11 +324,11 @@ impl PreviewView {
             .get_or_insert_with(|| {
                 let (display, insertions) =
                     metadata_display(&resources.source[block.range.clone()]);
-                Arc::new(SelectionMap {
-                    block: block.range.clone(),
-                    display_len: display.len(),
+                Arc::new(SelectionMap::new(
+                    block.range.clone(),
+                    display.len(),
                     insertions,
-                })
+                ))
             })
             .clone();
         let state = resources.states[index]
@@ -308,7 +390,15 @@ impl PreviewView {
                     // The old 2px left border plus 4px padding kept text at a
                     // 6px inset; keep that now that the border is gone.
                     .pl_1p5()
-                    .child(self.text_view(&state, style, cx).selectable(true)),
+                    .child(
+                        self.text_view(
+                            &state,
+                            style,
+                            (!disabled && handler.is_some()).then_some(selection_map.clone()),
+                            cx,
+                        )
+                        .selectable(true),
+                    ),
             );
         // A fixed gutter keeps text wrapping unchanged when comments are saved.
         // Empty "+" affordances stay dim so long documents scan cleanly;
@@ -398,12 +488,23 @@ impl PreviewView {
 }
 /// Map the inner TextView source back to the artifact body. Appended reference
 /// definitions are invisible support content, never part of a comment selection.
-struct SelectionMap {
+pub(super) struct SelectionMap {
     block: std::ops::Range<usize>,
     display_len: usize,
     insertions: Vec<usize>,
 }
 impl SelectionMap {
+    pub(super) fn new(
+        block: std::ops::Range<usize>,
+        display_len: usize,
+        insertions: Vec<usize>,
+    ) -> Self {
+        Self {
+            block,
+            display_len,
+            insertions,
+        }
+    }
     fn original_range(&self, range: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
         let endpoint = |offset: usize| {
             let offset = offset.min(self.display_len);
@@ -471,6 +572,155 @@ mod tests {
             map.original_range(owner..owner + 2),
             Some(12 + source.rfind("me").unwrap()..14 + source.rfind("me").unwrap())
         );
+    }
+
+    #[test]
+    fn task_ranges_map_nested_unicode_lists_back_to_resource_source() {
+        let source = "**Name:** λ\n**Status:** ready\n\n- [ ] Parent\n  - [ ] 子 task\n\n[ref]: https://example.com\n";
+        let list_start = source.find("- [ ] Parent").unwrap();
+        let child = source.rfind("- [ ]").unwrap();
+        let block = anchors::blocks(source)
+            .into_iter()
+            .find(|b| b.range.start == list_start)
+            .unwrap();
+        let (display, insertions) = metadata_display(&source[block.range.clone()]);
+        let map = SelectionMap::new(block.range, display.len(), insertions);
+        let local = display.rfind("[ ]").unwrap();
+        let range = map.original_range(local..local + 3).unwrap();
+        assert_eq!(range, child + 2..child + 5);
+        let event = TaskToggle::new(source.into(), range, true).unwrap();
+        let mut expected = source.to_owned();
+        expected.replace_range(child + 2..child + 5, "[x]");
+        assert_eq!(event.apply(source), Some(expected));
+        let (display, insertions) = metadata_display(source);
+        let map = SelectionMap::new(0..source.len(), display.len(), insertions);
+        let local = display.rfind("[ ]").unwrap();
+        assert_eq!(
+            map.original_range(local..local + 3),
+            Some(child + 2..child + 5)
+        );
+    }
+
+    #[test]
+    fn resource_find_matches_callout_marker_visibility() {
+        for (quote, hidden) in [
+            ("> [!NOTE]\n> Body.\n", true),
+            (">\n> [!NOTE]\n> Body.\n", true),
+            ("> [!nOtE]\r\n> Body.\r\n", true),
+            ("> [!NOTE]  \n> Body.\n", true),
+            ("> \\[!NOTE]\n> Body.\n", false),
+            ("> &#91;!NOTE]\n> Body.\n", false),
+            ("> [!NOTE] Title\n> Body.\n", false),
+            ("> [!CUSTOM]\n> Body.\n", false),
+            ("> > [!NOTE]\n> > Body.\n", false),
+        ] {
+            // Parse after a Unicode prefix to exercise absolute AST offsets
+            // against the block-local source passed by the plugin.
+            let source = format!("λ prefix\n\n{quote}");
+            let root = markdown::to_mdast(&source, &markdown::ParseOptions::gfm()).unwrap();
+            let node = root.children().unwrap().last().unwrap();
+            let plain = resource_plain_text(node, quote.trim_end());
+            let marker = if quote.contains("CUSTOM") {
+                "[!CUSTOM]"
+            } else {
+                "[!NOTE]"
+            };
+            assert_eq!(
+                plain.to_ascii_uppercase().contains(marker),
+                !hidden,
+                "{quote:?}"
+            );
+            assert!(plain.contains("Body."), "{quote:?}");
+        }
+    }
+
+    #[gpui_kit::test]
+    fn callouts_keep_visible_text_and_source_in_both_readers(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        let source = ">\n> [!NOTE]\n> Visible **note**.\n\n> [!CUSTOM]\n> Fallback quote.\n";
+        for embedded in [false, true] {
+            let reader = cx.new(|cx| {
+                if embedded {
+                    PreviewView::embedded(source.into(), cx)
+                } else {
+                    PreviewView::for_editor(source.into(), cx)
+                }
+            });
+            let view = reader.clone();
+            let (_, test_cx) = cx.add_window_view(move |window, cx| {
+                gpui_kit::component::Root::new(view, window, cx)
+            });
+            for _ in 0..3 {
+                test_cx.run_until_parked();
+                test_cx.update(|window, cx| window.render_frame(cx));
+            }
+            reader.read_with(test_cx, |reader, cx| {
+                let state = if embedded {
+                    reader.resources.as_ref().unwrap().states[0]
+                        .as_ref()
+                        .unwrap()
+                } else {
+                    &reader.state
+                };
+                let text = state.read(cx).rendered_text();
+                assert!(text.as_str().contains("Visible note."));
+                assert!(!text.as_str().contains("[!NOTE]"));
+                assert_eq!(reader.source.as_ref(), source);
+                let outer = reader.state.read(cx).rendered_text();
+                assert!(!outer.as_str().contains("[!NOTE]"));
+                assert!(outer.as_str().contains("[!CUSTOM]"));
+            });
+        }
+    }
+
+    #[gpui_kit::test]
+    fn body_click_routes_find_through_text_view_focus(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(gpui_kit::init);
+        for embedded in [false, true] {
+            let reader = cx.new(|cx| {
+                let source = "Find words in this ordinary paragraph.".into();
+                if embedded {
+                    PreviewView::embedded(source, cx)
+                } else {
+                    PreviewView::for_editor(source, cx)
+                }
+            });
+            let view = reader.clone();
+            let (_, test_cx) = cx.add_window_view(move |window, cx| {
+                gpui_kit::component::Root::new(view, window, cx)
+            });
+            for _ in 0..3 {
+                test_cx.run_until_parked();
+                test_cx.update(|window, cx| window.render_frame(cx));
+            }
+            let position = reader.read_with(test_cx, |reader, cx| {
+                let state = if embedded {
+                    reader.resources.as_ref().unwrap().states[0]
+                        .as_ref()
+                        .unwrap()
+                } else {
+                    &reader.state
+                };
+                state.read(cx).bounds().origin + gpui_kit::point(px(2.), px(13.))
+            });
+            test_cx.simulate_mouse_down(position, MouseButton::Left, Default::default());
+            test_cx.simulate_mouse_up(position, MouseButton::Left, Default::default());
+            test_cx.update(|window, cx| {
+                window.press(
+                    if cfg!(target_os = "macos") {
+                        "cmd-f"
+                    } else {
+                        "ctrl-f"
+                    },
+                    cx,
+                );
+            });
+            test_cx.simulate_input("ordinary");
+            test_cx.run_until_parked();
+            reader.read_with(test_cx, |reader, _| {
+                assert_eq!(reader.find.as_ref().unwrap().matches.len(), 1);
+            });
+        }
     }
 
     #[gpui_kit::test]

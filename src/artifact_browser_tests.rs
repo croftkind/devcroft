@@ -1,5 +1,96 @@
 use super::*;
 use gpui_kit::test::TestWindowExt as _;
+
+#[gpui_kit::test]
+fn task_toggle_persists_and_revision_conflicts_preserve_external_edits(
+    cx: &mut gpui_kit::TestAppContext,
+) {
+    use crate::data::artifacts::NewArtifact;
+    let dir = tempfile::tempdir().unwrap();
+    let root = DataRoot::new(dir.path().to_owned());
+    crate::data::write_json_atomic(
+        &root
+            .portable_dir()
+            .join("repositories/repo/repository.json"),
+        &serde_json::json!({"key": "repo"}),
+    )
+    .unwrap();
+    let store = ArtifactStore::new(&root);
+    let source = "# λ Tasks\n\n- [ ] Parent\n  - [ ] 子 task\n\nCommented paragraph.\n";
+    let snapshot = store
+        .create(NewArtifact {
+            repository: Some("repo".into()),
+            sessions: vec![],
+            title: "Checklist".into(),
+            kind: Kind::Note,
+            content: source.into(),
+            status: None,
+        })
+        .unwrap();
+    let snapshot = store
+        .comment(
+            &snapshot.artifact.id,
+            &snapshot.revision,
+            CommentChange::CreateBlock {
+                body: "Keep this anchor".into(),
+                block: 2,
+                quote: None,
+            },
+        )
+        .unwrap();
+    cx.update(gpui_kit::init);
+    let browser = cx.new(|cx| ArtifactBrowser::new(Some(root.clone()), cx));
+    browser.update(cx, |browser, cx| browser.select(Some(snapshot.clone()), cx));
+    let view = browser.clone();
+    let (_, cx) =
+        cx.add_window_view(move |window, cx| gpui_kit::component::Root::new(view, window, cx));
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update(|window, cx| window.render_frame(cx));
+    }
+    let child = source.rfind("- [ ]").unwrap();
+    let toggle =
+        crate::preview::TaskToggle::new(source.into(), child + 2..child + 5, true).unwrap();
+    let preview = browser.read_with(cx, |browser, _| browser.preview.clone().unwrap());
+    preview.update(cx, |_, cx| cx.emit(toggle));
+    cx.run_until_parked();
+    let saved = store.get(&snapshot.artifact.id).unwrap();
+    let mut expected = source.to_owned();
+    expected.replace_range(child + 2..child + 5, "[x]");
+    assert_eq!(saved.artifact.content, expected);
+    assert_eq!(
+        saved.artifact.comments[0].id,
+        snapshot.artifact.comments[0].id
+    );
+    let anchor = saved.artifact.comments[0]
+        .anchor
+        .as_ref()
+        .unwrap()
+        .location();
+    assert!(!anchor.outdated);
+    assert_eq!(anchor.source, "Commented paragraph.");
+    browser.read_with(cx, |browser, _| assert!(browser.error.is_none()));
+
+    // A concurrent comment changes the revision without changing the body.
+    // The subsequent checkbox save must not overwrite that record.
+    let external = store
+        .comment(
+            &saved.artifact.id,
+            &saved.revision,
+            CommentChange::Create("External comment".into()),
+        )
+        .unwrap();
+    let toggle =
+        crate::preview::TaskToggle::new(expected.into(), child + 2..child + 5, false).unwrap();
+    browser.update(cx, |browser, cx| {
+        browser.toggle_task(&saved.artifact.id, &toggle, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(store.get(&saved.artifact.id).unwrap(), external);
+    browser.read_with(cx, |browser, _| {
+        assert!(browser.error.as_ref().unwrap().contains("Could not save"));
+    });
+}
 #[test]
 fn refresh_coalesces_requests_and_discards_superseded_results() {
     let mut refresh = Refresh::default();

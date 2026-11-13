@@ -715,6 +715,14 @@ impl ArtifactBrowser {
                             cx.notify();
                         })
                         .detach();
+                        let id = s.artifact.id.clone();
+                        cx.subscribe(
+                            &preview,
+                            move |this, _, event: &crate::preview::TaskToggle, cx| {
+                                this.toggle_task(&id, event, cx);
+                            },
+                        )
+                        .detach();
                         self.preview = Some(preview);
                     }
                     _ => self.preview = None,
@@ -789,6 +797,27 @@ impl ArtifactBrowser {
         self.error = None;
         cx.notify();
     }
+    fn toggle_task(
+        &mut self,
+        id: &str,
+        event: &crate::preview::TaskToggle,
+        cx: &mut Context<Self>,
+    ) {
+        if self.draft.is_some() || self.saving {
+            return;
+        }
+        let Some(snapshot) = self.selected.clone().filter(|s| s.artifact.id == id) else {
+            return;
+        };
+        let Some(content) = event.apply(&snapshot.artifact.content) else {
+            self.error = Some("The document changed. Try the checkbox again.".into());
+            self.refresh(cx);
+            cx.notify();
+            return;
+        };
+        self.mutate(snapshot, Mutation::Document(content), false, cx);
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
         let Some(draft) = &self.draft else {
             return;
@@ -887,8 +916,11 @@ impl ArtifactBrowser {
                             this.select(Some(snapshot), cx);
                         }
                         Err(error) => {
-                            this.error =
-                                Some(format!("Could not save. Your draft is retained. {error}"))
+                            this.error = Some(if this.draft.is_some() {
+                                format!("Could not save. Your draft is retained. {error}")
+                            } else {
+                                format!("Could not save. {error}")
+                            })
                         }
                     }
                 }

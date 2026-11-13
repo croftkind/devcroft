@@ -4,6 +4,17 @@ The Resources tab replaces task tracking. Its sidebar lists the current reposito
 
 Use Edit Markdown to change a document and Save or Cancel. The right sidebar has **On this page** and **Comments** tabs. Right-click a rendered block and choose **Comment on this block**, or use its **+** button. A block is a paragraph, heading, list, table, blockquote, or code block. Select words within that block first and choose **Comment on selected text** to attach feedback to that exact source range. The editor opens in the Comments tab while the document stays visible. Selection comments store the original Markdown byte offsets, source lines, and selected quote. Without a mapped selection, comments attach to the whole block. The gutter and background indicate comments on the containing block; selecting across separate blocks is not supported.
 
+Click a Markdown task checkbox to save its checked state directly. Checkbox
+changes use the same revision checks as document edits and keep the reader's
+scroll position. They are unavailable while a document or comment draft is open
+or a save is in progress.
+
+The reader styles top-level GitHub-style callouts named `NOTE`, `TIP`,
+`IMPORTANT`, `WARNING`, and `CAUTION`. Put the marker alone on the first line,
+for example `> [!NOTE]`, followed by quoted body lines. Callouts retain block
+comment controls and their original Markdown source. Unknown names, nested
+callouts and markers with a title on the same line remain ordinary blockquotes.
+
 Saved blocks carry a background wash and a comment-count button: amber while comments are open, green once every comment on the block is resolved. Click the button to open the comment, or click a comment card's content to return to its block. Multiple comments on the same block remain separate cards. Each card's **⋯** menu contains **Edit**, **Resolve / Reopen**, and **Delete**. **Add document comment** retains the existing document-level feedback workflow. Use the artifact options menu's **Copy Markdown** to copy the whole source.
 
 Block and selection anchors retain their original Markdown excerpt, optional selected quote, UTF-8 byte offsets, one-based source lines, and surrounding context. Unchanged excerpts can relocate after insertions or moves. Edits outside a selection can leave its anchor intact, even within the same paragraph. Edited, removed, or ambiguously repeated excerpts are marked **Outdated** and retain their original excerpt; their cards can still be edited, resolved, reopened, or deleted. Restoring an identifiable original block restores navigation. Resolved comments remain visible and can be reopened. Desktop polling picks up CLI changes. Comment mutations retain the artifact's revision checks, and conflicting saves keep the draft.

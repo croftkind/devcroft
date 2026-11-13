@@ -706,9 +706,48 @@ impl NativeEditor {
                 },
             )
             .detach();
+            cx.subscribe_in(
+                &preview,
+                window,
+                |this, preview, event: &crate::preview::TaskToggle, window, cx| {
+                    if this.markdown_preview.as_ref() == Some(preview) {
+                        this.toggle_preview_task(event, window, cx);
+                    }
+                },
+            )
+            .detach();
             self.markdown_preview = Some(preview);
         }
         self.editor_focus(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn toggle_preview_task(
+        &mut self,
+        event: &crate::preview::TaskToggle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.supports_markdown_preview() || self.markdown_preview.is_none() {
+            return;
+        }
+        let value = self.editor.read(cx).value();
+        let Some(replacement) = event.replacement(value.as_ref()) else {
+            self.error = Some("The document changed. Try the checkbox again.".into());
+            cx.notify();
+            return;
+        };
+        // An ordinary atomic edit retains undo and emits InputEditsEvent for
+        // dirty tracking, LSP and Git markers. The three-byte marker replacement
+        // leaves the code view's existing selection at the same source offsets.
+        self.editor.update(cx, |editor, cx| {
+            let selection = editor.selected_range();
+            let reversed = editor.is_selection_reversed();
+            editor.set_selected_range(event.marker_range.clone(), cx);
+            editor.replace(replacement, window, cx);
+            editor.set_selected_range_with_direction(selection, reversed, cx);
+        });
+        self.error = None;
         cx.notify();
     }
 
@@ -4621,6 +4660,60 @@ mod tests {
         view.read_with(test_cx, |view, cx| {
             assert_eq!(view.editor.read(cx).cursor_position().line, 1)
         });
+    }
+
+    #[gpui_kit::test]
+    fn markdown_task_toggle_is_undoable_and_saves_through_the_editor(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tasks.md");
+        let source = "# λ Tasks\n\n- [ ] Parent\n  - [ ] 子 task\n";
+        fs::write(&file, source).unwrap();
+        let (view, cx) = test_editor(cx, dir.path());
+        view.update_in(cx, |view, window, cx| {
+            view.open(&file, None, window, cx).unwrap();
+            view.toggle_markdown_preview(window, cx);
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.render_frame(cx));
+        }
+        let child = source.rfind("- [ ]").unwrap();
+        let toggle =
+            crate::preview::TaskToggle::new(source.into(), child + 2..child + 5, true).unwrap();
+        let preview = view.read_with(cx, |view, _| view.markdown_preview.clone().unwrap());
+        preview.update(cx, |_, cx| cx.emit(toggle));
+        cx.run_until_parked();
+        let mut expected = source.to_owned();
+        expected.replace_range(child + 2..child + 5, "[x]");
+        view.read_with(cx, |view, cx| {
+            assert!(view.dirty);
+            assert_eq!(view.editor.read(cx).value(), expected);
+        });
+        assert_eq!(fs::read_to_string(&file).unwrap(), source);
+        view.update_in(cx, |view, window, cx| {
+            view.toggle_markdown_preview(window, cx);
+        });
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(gpui_kit::component::input::Undo), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.editor.read(cx).value(), source);
+            assert!(!view.dirty);
+        });
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(gpui_kit::component::input::Redo), cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.editor.read(cx).value(), expected);
+            view.save(window, cx);
+            assert!(!view.dirty);
+        });
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
     }
 
     #[gpui_kit::test]
