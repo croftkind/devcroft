@@ -265,7 +265,6 @@ pub(crate) struct Workspace {
     git_page_origin: Option<GitPageOrigin>,
     git_header_busy: bool,
     git_header_busy_focus: FocusHandle,
-    git_tab_focus: [FocusHandle; 2],
     git_header_return_focus: Option<FocusHandle>,
     git_picker_origin_focus: Option<FocusHandle>,
     git_header_notice: Option<String>,
@@ -888,7 +887,6 @@ impl Workspace {
             git_page_origin: None,
             git_header_busy: false,
             git_header_busy_focus: cx.focus_handle(),
-            git_tab_focus: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
             git_header_return_focus: None,
             git_picker_origin_focus: None,
             git_header_notice: None,
@@ -1531,12 +1529,11 @@ impl Workspace {
         self.git_view = Some(git);
     }
 
-    fn select_git_mode(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_git_mode(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.git_page_origin.is_some()
             && let Some(mode) = GitMode::ALL.get(index).copied()
             && let Some(git) = &self.git_view
         {
-            self.git_tab_focus[index].focus(window, cx);
             git.update(cx, |git, cx| git.select_mode(mode, cx));
         }
     }
@@ -2839,6 +2836,7 @@ impl Workspace {
         let attention_only = self.attention_only;
         let mut command = Command::new(&self.command_state)
             .placeholder(self.palette_mode.placeholder())
+            .highlight_matches(true)
             .on_query(move |query, _window, cx| {
                 let has_query = query_has_terms(query);
                 let _ = query_workspace.update(cx, |this, cx| {
@@ -4670,7 +4668,7 @@ impl Render for Workspace {
                             .selected_index(header_tab_index)
                             .on_click(cx.listener(|this, index: &usize, window, cx| {
                                 if this.git_page_origin.is_some() {
-                                    this.select_git_mode(*index, window, cx);
+                                    this.select_git_mode(*index, cx);
                                 } else {
                                     this.select_tab(*index, window, cx);
                                 }
@@ -4680,22 +4678,6 @@ impl Render for Workspace {
                                     Tab::new()
                                         .label(label)
                                         .when(index == header_tab_index, |tab| tab.font_semibold())
-                                        .when(git_mode.is_some(), |tab| {
-                                            tab.track_focus(&self.git_tab_focus[index])
-                                            .on_key_down(cx.listener(
-                                            move |this,
-                                                  event: &gpui_kit::KeyDownEvent,
-                                                  window,
-                                                  cx| {
-                                                if event.keystroke.key == "enter"
-                                                    || event.keystroke.key == "space"
-                                                {
-                                                    this.select_git_mode(index, window, cx);
-                                                    cx.stop_propagation();
-                                                }
-                                            },
-                                        ))
-                                        })
                                 }),
                             ),
                         )
@@ -5032,11 +5014,17 @@ mod tests {
             );
             assert_eq!(workspace.active_tab, WorkspaceTab::Resources);
         });
-        // The header tabs retain keyboard activation in their new location.
+        // Kit owns roving focus: arrows move it without changing the mode,
+        // and Space/Enter activate the focused tab.
         test_cx.update(|window, cx| {
             window.render_frame(cx);
-            window.focus_prev(cx);
-            assert!(workspace.read(cx).git_tab_focus[0].is_focused(window));
+        });
+        test_cx.simulate_keystrokes("left");
+        workspace.read_with(test_cx, |workspace, cx| {
+            assert_eq!(
+                workspace.git_view.as_ref().unwrap().read(cx).mode(),
+                GitMode::History
+            );
         });
         test_cx.simulate_keystrokes("space");
         test_cx.simulate_event(gpui_kit::KeyUpEvent {
@@ -5047,6 +5035,18 @@ mod tests {
                 workspace.git_view.as_ref().unwrap().read(cx).mode(),
                 GitMode::Changes
             );
+        });
+        test_cx.simulate_keystrokes("right");
+        test_cx.simulate_keystrokes("enter");
+        test_cx.simulate_event(gpui_kit::KeyUpEvent {
+            keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),
+        });
+        workspace.read_with(test_cx, |workspace, cx| {
+            assert_eq!(
+                workspace.git_view.as_ref().unwrap().read(cx).mode(),
+                GitMode::History
+            );
+            assert_eq!(workspace.active_tab, WorkspaceTab::Resources);
         });
         test_cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| workspace.back_from_git(window, cx));

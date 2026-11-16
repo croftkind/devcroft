@@ -57,7 +57,7 @@ use anyhow::{Context as _, Result, anyhow};
 use clap::Parser as _;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    App, AppContext as _, KeyBinding, NoAction, WindowBounds, WindowOptions, px, rgb, size,
+    App, AppContext as _, Bounds, KeyBinding, NoAction, WindowBounds, WindowOptions, px, rgb, size,
 };
 
 use crate::cli::{Cli, Command};
@@ -159,6 +159,9 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
     let app = gpui_kit::application().with_assets(app_assets::AppAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // Devcroft's custom layouts use physical edges. Keep Kit's controls
+        // aligned with them until the whole workspace supports RTL layout.
+        gpui_kit::base::LayoutDirection::Ltr.set_global(cx);
         bind_app_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         load_bundled_fonts(cx).expect("failed to load bundled application fonts");
@@ -171,7 +174,11 @@ fn run_app(args: crate::cli::AppArgs) -> Result<()> {
                 title: Some("Devcroft".into()),
                 ..Default::default()
             }),
-            window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1440.), px(900.)),
+                cx,
+            ))),
             // Wayland app-id / X11 WM_CLASS. Omarchy's universal clipboard
             // shortcuts (`Super+C/V/X`) only send terminal keys
             // (`Shift+Insert`, …) to windows tagged `terminal`, matched on
