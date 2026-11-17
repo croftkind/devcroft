@@ -275,10 +275,14 @@ fn reload_reopens_changed_viewed_files_and_preserves_other_progress(
     fs::write(dir.path().join("manual.txt"), "updated!\n").unwrap();
     view.update(cx, |view, cx| view.reload(cx));
     cx.run_until_parked();
-    view.read_with(cx, |view, _| {
+    view.read_with(cx, |view, cx| {
         assert_progress(view, "a.txt", false, false);
         assert_progress(view, "b.txt", true, true);
         assert_progress(view, "manual.txt", false, true);
+        let diff = view.diff_state.read(cx);
+        assert!(!diff.is_file_collapsed("a.txt"));
+        assert!(diff.is_file_collapsed("b.txt"));
+        assert!(diff.is_file_collapsed("manual.txt"));
     });
     // A file can be reviewed again at its new version.
     view.update(cx, |view, cx| {

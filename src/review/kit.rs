@@ -100,17 +100,18 @@ impl ReviewView {
     }
 
     pub(super) fn sync_collapsed(&mut self, cx: &mut Context<Self>) {
-        let paths = self
-            .diff_state
-            .read(cx)
-            .files()
-            .iter()
-            .map(|file| file.path().clone())
-            .collect::<Vec<_>>();
+        let (collapsed, expanded): (Vec<_>, Vec<_>) = {
+            let collapsed = self.collapsed.borrow();
+            self.diff_state
+                .read(cx)
+                .files()
+                .iter()
+                .map(|file| file.path().clone())
+                .partition(|path| collapsed.contains(path.as_str()))
+        };
         self.diff_state.update(cx, |diff, cx| {
-            for path in paths {
-                diff.set_file_collapsed(&path, self.collapsed.borrow().contains(path.as_str()), cx);
-            }
+            diff.set_files_collapsed(expanded, false, cx);
+            diff.set_files_collapsed(collapsed, true, cx);
         });
     }
 

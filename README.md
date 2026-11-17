@@ -111,7 +111,10 @@ mise run test
 Ordinary builds use GPUI Fast. The default feature switches Kit and the macOS
 WebView wrapper together so they share GPUI types.
 
-GPUI Kit and gpui-webview use 0.9.1. Composed tutorial pages stay visible
+GPUI Kit and gpui-webview use 0.10.0. GPUI Base is pinned to upstream commit
+`453f6d2` for the [tab pointer-focus fix](https://github.com/longbridge/gpui-kit/pull/4002).
+Remove the Cargo patch once a published release includes that fix.
+Composed tutorial pages stay visible
 behind palettes, menus, dialogs, and navigation hints on GPUI Fast. GPUI Pre
 and hosts where native composition fails keep the hide-while-overlay fallback.
 Sheets hide the tutorial on both backends because Kit does not compose them above
