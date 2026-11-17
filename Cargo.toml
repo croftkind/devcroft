@@ -89,10 +89,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 gpui-kit = { version = "0.10.0", features = ["test-support"] }
 
-# GPUI Base 0.10.0 stops tab mouse-down before its automatic focus handler.
-# Remove this patch when upstream preserves click-to-keyboard tab navigation.
+# Upstream tab pointer-focus fix (#4002). Remove once a release includes it.
 [patch.crates-io]
-gpui-base = { path = "vendor/gpui-base" }
+gpui-base = { git = "https://github.com/longbridge/gpui-kit", rev = "453f6d2c3540845de6d7ad5ba731fbd19ef8f435" }
 
 [profile.dev]
 debug = "limited"
