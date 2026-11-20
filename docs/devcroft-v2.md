@@ -2,6 +2,8 @@
 
 I have been dogfooding devcroft for months. During this testing I have discovered limitation of our current approach. Also, I have exposed to few more ideas that feels more natural for agent driven development. So, I am planning re-architeching devcroft. It will be singificantly different than what we have currently. This doc discuss what are the limitation of current arhitecture and what I expect from v2. V2 does not means v2 version of devcroft. It just means v2 version of our approach for this project.
 
+The UI will be dastrically different than what we have currently. There should be easy way to discover contextual information. More focus on what matter most and less to what used rarely. It still should support rich keyboard navigation. There should be one preffered way to do a thing rather than giving options. For example, only built-in editor. No neovim. User can still open a project in their preffered IDE.
+
 ## Limitation of current architecture
 
 ### Rich interaction not possible in TUI
@@ -68,6 +70,15 @@ A deliverible work. It is workspace scoped. It can involves multiple repositorie
 - There might be multiple tasks in-progress parallely they might change same repositories. So, maybe git worktree makes sense here.
 
 ### Artifacts
+- Rich and beutiful artifacts like claude artifacts
+- It doesn't have to be markdown like currently we have
+- Rich HTML artifcats with interactive visual should be supported
+- Agent may present some UI prototype as in the artifact we must support this
+- Artifacts are workspace scoped.
+- There should be way to discover artifacts within workspace
+- A task can produce multiple artifacts
+- There should be a way to discover related artifacts within task
+- There should be way to ask agent about a selection or provide feedback for an artifact
 
 ### Terminal Sessions
 
@@ -77,14 +88,62 @@ Terminal session is similar as our current libghostty powered terminal session b
 - Terminal session should be task aware. So, if a task is being done on a git work-tree for a repository, terminal should be automatically switched to that.
 - There should be a easy way to navigate between terminal session for different repositories for a workspace
 
-### Agent UI
+### Agent Sessions
+
+An unified frontend for different agent across different providers.
+- An unified rich graphical chat UI like T3Code
+- Should support multiple provider without switching interfaces
+- We should be able to select provider, model, and effort level
+- An agent session can be scoped to a task or can be workspace scoped
+- We should support threaded session. So, there could be parent session for a task and then there could be multiple threads from that parent session
+- There should be a easy way to discover the threads.
+- Chat should support rich visual like table, mermaid etc.
+- Should support referencing files, artifacts within the workspace
+- Should support question, permision promt etc.
 
 ### Pull Request Review
 
+Pull request review should be first class citizen. We should review PR from github.
+- Pull requests are workspace scoped
+- There should be a way to discover PRs for the repositories of a particular workspace
+- There should be a way to mark a PR as watched. Then, there should be notification for event like PR approved, merged etc.
+- We should be able to filter PR by created by, participating, state etc.
+- There should be interactive agent thread for a PR review.
+- There should be a way to select a codeblocks and ask question about it to agent.
+- Should be able to approve a PR that get synced in Github
+- Github comments should be visible
+- Should be able to post comment to github from review ui
+- Should see github checks status
+
 ### General Chats
+
+General chats are not scoped to a particular workspace. There should be a dedicated place for chatting with agent for ideas, machine isuees or general questions.
+- Not workspace scoped
+- A dedicated UI for general chats
+- Maybe thread like workspace chat
+- It can start in a dedicated directory instead of machine root
+- It can be scoped to profile
 
 ### Tools
 
+General tools that helps everyday task. For example, JSON formatter, file diff viwer, base64 encoder/decoder etc. We already have these currently but they are not easy to discover. There should be a dediced UI to discover the tools.
+
 ### Wiki
 
+A wiki or knowledgebase where agent can read from or write to. Not only agent but human can add update content there. It will be home for knowldge like style guide, design patterns, architectural guideline, trips and ticks, list of useful libraries or tools etc. User can refer an wiki resource to an agent or agent can automatically search in the wiki to see if there anything related to it's current task. A wiki is global knowledge base. It is not scoped to any workspace or profile.
+
 ### Inbox
+
+A notification system for informing user for things like some agent finished execution, some agent need attention, A PR I am watching have been merged etc.
+
+### Remote workspace
+
+In future we may support remote workspace. Maybe connect over ssh to other the machine on network. Maybe it can be a cloud machine. The details are not clear yet. It is a future possibility not current requirement. So, we should design our workspace concept so that we can later introduce remote workspace later.
+
+### Must support providers
+
+We must support following providers/harness:
+- OpenAI Codex
+- Antropic claude
+- Google Antigravity
+- Opencode
