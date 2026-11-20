@@ -21,7 +21,7 @@ brew upgrade --cask devcroft
 
 Packages support Linux x86-64 (Ubuntu 24.04 or compatible) and macOS 13+ on Apple Silicon. The installer verifies checksums, installs the desktop app and CLI, and preserves your app data. Add `~/.local/bin` to your PATH for the CLI. Restart Devcroft after updating. Home shows a notice when a newer stable release is available. See [installation, platform requirements, and publishing releases](docs/releases.md).
 
-You need Git (`git` on the application PATH) and at least one agent harness (`opencode`, `claude`, `codex`, or `omp`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
+You need Git (`git` on the application PATH) and at least one agent harness (`opencode`, `claude`, `codex`, `omp`, or Antigravity's `agy`) on your default shell's PATH. Optional: `gh` (authenticated) for PR tracking, Neovim if you prefer it as your editor.
 
 On a fresh installation, setup starts with **Sync & backup**: keep data local,
 connect a new private Git repository, or choose **Existing repository** to connect

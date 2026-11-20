@@ -254,6 +254,7 @@ mod tests {
             ("codex", "resume"),
             ("claude", "--resume"),
             ("opencode", "--session"),
+            ("agy", "--conversation"),
         ] {
             let mut row = session(provider, "native-id", 1);
             row.title = "$(touch /tmp/no)".into();

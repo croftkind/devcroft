@@ -5,10 +5,6 @@
 //! [`AgentKind::DEFAULT`] until changed). Use **New session** to pick a
 //! harness explicitly for a new session; open sessions keep running with
 //! the harness they started with ([`AgentKind::command`]).
-//!
-//! Only `opencode`, `claude`, `codex`, and `omp` exist today. Adding a
-//! harness later is a matter of extending this enum plus its id/command
-//! tables below.
 
 /// Agent harness launched in the Agent tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -17,6 +13,7 @@ pub(crate) enum AgentKind {
     Claude,
     Codex,
     Omp,
+    Antigravity,
 }
 
 impl AgentKind {
@@ -25,6 +22,7 @@ impl AgentKind {
     pub(crate) fn prompt_arguments(self, prompt: &str) -> Vec<String> {
         match self {
             Self::Opencode => vec!["--prompt".into(), prompt.into()],
+            Self::Antigravity => vec!["--prompt-interactive".into(), prompt.into()],
             Self::Claude | Self::Codex | Self::Omp => vec![prompt.into()],
         }
     }
@@ -34,7 +32,13 @@ impl AgentKind {
     pub(crate) const DEFAULT: Self = Self::Opencode;
 
     /// Every harness the new-session picker offers, in display order.
-    pub(crate) const ALL: [Self; 4] = [Self::Opencode, Self::Claude, Self::Codex, Self::Omp];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Opencode,
+        Self::Claude,
+        Self::Codex,
+        Self::Omp,
+        Self::Antigravity,
+    ];
 
     /// Stable id matched case-insensitively when resolving historical
     /// sessions, so values like `"Claude"` still resolve.
@@ -44,6 +48,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Omp => "omp",
+            Self::Antigravity => "agy",
         }
     }
 
@@ -54,6 +59,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Omp => "omp",
+            Self::Antigravity => "Antigravity",
         }
     }
 
@@ -64,6 +70,7 @@ impl AgentKind {
             Self::Claude => "Anthropic's Claude Code CLI.",
             Self::Codex => "OpenAI's Codex CLI.",
             Self::Omp => "The oh-my-pi agent harness.",
+            Self::Antigravity => "Google's Antigravity CLI.",
         }
     }
 
@@ -74,6 +81,7 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Omp => "omp",
+            Self::Antigravity => "agy",
         }
     }
 
@@ -85,6 +93,7 @@ impl AgentKind {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "omp" | "oh-my-pi" | "ohmypi" => Some(Self::Omp),
+            "agy" | "antigravity" => Some(Self::Antigravity),
             _ => None,
         }
     }
@@ -126,6 +135,15 @@ mod tests {
         assert_eq!(AgentKind::Claude.command(), "claude");
         assert_eq!(AgentKind::Codex.command(), "codex");
         assert_eq!(AgentKind::Omp.command(), "omp");
+        assert_eq!(AgentKind::Antigravity.command(), "agy");
+    }
+
+    #[test]
+    fn antigravity_guide_uses_interactive_prompt_flag() {
+        assert_eq!(
+            AgentKind::Antigravity.prompt_arguments("Read the guide"),
+            ["--prompt-interactive", "Read the guide"],
+        );
     }
 
     #[test]

@@ -118,6 +118,7 @@ impl SessionSummary {
             "codex" => vec!["resume".into(), self.key.id.clone()],
             "opencode" => vec!["--session".into(), self.key.id.clone()],
             "claude" => vec!["--resume".into(), self.key.id.clone()],
+            "agy" => vec!["--conversation".into(), self.key.id.clone()],
             _ => Vec::new(),
         }
     }

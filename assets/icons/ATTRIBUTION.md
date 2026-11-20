@@ -8,6 +8,7 @@ Agent surfaces (new-session picker, sessions sidebar,
 Home cards — see `src/agent_icons.rs`). The first three belong to their
 respective owners (Anthropic, OpenAI, SST) and are redistributed here for
 product identification only; `omp.svg` is oh-my-pi's pi-and-connector mark.
+`agy.svg` is Google's Antigravity icon from its [press assets](https://antigravity.google/press).
 Sessions from unknown providers fall back to the neutral `Bot` glyph. To add
 a harness logo, drop `<key>.svg` next to these and extend `icon_svg`.
 

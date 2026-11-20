@@ -33,6 +33,9 @@ impl Account {
     }
 
     pub(crate) fn store(&self, agent: AgentKind) -> Option<PathBuf> {
+        if agent == AgentKind::Antigravity {
+            return None;
+        }
         let directory = self.directory.as_ref()?.join(agent.id());
         Some(if agent == AgentKind::Opencode {
             directory.join("data")
@@ -51,6 +54,7 @@ impl Account {
                 AgentKind::Codex => "CODEX_HOME",
                 AgentKind::Opencode => "XDG_DATA_HOME",
                 AgentKind::Omp => "PI_CODING_AGENT_DIR",
+                AgentKind::Antigravity => return Vec::new(),
             }
             .to_owned(),
             store.to_string_lossy().into_owned(),
@@ -91,6 +95,11 @@ impl Account {
     }
 
     pub(crate) fn prepare(&self, agent: AgentKind) -> Result<()> {
+        ensure!(
+            self.directory.is_none() || self.store(agent).is_some(),
+            "{} requires a space with shared agent accounts",
+            agent.label(),
+        );
         for (key, path) in self.environment(agent) {
             if key == "OMP_PROFILE" {
                 continue;
@@ -186,6 +195,7 @@ impl Account {
                 "OMP_AUTH_BROKER_TOKEN",
                 "OMP_AUTH_BROKER_ACCOUNT_POOL_FILE",
             ],
+            AgentKind::Antigravity => &[],
         }
     }
 }
@@ -284,6 +294,7 @@ impl Accounts {
         let account = self.for_checkout(&session.cwd);
         match account.store(agent) {
             Some(store) => canonical(&store) == canonical(&session.key.store),
+            None if account.directory.is_some() => false,
             None => !self
                 .managed_directory
                 .as_ref()
@@ -389,17 +400,40 @@ mod tests {
             work_account
         );
         for agent in AgentKind::ALL {
-            assert_ne!(work_account.store(agent), personal_account.store(agent));
-            assert!(
-                !work_account
-                    .store(agent)
-                    .unwrap()
-                    .starts_with(root.portable_dir())
-            );
+            if let Some(store) = work_account.store(agent) {
+                assert_ne!(Some(&store), personal_account.store(agent).as_ref());
+                assert!(!store.starts_with(root.portable_dir()));
+            }
         }
         let metadata = fs::read_to_string(Spaces::path(&root)).unwrap();
         assert!(!metadata.contains(root.root().to_str().unwrap()));
         assert!(!metadata.contains("credentials"));
+    }
+
+    #[test]
+    fn antigravity_requires_a_shared_space_for_launch_and_history() {
+        let (dir, root, personal, work) = fixture();
+        isolate(&root, "Work", true);
+        let accounts = Accounts::load(Some(&root)).unwrap();
+        let mut summary = session(&personal, dir.path());
+        summary.key.provider = AgentKind::Antigravity.id().into();
+        assert!(accounts.permits(&summary));
+        assert!(
+            accounts
+                .for_checkout(&personal)
+                .prepare(AgentKind::Antigravity)
+                .is_ok()
+        );
+
+        summary.cwd = work.clone();
+        summary.checkout = work.clone();
+        assert!(!accounts.permits(&summary));
+        let (activity, _) = AgentActivityStore::with_data_root(Some(root));
+        let launch = activity.start(&work, AgentKind::Antigravity);
+        assert_eq!(
+            launch.launch_error.as_deref(),
+            Some("Antigravity requires a space with shared agent accounts")
+        );
     }
 
     #[test]

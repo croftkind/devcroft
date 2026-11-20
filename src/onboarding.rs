@@ -1675,10 +1675,11 @@ mod tests {
         for agent in AgentKind::ALL {
             draft.set_agent_enabled(agent, false);
         }
-        assert_eq!(draft.enabled_agents, vec!["omp"]);
-        assert_eq!(draft.default_agent, "omp");
+        let last = *AgentKind::ALL.last().unwrap();
+        assert_eq!(draft.enabled_agents, vec![last.id()]);
+        assert_eq!(draft.default_agent, last.id());
         draft.set_agent_enabled(AgentKind::Codex, true);
-        draft.set_agent_enabled(AgentKind::Omp, false);
+        draft.set_agent_enabled(last, false);
         assert_eq!(draft.default_agent, "codex");
     }
 

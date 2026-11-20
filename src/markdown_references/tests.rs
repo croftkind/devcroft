@@ -10,6 +10,11 @@ fn portable_urls_round_trip_without_device_paths() {
             provider: "codex".into(),
             id: "conversation:hello world+✓".into(),
         },
+        Reference::Session {
+            repository: "backend".into(),
+            provider: "agy".into(),
+            id: "antigravity-conversation".into(),
+        },
     ] {
         assert_eq!(reference.url().parse::<Reference>().unwrap(), reference);
     }

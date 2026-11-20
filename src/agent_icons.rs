@@ -1,7 +1,7 @@
 //! Full-color harness logos for the Agent surfaces.
 //!
 //! The SVGs under `assets/icons/` (`claude.svg`, `codex.svg`, `opencode.svg`,
-//! `omp.svg`) are embedded with `include_bytes!` and rasterized once
+//! `omp.svg`, `agy.svg`) are embedded with `include_bytes!` and rasterized once
 //! through the app's SVG renderer into [`img`] tiles — the same pattern as
 //! [`crate::review::icons`]. GPUI's `Svg` element renders monochrome
 //! silhouettes, which would flatten these brand marks, so rows use the
@@ -31,6 +31,7 @@ pub(crate) fn icon_svg(agent: AgentKind) -> Option<&'static [u8]> {
         AgentKind::Claude => Some(include_bytes!("../assets/icons/claude.svg")),
         AgentKind::Codex => Some(include_bytes!("../assets/icons/codex.svg")),
         AgentKind::Omp => Some(include_bytes!("../assets/icons/omp.svg")),
+        AgentKind::Antigravity => Some(include_bytes!("../assets/icons/agy.svg")),
     }
 }
 

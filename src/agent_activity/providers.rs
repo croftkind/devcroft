@@ -42,7 +42,7 @@ pub(super) fn prepare(
     match agent {
         AgentKind::Opencode => prepare_opencode(emitter.clone(), cancelled),
         AgentKind::Claude => prepare_claude(generation, emitter.clone(), cancelled),
-        AgentKind::Codex | AgentKind::Omp => Ok(ProviderLaunch::default()),
+        AgentKind::Codex | AgentKind::Omp | AgentKind::Antigravity => Ok(ProviderLaunch::default()),
     }
 }
 

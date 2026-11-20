@@ -37,9 +37,9 @@ details. The author-supplied label remains visible and copyable:
 Use real keys from `devcroft repository list --json`, artifact IDs from
 `devcroft artifact list --json`, and provider/session IDs from
 `devcroft session list --json`. Percent-encode session IDs as a URL path segment.
-Session references support `opencode`, `codex`, and `claude`; they contain no
-checkout or provider-store paths. The repository binding and session must be
-available on this device, and ambiguous matches are rejected.
+Session references support `opencode`, `codex`, `claude`, and Antigravity (`agy`).
+They contain no checkout or provider-store paths. The repository binding
+and session must be available on this device, and ambiguous matches are rejected.
 
 Click or keyboard-activate a reference to open it. Artifact links open in global
 Browse artifacts, including records outside the current

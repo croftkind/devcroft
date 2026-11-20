@@ -2,6 +2,10 @@
 
 Terminal-backed tabs own independent PTY sessions. Switching tabs keeps the underlying process alive. Devcroft starts the default shell as an interactive login shell, then enters the Agent or Neovim command through that shell. This makes shell startup files, environment changes, aliases, functions, and tool-manager activation available to those commands.
 
+## Google Antigravity CLI
+
+With `agy` on your login shell's PATH, enable **Antigravity** in **Settings → Agent** and select it from **New session**. Devcroft uses your existing Antigravity sign-in in spaces that use shared agent accounts. Local conversations with a workspace appear in the checkout's recent sessions and can be reopened by selecting the conversation.
+
 ## Separate work and personal agent accounts
 
 In **Settings → Spaces → Agent accounts**, enable separate accounts for the spaces that need their own subscriptions. Existing spaces use shared machine accounts until you enable this option. Close the space's open agent sessions before changing the setting or deleting the space.

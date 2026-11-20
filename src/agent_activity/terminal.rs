@@ -30,7 +30,7 @@ pub(super) fn classify(
         AgentKind::Codex => classify_codex(title, &screen),
         AgentKind::Claude => classify_claude(title, &screen),
         AgentKind::Opencode => classify_opencode(&screen),
-        AgentKind::Omp => None,
+        AgentKind::Omp | AgentKind::Antigravity => None,
     }
 }
 

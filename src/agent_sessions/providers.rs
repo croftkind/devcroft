@@ -2,6 +2,7 @@ use super::{
     model::{SessionKey, SessionSummary, canonical, title},
     process::Rpc,
 };
+use crate::agent::AgentKind;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -40,6 +41,10 @@ pub(super) fn sources(accounts: &crate::agent_accounts::Accounts) -> Vec<Source>
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join(".claude")),
         },
+        Source {
+            provider: AgentKind::Antigravity.id(),
+            root: home.join(".gemini/antigravity-cli"),
+        },
     ];
     for account in &accounts.isolated {
         for agent in [
@@ -75,8 +80,79 @@ pub(super) fn discover(
         "opencode" => opencode(source),
         "codex" => codex(source),
         "claude" => claude(source, files),
+        "agy" => antigravity(source),
         _ => bail!("Unsupported session provider"),
     }
+}
+
+fn antigravity(source: &Source) -> Result<Vec<SessionSummary>> {
+    let database = source.root.join("conversation_summaries.db");
+    if !database.is_file() {
+        return Ok(Vec::new());
+    }
+
+    // agy keeps its local conversation metadata in this index. Reading it
+    // directly works across checkouts without starting the CLI or signing in.
+    let connection = rusqlite::Connection::open_with_flags(
+        &database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .context("opening Antigravity conversation index")?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT conversation_id, title, preview, workspace_uris, unixepoch(last_modified_time)
+             FROM conversation_summaries
+             WHERE coalesce(parent_conversation_id, '') = '' AND coalesce(nesting_depth, 0) = 0",
+        )
+        .context("reading Antigravity conversation index")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+        ))
+    })?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        let Ok((id, row_title, preview, workspace_uris, updated)) = row else {
+            continue;
+        };
+        if id.is_empty() || id.starts_with('-') || id.chars().any(char::is_control) {
+            continue;
+        }
+        let Ok(workspaces) = serde_json::from_str::<Vec<String>>(&workspace_uris) else {
+            continue;
+        };
+        // Additional workspace roots do not change the conversation's checkout.
+        let Some(cwd) = workspaces
+            .first()
+            .and_then(|uri| uri.parse().ok())
+            .and_then(|uri| crate::editor::lsp::path_from_uri(&uri).ok())
+            .filter(|path| path.is_absolute())
+        else {
+            continue;
+        };
+        sessions.push(SessionSummary {
+            key: SessionKey {
+                provider: source.provider.into(),
+                store: source.root.clone(),
+                id,
+            },
+            checkout: PathBuf::new(),
+            cwd,
+            title: title(if row_title.trim().is_empty() {
+                &preview
+            } else {
+                &row_title
+            }),
+            updated: updated.unwrap_or_default(),
+            timestamp_source: "provider_updated".into(),
+        });
+    }
+    Ok(sessions)
 }
 
 fn opencode(source: &Source) -> Result<Vec<SessionSummary>> {
@@ -537,6 +613,62 @@ fn parse_claude(source: &Source, path: &Path, modified: u128) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_discovers_only_root_conversations_with_a_local_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Source {
+            provider: "agy",
+            root: dir.path().to_owned(),
+        };
+        assert!(discover(&source, &mut HashMap::new()).unwrap().is_empty());
+
+        let checkout = dir.path().join("test checkout");
+        let cwd = checkout.join("nested");
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let uri = crate::editor::lsp::file_uri(&cwd).unwrap();
+        let workspaces = json!([uri.as_str(), "file:///additional-root"]).to_string();
+        let connection =
+            rusqlite::Connection::open(dir.path().join("conversation_summaries.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE conversation_summaries (
+                    conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL, preview TEXT NOT NULL,
+                    workspace_uris TEXT NOT NULL, last_modified_time DATETIME NOT NULL,
+                    parent_conversation_id TEXT NOT NULL, nesting_depth INTEGER NOT NULL
+                )",
+            )
+            .unwrap();
+        for (id, uris, parent, depth) in [
+            ("root", workspaces.as_str(), "", 0),
+            ("child", workspaces.as_str(), "root", 1),
+            ("remote", r#"["file://other-host/workspace"]"#, "", 0),
+            ("no-workspace", "[]", "", 0),
+            ("malformed", "not-json", "", 0),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO conversation_summaries
+                     VALUES (?1, '', 'Session preview', ?2, '2025-11-19 22:03:33.56455+00:00', ?3, ?4)",
+                    rusqlite::params![id, uris, parent, depth],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let mut sessions = discover(&source, &mut HashMap::new()).unwrap();
+        super::super::model::sort(&mut sessions);
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.cwd, canonical(&cwd));
+        assert_eq!(session.checkout, canonical(&checkout));
+        assert_eq!(session.title, "Session preview");
+        assert_eq!(session.updated, 1_763_589_813);
+        assert_eq!(session.arguments(), ["--conversation", "root"]);
+        session.validate().unwrap();
+    }
+
     #[test]
     #[ignore = "reads installed agents' local metadata; requires local provider access"]
     fn installed_provider_metadata_smoke() {

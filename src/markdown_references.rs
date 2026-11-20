@@ -68,7 +68,7 @@ fn parse_reference(url: &str) -> Result<Reference> {
         [kind, repository, provider, id] if kind == "session" => {
             data::require_repository_key(repository)?;
             ensure!(
-                matches!(provider.as_str(), "opencode" | "codex" | "claude"),
+                matches!(provider.as_str(), "opencode" | "codex" | "claude" | "agy"),
                 "Unsupported session provider"
             );
             ensure!(

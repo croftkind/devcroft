@@ -262,6 +262,11 @@ impl AgentActivityStore {
             inner.next_generation = inner.next_generation.wrapping_add(1).max(1);
             let generation = inner.next_generation;
             let foreground = inner.foreground_checkout.as_deref() == Some(checkout.as_path());
+            let unavailable = match agent {
+                AgentKind::Omp => Some("No activity adapter for OMP"),
+                AgentKind::Antigravity => Some("No activity adapter for Antigravity"),
+                _ => None,
+            };
             inner.records.insert(
                 (checkout.clone(), generation),
                 ActivityRecord {
@@ -279,11 +284,10 @@ impl AgentActivityStore {
                     unread_completion: false,
                     foreground,
                     visible: false,
-                    observation_available: agent != AgentKind::Omp,
+                    observation_available: unavailable.is_none(),
                     structured_status_available: false,
                     exited: false,
-                    detail: (agent == AgentKind::Omp)
-                        .then(|| "No activity adapter for OMP".to_owned()),
+                    detail: unavailable.map(str::to_owned),
                 },
             );
             generation
